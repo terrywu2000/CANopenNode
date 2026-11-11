@@ -1,0 +1,5 @@
+{
+  "interface_name": "CAN1",
+  "model_path": "../../examples/kinco_FD124.json",
+  "persistence_path": "./kinco_FD124.lss.json"
+}
