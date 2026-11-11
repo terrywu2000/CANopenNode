@@ -2,7 +2,7 @@
 
 > 适用范围：当前仓库 CANopenNode 核心，以及 `xnet_intergration/` NI-XNET CANopen 从站集成。
 > 参考资料：`reference/canopennode-rtt`（Pure-C CiA 402 Device 核心 + RT-Thread 适配）、`reference/EtherCAT_Slave`（EtherCAT 侧 CiA 402 示例应用）。
-> 本文是后续开发的需求基线。标注 **[待确认]** 的条目需要在开发前由负责人决策。
+> 本文是后续开发的需求基线。首期范围已确定为 PP 位置控制；仅将仍需负责人决策的事项标注为 **[待确认]**。
 
 ---
 
@@ -15,7 +15,8 @@
   - `include/xnet_canopen.h` 文件头明确声明："No function interprets a CiA 402 controlword or generates the application's statusword."，并声明 NMT 状态、CANopen 状态、应用驱动状态是三个独立概念。
   - `xnet_intergration/src/model.cpp:280` 注释："adding 0x6040 does not give the library a CiA 402 controlword interpreter."。即 0x6040 等对象目前只是 OD 存储与访问元数据。
   - `xnet_intergration/tests/app/README.md:113` 说明测试应用不实现 CiA 402。
-- 已有 Kinco FD124 的 EDS（`xnet_intergration/eds/Kinco_FD_20250417_V1.2.eds`）与 JSON 配置（`examples/kinco_FD124.json`、`tests/app/kinco_FD124.config.json`，目前为未跟踪文件）。
+- 设备 OD 由 JSON 配置描述；JSON 由工具从目标真实驱动设备的 EDS 转换生成。普通 CANopen 设备配置可以不包含 CiA 402 对象，电机驱动设备配置则包含其实际提供的 402 对象与 PDO 配置。
+- 仓库已有 Kinco FD124 的 EDS（`xnet_intergration/eds/Kinco_FD_20250417_V1.2.eds`）与 JSON 配置样例（`examples/kinco_FD124.json`、`tests/app/kinco_FD124.config.json`）。
 
 ### 1.2 目标
 
@@ -23,7 +24,7 @@
 
 1. 按 IEC 61800-7-201 / CiA 402 规定实现 PDS 状态机、Controlword 解析、Statusword 生成。
 2. 支持多轴（`logicalDevice` 偏移），每轴 OD 布局符合 CiA 402 标准索引。
-3. 支持 PP、PV、HM、CSP、CSV、CST 模式，编译期可裁剪；力矩模型可选扩展 PT，首期模式范围见 §9。
+3. 首期只支持 PP（Profile Position）位置控制。PV、PT、HM、CSP、CSV、CST 等模式作为未来扩展，不属于本次实现与验收范围。
 4. 驱动动作通过回调（DriveIF）抽象，核心模块不包含任何硬件或 CAN 代码。
 5. 核心为 Pure C，无堆分配，回调非阻塞，可在 RT 环境运行。
 6. 与 xnet 的 OD 访问、批量 API、复位语义（Reset Node / Reset Communication）保持一致。
@@ -31,8 +32,8 @@
 ### 1.3 非目标
 
 - 不实现厂商私有对象（如 Kinco 的 0x2FF0 系列），仅预留扩展点。
-- 不实现通用运动规划器；PP/PV 及可选 PT 的 profile/斜坡处理统一由核心的模式处理模块负责，模型只实现驱动跟踪、限幅和动态响应，不重复生成轨迹。
-- 不修改 `xnet_canopen.h` 已发布的 ABI，除非另行批准（见 §9.3）。
+- 不实现通用运动规划器；首期 PP 的 profile/斜坡处理由核心负责，模型只实现位置跟踪、限幅和动态响应，不重复生成轨迹。
+- 不修改 `xnet_canopen.h` 已发布的 ABI，除非另行批准（见 §9 第 3 项）。
 - 不替代 EtherCAT 侧的 `cia402appl.c`，两者仅作为行为参考。
 
 ---
@@ -49,7 +50,7 @@
 | 安全所有权 | QuickStop、DisableVoltage、FaultReaction 可抢占 BUSY 动作 | 无显式所有权模型 | 无 |
 | 故障复位 | 0x6040 bit7 上升沿（edge-triggered） | 固定掩码 `CONTROLWORD_COMMAND_FAULTRESET_MASK`（`cia402appl.h:57`） | 无 |
 | 多轴 | 支持，OD 基址 `0x6000 + n*0x0800` | 支持（`LocalAxes[]`） | 无 |
-| 模式 | 编译期开关 `CO_402_CONFIG_MODE_{PP,PV,HM,CSP,CSV,CST}` | 按 0x6502 与 PDO 映射 | 无 |
+| 模式 | 首期仅 PP（1） | 按 JSON/EDS 中 0x6502 与 PDO 配置校验 | 无 |
 | 堆使用 | 无堆，应用持有所有存储 | 静态 | 有 C++ 动态对象 |
 
 **结论**：canopennode-rtt 的 Pure-C 核心在结构上最适合 xnet 复用（无堆、回调边界清晰、有安全所有权模型）。EtherCAT 示例更接近"验证用法"，状态转换表可用于交叉核对。
@@ -64,7 +65,7 @@
 2. **CANopen NMT 状态**：`nmt_state`。
 3. **CiA 402 PDS 状态**：本模块维护，通过 Statusword bit0-3、5、6 表示。
 
-PDS 状态不得因 NMT 切换而隐式改变，除非规范或本模块策略明确要求（见 §6.4）。
+CANopen NMT 是底层通信层状态机，DS402 PDS 是上层电机控制状态机。NMT 状态本身不直接改变 PDS；DS402 可以读取 NMT 状态作为自己的输入，并由 DS402 决定电机控制动作、PDS 转换及相应 OD 发布（见 §6.4）。
 
 ### 3.2 PDS 状态（CiA 402 标准）
 
@@ -82,11 +83,13 @@ PDS 状态不得因 NMT 切换而隐式改变，除非规范或本模块策略�
 
 | ID | 需求 | 验收标准 |
 |---|---|---|
-| FR-OD-01 | 每个 CiA 402 轴必须提供以下对象：0x603F（U16 错误码）、0x6040（U16 Controlword，RPDO）、0x6041（U16 Statusword，TPDO）、0x6060（I8 Modes of Operation）、0x6061（I8 Modes of Operation Display）、0x6064（I32 Position Actual）、0x606C（I32 Velocity Actual）、0x607A（I32 Target Position）、0x60FF（I32 Target Velocity）、0x6502（U32 Supported Drive Modes） | 启动时校验存在性、标量 VAR、长度、访问属性与 PDO 映射；缺失则拒绝启动并返回 `XNET_CO_MODEL_ERROR`（或核心的对应错误码） |
+| FR-OD-01 | 配置启用 `drive_402` 时，PP 必需对象为 0x603F（U16 Error code）、0x6040（U16 Controlword）、0x6041（U16 Statusword）、0x6060（I8 Modes of operation）、0x6061（I8 Modes of operation display）、0x6064（I32 Position actual）、0x607A（I32 Target position）、0x6081（U32 Profile velocity）、0x6083（U32 Profile acceleration）、0x6084（U32 Profile deceleration）及 0x6502（U32 Supported drive modes）。0x606C 等非 PP 必需对象按 JSON/设备 EDS 配置作为可选对象。 | 仅在初始化载入 JSON 后校验：上述必需对象必须存在且类型、子索引、长度、访问属性正确；PDO 配置必须与 JSON/EDS 中声明的方向、映射对象及映射长度一致，并包含 RPDO 的 0x6040/0x607A 命令输入映射和 TPDO 的 0x6041/0x6064 状态输出映射。缺项或冲突视为配置错误，初始化失败并返回 `XNET_CO_MODEL_ERROR`（或核心对应错误码）。 |
 | FR-OD-02 | 多轴时，轴 n 的对象基址为 `0x6000 + n * 0x0800`（canopennode-rtt 约定） | 同一设备 0x6000、0x6800、0x7000 可同时工作，互不覆盖 |
 | FR-OD-03 | 核心不得假定对象有符号语义；符号/无符号由 OD/EDS 决定 | 0x6060 为 INTEGER8，0x6061 为 INTEGER8，读写不做错误的符号扩展 |
 | FR-OD-04 | 对象访问须经过 OD 锁（与 xnet 的批量 API 锁序一致，见 §8.2） | 通过 SDO 写 0x6040 与批量写 API 并发时无数据竞争 |
-| FR-OD-05 | 主站独占写入 target 与 profile 参数，核心独占发布 demand、状态和已接受实际值；模型只写本地交换对象 | 覆盖命令、反馈的网络/本地权限；核心不得覆盖 0x607A、0x60FF、0x6071 |
+| FR-OD-05 | 主站独占写入 target 与 profile 参数，核心独占发布 demand、状态和已接受实际值；模型只写本地交换对象 | 覆盖命令、反馈的网络/本地权限；核心不得覆盖 0x607A 或 PP profile 参数 |
+
+JSON 是 OD 与 PDO 配置的唯一运行时来源，初始化阶段不根据 `drive_402` 自动补建对象，也不在运行时动态添加 PDO 映射。普通设备 JSON 未声明 `drive_402` 时按普通 CANopen 设备初始化，不执行 402 对象校验或状态机；声明启用时，若 EDS 转换得到的 JSON 缺少任一 PP 协议必需对象或必要配置，必须作为配置错误拒绝初始化，不得静默降级为普通设备或自动补默认对象。若使用 external 模型，所需本地交换对象必须作为本设备 JSON 的本地扩展项提供并通过同一初始化校验；不得由运行时绕过 JSON 创建。
 
 **实现说明**：`canopennode-rtt` 的 OD 扩展通过 `CO_402_device_bindOD()` 绑定，并在 Communication Reset 时重新绑定（见 `docs/en/cia402-device-rtt.md`）。xnet 中对应的是 `Model` 的 `resolve_node` / `configure` 流程（`xnet_intergration/src/model.cpp:427`、`:494`），绑定点应放在同一流程里。
 
@@ -109,19 +112,17 @@ PDS 状态不得因 NMT 切换而隐式改变，除非规范或本模块策略�
 | FR-CW-01 | Controlword 位 0–3、7 参与 PDS 命令；位 4–6、8 作为模式相关位（set-point、change immediately、relative、halt） |
 | FR-CW-02 | 故障复位为边沿触发：仅在 FAULT 状态下 bit7 由 0 变 1 时生效（canopennode-rtt 行为） |
 | FR-CW-03 | 不得把 Statusword 的保留位置为非零值；bit11（internal limit）与 bit12（模式相关）仅由对应模式写入 |
-| FR-CW-04 | Statusword bit10（target reached）、bit12（setpoint ack / HM attained / drive follows command）、bit13（following error / HM error）由模式模块维护 |
+| FR-CW-04 | 首期 PP 的 Statusword bit10（target reached）、bit12（set-point acknowledge）及 bit11（internal limit）由 PP 模式逻辑维护；其他模式相关位不在首期实现范围 |
 
 ### 4.4 模式
 
 | ID | 需求 |
 |---|---|
-| FR-MODE-01 | 模式通过编译开关 `CO_402_CONFIG_MODE_{PP,PV,PT,HM,CSP,CSV,CST}` 启用，默认全部关闭；PT 为可选扩展 |
-| FR-MODE-02 | 模式值：PP=1、PV=3、PT=4、HM=6、CSP=8、CSV=9、CST=10；PT 与 CST 不可互换 |
-| FR-MODE-03 | 0x6502 位映射：PP=bit0、PV=bit2、PT=bit3、HM=bit5、CSP=bit7、CSV=bit8、CST=bit9；只公布编译启用、OD 完整且模型声明支持的交集 |
-| FR-MODE-04 | 写 0x6060 为不支持的模式时拒绝写入（SDO Abort 或返回错误），0x6061 保持原值 |
-| FR-MODE-05 | 模式切换仅在 `OPERATION_ENABLED` 之外或经过 `modeExit` 回调完成后生效 **[待确认]**：是否允许运行中切换 |
-| FR-MODE-06 | 模式接口（modeEnter / modeExit / profilePosition / profileVelocity / homing）为 **追加式** 扩展，不破坏已有 DriveIF ABI |
-| FR-MODE-07 | 0x6061 只公布模型已确认就绪的模式，不直接回显 0x6060；待确认时禁止应用新模式的非零 demand，拒绝或超时须诊断 |
+| FR-MODE-01 | 首期只启用 PP（模式值 1）；其他模式的能力声明与运行逻辑不属于首期 |
+| FR-MODE-02 | 0x6502 只公布 PP 能力（bit0），并要求 JSON 中该能力与 PP 必需 OD 对象、PDO 配置及模型能力一致；不宣称支持其他模式 |
+| FR-MODE-03 | 0x6060 写入 1 表示 PP；写入任何其他模式值必须拒绝（SDO Abort 或返回错误），不得改变当前模式；0x6061 仅在 PP 初始化/就绪后发布 1 |
+| FR-MODE-04 | 首期不支持运行时模式切换；0x6060 不得从 PP 切换到其他模式。该能力作为未来需求另行设计 |
+| FR-MODE-05 | PP profile 位置命令按 Controlword 的 new-set-point、change-immediately、relative 等相关位处理，并由核心生成 profile demand；同一命令不得重复触发，确认及 target reached 判据必须有单元测试 |
 
 ### 4.5 DriveIF（驱动回调）
 
@@ -164,11 +165,11 @@ PDS 状态不得因 NMT 切换而隐式改变，除非规范或本模块策略�
 | NFR-01 | 核心模块为 C99 或 C11，无堆分配 | 代码审查、`grep malloc` 为空 |
 | NFR-02 | 与现有 xnet 代码风格一致（xnet 为 C++ 实现，对外 C ABI） | 代码审查 |
 | NFR-03 | MISRA C:2012 风格（参照根 README）；允许偏离需在注释中说明 | 静态检查 |
-| NFR-04 | 单轴 `axisProcess` 最坏执行时间需在目标平台实测并记录 **[待确认]**（建议 < 100 µs，不含回调） | 基准测试 |
+| NFR-04 | 首期以 CANopen 毫秒级基本控制为目标，当前只做功能验证；记录处理周期与延迟作为诊断信息，不设硬实时 WCET、抖动或端到端性能验收门槛，也不据此宣称硬实时能力 | 功能测试与可选诊断记录 |
 | NFR-05 | 不得在 `xnet_canopen.h` 已有函数的签名或语义上做破坏性修改 | ABI 对比 |
 | NFR-06 | 所有新文件包含版权与模块说明头，与 `CO_402_*` 风格一致 | 代码审查 |
 | NFR-07 | 只在需要注释处添加注释（仓库约定） | 代码审查 |
-| NFR-08 | 分别记录模型周期/WCET、批量 API 持锁时间、worker 抖动、反馈年龄与命令到反馈/TPDO 延迟；不以轴处理耗时替代端到端验收 | 按 §8.4 在目标平台测试，预算见 §9.6 |
+| NFR-08 | 可记录模型周期、批量 API 持锁时间、worker 周期、反馈年龄与命令到反馈/TPDO 延迟，供功能调试使用；这些观测值不是首期性能通过/失败门槛 | 功能测试中的诊断记录 |
 
 ---
 
@@ -184,7 +185,7 @@ PDS 状态不得因 NMT 切换而隐式改变，除非规范或本模块策略�
 
 ### 6.2 Statusword 派生
 
-Statusword 的状态位由 PDS 当前状态决定，模式相关位由模式模块根据已接受反馈维护；模型不直接写 Statusword。bit10 的容差/持续时间、bit11 的限幅来源及各模式 bit12/13 的判据须写入模式配置和测试。实际反馈无效或过期时，不得报告新的 target reached。Statusword 与实际值应在 OD 锁内发布，避免 TPDO 读到未提交反馈。
+Statusword 的状态位由 PDS 当前状态决定，PP 相关位由核心根据已接受反馈维护；模型不直接写 Statusword。bit10 的位置容差/持续时间、bit11 的限幅来源及 bit12 的 set-point acknowledge 判据须写入配置和测试。实际反馈无效或过期时，不得报告新的 target reached。Statusword 与实际值应在 OD 锁内发布，避免 TPDO 读到未提交反馈。
 
 ### 6.3 Fault Reset
 
@@ -195,8 +196,9 @@ Statusword 的状态位由 PDS 当前状态决定，模式相关位由模式模�
 
 ### 6.4 NMT 与 PDS 的关系
 
-- NMT 进入 Stopped 时，应先将 PDS 转到安全状态（经 quickStop 或 disableVoltage，具体见 **[待确认]** §9.2）。
-- NMT 重新进入 Operational 不得自动恢复 `OPERATION_ENABLED`，必须由主站重新发送命令序列。
+- NMT 状态机只管理底层 CANopen 通信状态；NMT 状态变化不直接调用或改写 PDS 状态，也不直接触发电机控制动作。
+- DS402 周期逻辑可以读取 NMT 状态，并据此决定自身是否接受普通控制命令、撤销输出许可、执行 disableVoltage/quickStop 等动作，以及如何更新 PDS 和 0x6041。所有电机控制行为变化必须经 DS402 状态机完成并由其发布相应 OD。
+- NMT 状态到 DS402 行为的具体策略属于 DS402 产品策略，须在 DS402 内定义并测试；NMT 重新进入 Operational 不得自动恢复 `OPERATION_ENABLED`，需要重新满足 DS402 条件并由主站发送使能命令序列。
 
 ---
 
@@ -228,10 +230,10 @@ CANopen 主站 → CANopenNode / OD
 
 ### 7.3 与 xnet 集成点
 
-1. **OD 描述**：在 `model.cpp` 的 `load()` 中，当 JSON 配置中声明 `drive_402` 段时，按启用模式生成 §4.1 标准对象及 §7.5 本地交换对象；配置不完整则拒绝启动。
-2. **绑定**：在 `Model::configure()`（`model.cpp:494`）或 `device.cpp` 中，于 OD 初始化后调用 `CO_402_device_bindOD()`。
+1. **OD 来源与校验**：启动时加载 JSON；该 JSON 由设备 EDS 转换工具生成并决定 OD 与 PDO，不由 402 核心补建对象。未声明 `drive_402` 时按普通设备初始化；声明启用时，在初始化阶段校验 PP 必需对象、权限、类型、长度及 PDO 映射，缺失/不匹配即作为配置错误拒绝启动。
+2. **绑定**：在 JSON/OD/PDO 校验成功并完成 OD 初始化后，于 `Model::configure()`（`model.cpp:494`）或 `device.cpp` 调用 `CO_402_device_bindOD()`；只有显式启用 402 的设备才绑定。
 3. **周期调用**：402 只在现有 device worker 中处理，插入 RPDO 处理之后、TPDO 处理之前；另设应用拥有的模型线程，不在 worker 内执行模型计算。
-4. **Reset**：`xnet_canopen_device::reset_stack()`（`src/device.cpp:230`）在 `model->restore()`（`:243`）之后完成复位。402 重新绑定应放在该流程中，并在成功完成后才发布计数（参考 `device.cpp:247-249` 的注释）。
+4. **Reset**：`xnet_canopen_device::reset_stack()`（`src/device.cpp:230`）在 `model->restore()`（`:243`）之后完成复位。402 重新绑定应放在该流程中，并在成功完成后才发布计数（参考 `device.cpp:247-249` 的注释）；复位过程中仍由 DS402 处理电机控制状态，不由 NMT 层直接修改 PDS。
 5. **状态快照**：402 与模型诊断通过只读 OD 对象暴露，不新增 C 函数，不修改已有 40 字节 `xnet_canopen_status_t`；复位代次随模型命令快照发布。
 
 ### 7.4 DriveIF 对 Kinco FD124 的适配 **[待确认]**
@@ -252,12 +254,12 @@ CANopen 主站 → CANopenNode / OD
 
 | 角色 | 负责的 OD | 访问通道 |
 |---|---|---|
-| 主站 | 0x6040、0x6060、target（0x607A、0x60FF、可选 0x6071）及 profile 参数（如 0x6081、0x6083、0x6084） | SDO / RPDO，按设备配置开放 |
-| 402 核心 | 0x6041、0x6061、0x603F；profile/斜坡后的 demand；经验证的实际值 | worker 内发布，绝不覆盖主站 target |
+| 主站 | 0x6040、0x6060（仅 PP）、0x607A 及 PP profile 参数（0x6081、0x6083、0x6084） | SDO / RPDO，按设备配置开放 |
+| 402 核心 | 0x6041、0x6061、0x603F；PP profile demand；经验证的实际位置值 | worker 内发布，绝不覆盖主站 target |
 | 模型交换适配层 | 动作/模式请求、命令代次、暂存与完整帧校验 | OD 扩展只做有界校验和复制，不推进 PDS |
-| 模型 | 实际位置/速度/力矩、动作结果、模式就绪、限幅、当前故障条件与复位许可 | 通过本地完整反馈帧提交，不直接写标准实际值或 Statusword |
+| 模型 | 实际位置（可包含设备配置的其他遥测量）、动作结果、PP 就绪、限幅、当前故障条件与复位许可 | 通过本地完整反馈帧提交，不直接写标准实际值或 Statusword |
 
-首期 profile/斜坡生成归核心，模型不得重复生成。CSP/CSV/CST 的周期目标按模式规则直接形成 demand。后续若要由模型负责 profile，必须另行修订该边界，不得同时启用两套轨迹处理。
+首期 PP profile/斜坡生成归核心，模型不得重复。PV、PT、HM、CSP、CSV、CST 等模式及相应 demand 处理均为未来扩展。
 
 #### 7.5.2 本地交换对象（厂商自定义区 0x2000–0x5FFF）
 
@@ -265,8 +267,8 @@ CANopen 主站 → CANopenNode / OD
 |---|---|---|---|---|
 | 0x2F00 | 当前模型故障 | UNSIGNED16 | 核心发布 | 来自最新已接受反馈帧，0 表示故障条件已消失，不是锁存记录 |
 | 0x2F01 | 模型心跳 | UNSIGNED32 | 模型 | 独立于反馈提交；模型存活时持续递增 |
-| 0x2F02 | 命令快照 | 固定长度 OCTET_STRING | 核心 | 带版本、epoch、command_seq、action_seq、动作、模式请求、已接受模式、有效输出使能、demand 和参数 |
-| 0x2F03 | 完整反馈提交 | 固定长度 OCTET_STRING | 模型 | 带版本、epoch、feedback_seq、源 command_seq、action_seq、动作结果、模式响应、实际值、有效掩码、限幅、当前故障码、reset_permitted |
+| 0x2F02 | 命令快照 | 固定长度 OCTET_STRING | 核心 | 带版本、epoch、command_seq、action_seq、动作、PP 模式状态、有效输出使能、位置 demand 和参数；未来模式扩展另行定义 |
+| 0x2F03 | 完整反馈提交 | 固定长度 OCTET_STRING | 模型 | 带版本、epoch、feedback_seq、源 command_seq、action_seq、动作结果、PP 就绪响应、实际位置、有效掩码、限幅、当前故障码、reset_permitted |
 | 0x2F04 | 处理确认 | UNSIGNED32 | 核心 | 最后被 worker 完成处理的 feedback_seq，0 表示本代次尚无结果；须同时检查 0x2F05 |
 | 0x2F05 | 处理结果 | UNSIGNED16 | 核心 | 0=无结果、1=已接受、2=命令过期、3=内容无效；epoch 失效通过新命令快照通知 |
 
@@ -275,13 +277,13 @@ CANopen 主站 → CANopenNode / OD
 - 0x2F01、0x2F03 为 SDO 只读、`local_write: true`，禁止 RPDO 写入；其余为核心只读发布、`local_write: false`。启动时验证权限及索引冲突。
 - 旧草案中的模型直接写 0x2F00、标准实际值以及“心跳最后写”方案被本协议替代；不改变现有通用批量 API 的逐条尝试语义。
 - 快照和反馈帧采用显式小端字段编码、固定长度、无隐式填充，不直接 memcpy 编译器结构体。实现前在接口头文件冻结版本 1 的逐字节偏移、长度、枚举、保留位和有效掩码；未知版本、错误长度、非法枚举/保留位须返回错误并诊断，不得截断或默认成功。
-- 位置为 I32 counts，速度为 I32 counts/s，力矩为 I16 额定力矩千分比；U16 故障码原样对应设备故障表。额定力矩、正方向、转换比例、模式限幅、容差和持续时间由 JSON 明确，初始化时拒绝缺失或不一致配置。模型内部可用浮点，适配层负责有界转换，溢出不得静默回绕。
-- 首期 PP/PV 必须提供位置和速度；PT/CST 启用时必须提供力矩，且配置对应的斜坡/限幅参数与 bit10/11 判据。仅支持 PP/PV 的模型不要求 PT；PT=4 与 CST=10 分别声明能力。
+- 位置为 I32 counts；U16 故障码原样对应设备故障表。PP 的位置比例、正方向、速度/加速度/减速度单位、限幅、target-reached 容差及持续时间由 JSON 明确，初始化时拒绝缺失或不一致配置。模型内部可用浮点，适配层负责有界转换，溢出不得静默回绕。
+- 首期 PP 必须具备有效位置反馈及 profile 参数；速度、力矩对象和 PT/CST 能力仅在未来模式扩展时纳入要求。
 - 模型故障经完整反馈进入核心，不使用 `xnet_canopen_set_fault` 代替 PDS 故障路径。心跳计数仅指示更新，超时使用 worker 本机单调时钟，不依赖模型墙钟。
 
 #### 7.5.3 批量分组（模型侧绑定，启动时完成）
 
-模型在 setup 阶段按轴一次性绑定分组。首期统一命令/反馈帧，通过版本与有效掩码扩展字段，避免先读模式再跨调用读取不同模式 demand。
+模型在 setup 阶段按轴一次性绑定分组。首期统一命令/反馈帧仅承载 PP 所需的动作、位置 demand、位置反馈与诊断字段；通过版本与有效掩码为未来模式扩展保留空间。
 
 | 分组 | 方向 | 内容 | 状态 |
 |---|---|---|---|
@@ -290,17 +292,17 @@ CANopen 主站 → CANopenNode / OD
 | `model_alive` | 写 | 本轴 0x2F01，独立条目 | 首期 |
 
 - 模型每次检查调用返回值及每条状态，只使用全部成功的快照。绑定返回的类型和长度必须与帧契约一致。
-- 新增模式须补充核心模式处理、模型能力、OD、参数及测试，不假定只增加模式表一行即可完成。
-- 不支持的模式按 FR-MODE-04 拒绝，0x6061 保持先前已接受值；初始无模式时为 0。模型仍更新健康和实际反馈，但不得施加未接受模式的输出。
+- 首期只接受 PP；其他模式值按 FR-MODE-03 拒绝。模型仍更新健康和实际反馈，但不得施加未接受模式的输出。
+- 未来新增模式须补充核心模式处理、模型能力、OD、参数及测试，不假定只增加模式表一行即可完成。
 
 #### 7.5.4 运行阶段流程
 
-1. worker 在 RPDO 后消费已提交反馈，检查心跳和反馈年龄，处理安全命令，再推进 PDS、模式和 profile，发布下一命令快照及 TPDO 数据。
+1. worker 在 RPDO 后消费已提交反馈，检查心跳和反馈年龄，处理安全命令，再推进 PDS 与 PP profile，发布下一命令快照及 TPDO 数据。
 2. 模型线程一次 `read_batch(command_view)` 取快照，释放 API 内部锁后计算；在待机、QuickStop、FaultReactionActive、FAULT 中也持续执行和报告实际值。
 3. 模型一次写入完整 `feedback_submit`，逐项检查结果；成功只表示帧已校验并进入待消费缓存，不表示 PDS 已转换。由 0x2F04/0x2F05 判断处理确认与结果；拒绝时诊断并读取新命令后重新计算，不无限等待已被拒绝帧。
 4. `model_alive` 单独更新。独立反馈超时可检测“心跳仍更新但计算无有效结果”，不得用心跳代替计算进展。
 
-**动作与模式握手**：核心先发布动作请求而不是先提交目标 PDS 状态。`action_seq` 对每个新动作或抢占递增；模型以同 epoch、同 action_seq 返回 BUSY/DONE/ERROR。模型计算只执行有效命令，不自行重解原始 Controlword。模式请求也使用新的 action_seq；只有匹配的模式就绪响应才能更新 0x6061。模式未就绪不得使用新模式的非零 demand。匹配动作的旧响应或被抢占动作的延迟 DONE 均不得生效。
+**动作与 PP 握手**：核心先发布动作请求而不是先提交目标 PDS 状态。`action_seq` 对每个新动作或抢占递增；模型以同 epoch、同 action_seq 返回 BUSY/DONE/ERROR。模型计算只执行有效命令，不自行重解原始 Controlword。PP 就绪通过匹配的动作/反馈确认；匹配动作的旧响应或被抢占动作的延迟 DONE 均不得生效。模式进入/退出握手属于未来模式扩展。
 
 安全命令使核心立即撤销旧动作的逻辑输出权限，并发布优先安全动作；模型每次施加输出前检查最新动作/代次，发现抢占则丢弃旧计算。PDS 的完成仍等待匹配反馈。异步交换只能提供有界响应，不能承诺同步撤销物理效果；不得用于真实硬件安全保证。`action_timeout_us` 到期须锁存故障并切入失败关闭策略；若安全反应本身无反馈，则撤销输出许可、保留故障诊断并按已定义的无反馈反应进入 FAULT，不伪造 DONE。
 
@@ -313,7 +315,7 @@ CANopen 主站 → CANopenNode / OD
 
 #### 7.5.6 超时与缺省模型
 
-- **配置**：仅 `drive_402` 启用 402；其中显式选择 internal 或 external 模型、支持模式、周期及超时。未声明时保持现有通信行为。
+- **配置**：仅 `drive_402` 启用 402；其中显式选择 internal 或 external 模型、首期模式 PP、周期及超时。未声明时保持现有通信行为。
 - **启动握手**：external 模式在 `startup_timeout_us` 内必须收到当前 epoch 的有效反馈及心跳；此前禁止使能，不能静默启用 InternalModel。到期未就绪须诊断并故障。
 - **运行超时**：分别以 `heartbeat_timeout_us`、`feedback_timeout_us`、`action_timeout_us` 监测心跳变化、完整反馈消费及动作完成。使用 worker 本机单调时钟的实际经过时间，不以名义周期数换算；模型故障条件仍在时持续报告。
 - **失联**：已连接 external 模型超时后失败关闭，不自动切到 InternalModel。对外实际值保留最后有效值但标记陈旧，不能当作安全状态或新的 target reached。
@@ -340,10 +342,10 @@ CANopen 主站 → CANopenNode / OD
 
 `402/drive402.hpp` 当前的 `ExternalModel` 是纯 C++ 接口，不关心 OD，与本设计有以下差距：
 
-1. `Feedback` 需扩展力矩、有效性、模式就绪、限幅、持续故障、复位许可及动作响应。
-2. 建立有效动作/模式请求与 demand 输出，不能只向模型提供最终 PDS 状态。
+1. `Feedback` 需扩展位置有效性、PP 就绪、限幅、持续故障、复位许可及动作响应。
+2. 建立有效动作请求与 PP position demand 输出，不能只向模型提供最终 PDS 状态。
 3. 将存活、反馈及动作超时分开；心跳计数判断更新，本机单调时间判断超时。
-4. 增加完整帧 OD 扩展、pending/消费缓存、代次与序号校验、初始化权限检查。
+4. 增加完整帧 OD 扩展、pending/消费缓存、代次与序号校验，以及基于 JSON 的 OD/PDO 初始化校验。
 
 开发方案：`402/` 核心保持不依赖 OD 的纯逻辑，新增一个 OD 适配层（位于 `xnet_intergration/src/`），负责把 OD 快照映射为核心的输入，并把核心输出写回 OD。
 
@@ -361,12 +363,12 @@ CANopen 主站 → CANopenNode / OD
 |---|---|---|
 | 数据通道 | 同进程本地 C API，不产生额外模型 CAN 报文 | 延迟取决于两个线程的相位、计算与锁等待，不保证一周期反馈或两周期往返 |
 | 故障检测边界 | worker 存活且可取得锁时，能检测模型无锁挂起和无有效反馈 | 同进程崩溃可终止整个服务；持锁挂起可阻止超时检测，不宣称进程级故障隔离 |
-| 锁与抖动 | 短时交换、锁外计算 | 回调只校验/复制固定大小帧，实测 WCET，不执行文件 I/O 或模型步进 |
+| 锁与抖动 | 短时交换、锁外计算 | 回调只校验/复制固定大小帧，不执行文件 I/O 或模型步进；耗时仅作诊断记录 |
 | 访问与完整性 | 仅心跳、完整帧允许本地模型写 | 网络写交换对象、直接写标准实际值均被拒绝；原子性来自单帧 OD 扩展，不来自 write_batch |
 | 复位与生命周期 | 批量 ID 可保留，模型会话必须失效 | uninitialize 后重新绑定；Reset/stop/start 更新 epoch 并重新握手 |
 | ABI | 不新增 C 函数，不改变已有结构及通用批量语义 | 必须开发帧扩展、适配器、核心响应接口并更新说明，绝非只改头注释 |
 | 宿主进程 / 线程 | 首期同进程、独立模型线程 | 若要求崩溃隔离，应另立 IPC、独立看门狗与进程恢复需求，不在本期隐含承诺 |
-| 驱动响应 | 模型不拥有 PDS，但提供动作完成、模式就绪和实际动态 | 核心保留状态生成权，避免双状态机及“先转换再等待完成”的循环依赖 |
+| 驱动响应 | 模型不拥有 PDS，但提供动作完成、PP 就绪和实际位置动态 | 核心保留状态生成权，避免双状态机及“先转换再等待完成”的循环依赖 |
 
 **结论**：按上述契约实现适配层和核心扩展后可集成 Slave 驱动模型；当前库不因此自动具备这些能力。先使用理想跟随且可注入延迟、限幅和故障的模型验收，再替换为复杂模型。
 
@@ -418,24 +420,24 @@ CANopen 主站 → CANopenNode / OD
 
 **启动阶段**
 
-1. 加载 `drive_402`，按模式生成标准对象及每轴交换对象，校验模式交集、类型、单位、权限和全部超时配置。
-2. 绑定 OD 扩展、初始化核心和新 epoch，默认禁止输出；根据配置显式选择 internal 或 external。
+1. 加载设备 JSON；若声明 `drive_402`，校验其 OD、PDO、PP 对象类型/权限/单位、external 模型所需本地扩展对象及全部超时配置。对象由 JSON 提供，不由运行时生成或补齐。
+2. 校验成功后绑定 OD 扩展、初始化核心和新 epoch，默认禁止输出；根据配置显式选择 internal 或 external。
 3. 应用 setup 绑定分组、初始化模型，启动后以当前 epoch 反馈与心跳完成握手；external 缺失不得回退。
-4. NMT 与 PDS 独立管理；即便 NMT Operational，也须完成模型就绪及主站使能序列。
+4. NMT 与 PDS 分层管理；NMT Operational 只是 DS402 可查询的通信状态之一，仍须完成 PP 模型就绪及主站使能序列。
 
 **运行阶段（两个线程异步执行，不保证表内步骤同周期完成）**
 
 | 步 | 执行者 | 动作 |
 |---|---|---|
-| 1 | 主站 | 通过 SDO 或 RPDO 写入 Controlword、模式、目标值 |
+| 1 | 主站 | 通过 SDO 或 RPDO 写入 Controlword、PP 模式值和目标位置 |
 | 2 | worker | 接收与 RPDO 完成后快照命令，消费合法 pending 帧；过期/旧代次帧拒绝并诊断 |
-| 3 | 402 核心 | 以实际经过时间检查心跳、反馈和动作超时，处理持续故障及安全抢占 |
-| 4 | 402 核心 | 根据合法命令与匹配动作结果推进 PDS、模式和 profile；不覆盖 target |
-| 5 | worker | 发布下一有效动作/模式/demand 快照、状态与已接受实际值，更新处理确认及结果 |
+| 3 | 402 核心 | 以实际经过时间检查心跳、反馈和动作超时，处理持续故障及安全抢占；可读取 NMT 状态作为策略输入 |
+| 4 | 402 核心 | 根据合法命令与匹配动作结果推进 PDS 和 PP profile；不覆盖 target |
+| 5 | worker | 发布下一有效动作/PP demand 快照、状态与已接受实际值，更新处理确认及结果 |
 | 6 | 301 核心 | TPDO 处理和发送；402 必须位于 RPDO 与 TPDO 处理之间 |
 | 7 | 模型线程 | 读取 command_view，在库锁外按固定步长计算；有未确认帧时先检查处理结果，不阻止本地步进 |
 | 8 | 模型线程 | 在所有 PDS 状态持续反馈；施加输出前检查动作/代次，提交完整帧，独立更新心跳 |
-| 9 | worker | 后续周期消费反馈；只有满足模式判据且反馈有效才更新 target reached 等状态 |
+| 9 | worker | 后续周期消费反馈；只有满足 PP 判据且反馈有效才更新 target reached 等状态 |
 
 **正常运动示例（PP 模式，示意，省略上电与 Switch On 的中间步骤）**
 
@@ -529,30 +531,28 @@ CANopen 主站 → CANopenNode / OD
 - 0x6041 由 402 线程写入，由 TPDO 读取：需在 OD 锁内写入。
 - pending 帧的校验、复制与消费由 runtime 锁保护；模型计算结果只通过帧发布，不共享未同步的模型内部指针。
 
-### 8.4 周期与时延
+### 8.4 周期与时延（功能验证）
 
-- 模型使用固定步长，可从 2 ms 验证；worker 使用实际 dt。两者不要求同相，也不保证同一 SYNC 内反馈。
+- 当前目标是 CANopen 毫秒级基本控制；模型可使用固定步长（例如 2 ms）开展功能验证，worker 使用实际 dt。两者不要求同相，也不保证同一 SYNC 内反馈。
 - 当前 worker 的 `wait_for(worker_period_us)` 是处理后等待，不是绝对周期截止期限。晚到时记录 overrun，禁止无界补步；模型步进策略及最大允许延迟须在配置中明确。
-- 反馈迟于产生它的命令是正常行为，通过 command_seq 和本机发布时刻计算年龄；超限则诊断并拒绝。心跳、反馈、动作超时预算须覆盖模型周期、worker 周期、计算和锁等待，并留出可测裕量。
-- 验收至少记录周期分布/最大抖动、模型 WCET、API 持锁时长、命令到反馈与 TPDO 的延迟、反馈最大年龄和丢帧/超时计数。目标阈值须在 §9.6 决定，不把平均值或“一两个周期”的估算当作最坏上界。
+- 反馈迟于产生它的命令是正常行为，通过 command_seq 和本机发布时刻计算年龄；超限则诊断并拒绝。功能测试使用配置的心跳、反馈、动作超时检查异常路径。
+- 可记录周期分布、模型处理时间、API 持锁时长、命令到反馈与 TPDO 的延迟、反馈年龄和丢帧/超时计数，用于解释功能测试结果；首期不设性能合格阈值，也不据此声明实时或硬实时保证。
 
 ---
 
-## 9. 设计决策与待决问题
+## 9. 设计决策与待办
 
-1. **许可证与复用**：canopennode-rtt 的许可证是否允许复制到本仓库？（影响 §7.2）
-2. **NMT Stopped 时的 PDS 策略**：转到 quickStop 还是 disableVoltage？需与 Kinco 硬件行为对齐。
-3. **xnet ABI（本次确定）**：不新增 C 函数、不改现有结构和通用批量语义；扩展每轴本地 OD 帧协议及诊断对象。
-4. **模式范围（待确认）**：PP/PV 为首期基线；是否加入 PT 或其他模式由模型能力与验收范围决定。若接入力矩模型，必须单独选择 PT=4 或 CST=10 并补全对象/参数，不因参考 Torque Controller 就强制所有模型支持 PT。
-5. **运行中切换模式**：是否允许 OPERATION_ENABLED 下写 0x6060？
-6. **周期与 WCET（待确认）**：确定目标 CPU、worker/模型周期、各 WCET、最大持锁/抖动/端到端延迟阈值，以及 startup/heartbeat/feedback/action 超时、command_max_age_us 和超周期步进策略。未填写不得宣称实时验收通过。
-7. **测试硬件**：是否有 Kinco FD124 实物用于验收？还是只做仿真验收？
-8. **EtherCAT 行为对照**：是否需要保证与 EtherCAT 示例 `cia402appl.c` 的 Statusword 在所有状态下逐位一致？
-9. **控制权边界（本次确定）**：PDS 和 Statusword 归核心；普通转换由主站发起，模型只提供动作结果/模式就绪、实际值、限幅及故障条件。动作完成影响转换时机，模型不能指定目标 PDS。
-10. **故障与恢复（本次修订）**：0x2F00 为完整反馈导出的当前故障条件，不直接由模型写；首次码锁存到 0x603F，后续新条件独立 EMCY。仅故障源消失且健康、复位许可成立时接受主站新边沿，并等待匹配动作完成。
-11. **执行与轨迹所有权（本次确定）**：同进程、独立模型线程、库锁外计算；核心负责 profile/斜坡，模型负责跟踪动态与限幅，不实现第二份 PDS。
-12. **交换与生命周期（本次确定）**：单条目完整帧校验提交，独立心跳，worker 统一消费；代次/序号防旧帧，external 缺失或失联不回退 internal。
-13. **实现前协议冻结（待完成）**：按 §7.5 冻结帧版本 1 的逐字节布局、全部动作/模式枚举、错误码表、配置 schema 和诊断字段，提供编码往返测试；不得边联调边猜测结构体布局。
+1. **许可证与复用 [待确认]**：确认 canopennode-rtt 的许可证是否允许将其实现移植到本仓库；若不允许，按其公开行为重新实现。
+2. **目标设备配置 [实现前核对]**：核对首期目标设备 EDS 转换得到的 JSON，确认 PP 必需 OD/PDO 项满足 FR-OD-01。若不满足，应修正转换/配置或报告配置不兼容，不得自动补项。
+3. **xnet ABI（已确定）**：不新增 C 函数、不改现有结构和通用批量语义；使用本地交换帧协议及诊断对象。
+4. **首期模式（已确定）**：只实现 PP；PV、PT、HM、CSP、CSV、CST 等均为未来扩展。首期不支持运行时模式切换。
+5. **功能验证目标（已确定）**：以 CANopen 毫秒级基本控制为目标，只做功能验证；周期/WCET/抖动/延迟记录不设性能验收门槛，不作硬实时声明。
+6. **NMT/DS402 边界（已确定）**：NMT 管理底层通信；DS402 查询 NMT 状态并独占决定电机控制动作、PDS 转换及相关 OD 更新。各 NMT 状态下 DS402 的具体命令接受与输出策略须在 DS402 行为表和测试中定义。
+7. **控制权边界（已确定）**：PDS 和 Statusword 归核心；普通转换由主站发起，模型只提供动作结果、PP 就绪、实际值、限幅及故障条件。动作完成影响转换时机，模型不能指定目标 PDS。
+8. **故障与恢复（已确定）**：0x2F00 为完整反馈导出的当前故障条件，不直接由模型写；首次码锁存到 0x603F，后续新条件独立 EMCY。仅故障源消失且健康、复位许可成立时接受主站新边沿，并等待匹配动作完成。
+9. **执行与轨迹所有权（已确定）**：同进程、独立模型线程、库锁外计算；核心负责 PP profile/斜坡，模型负责跟踪动态与限幅，不实现第二份 PDS。
+10. **交换与生命周期（已确定）**：单条目完整帧校验提交，独立心跳，worker 统一消费；代次/序号防旧帧，external 缺失或失联不回退 internal。
+11. **实现前协议冻结（实现前完成）**：按 §7.5 冻结帧版本 1 的逐字节布局、首期动作/反馈枚举、错误码表、JSON schema 和诊断字段，提供编码往返测试；不得边联调边猜测结构体布局。
 
 本次确定项是后续开发约束，不代表实现完成或硬件安全认证；§1.1 与 §7.5.8 描述的现有实现差距仍需开发验证。
 
@@ -567,33 +567,36 @@ CANopen 主站 → CANopenNode / OD
 | T-PDS | 全部 PDS 合法转换；非法转换忽略；0x000F 回调顺序 |
 | T-CW | Controlword 位解析；边沿复位；保留位处理 |
 | T-SW | 每个 PDS 状态下 Statusword 的状态位 |
-| T-MODE | 0x6060 写入校验；0x6061 回读；0x6502 与编译开关一致性 |
+| T-MODE | 只接受 PP 的 0x6060 写入校验；0x6061 回读；0x6502 仅声明 PP 能力 |
+| T-CONFIG | 普通设备 JSON 不触发 402 校验；402 JSON 完整时初始化成功；必需对象/PDO 缺失、类型或映射冲突时初始化失败 |
 | T-SAFE | QuickStop、DisableVoltage 抢占 BUSY 动作 |
 | T-FLT | 故障路径、故障锁存、0x603F 更新、fail-closed |
 | T-RST | Reset Node / Communication 对 OD 与绑定的影响 |
+| T-NMT | NMT 状态改变本身不直接改写 PDS；DS402 按自身策略读取 NMT 状态并更新 PDS/OD |
 | T-MULTI | 多轴 OD 基址与隔离 |
-| T-MODEL-ACTION | 模型延迟完成、ERROR、动作超时、安全抢占与迟到 DONE；模式未就绪不输出新模式非零 demand |
+| T-MODEL-ACTION | 模型延迟完成、ERROR、动作超时、安全抢占与迟到 DONE；PP 未就绪时不输出 PP demand |
 | T-MODEL-FRAME | 编解码、长度/版本/枚举/有效位错误、部分写失败、pending 占用、重复提交不刷新年龄、拒绝确认与重算；失败不得污染实际值 |
 | T-MODEL-LIFE | 启动无反馈、待机/FAULT 心跳、心跳正常但反馈超时、外部失联不回退、单调时钟判断及计数回绕 |
 | T-MODEL-RESET | 计算期间 Reset/stop/start、旧代次/旧动作拒绝、uninitialize 后重绑与线程退出；持续故障不允许复位，条件消失后必须新边沿 |
-| T-MODEL-UNITS | Target 不被覆盖、profile 不重复、正负方向、单位缩放/溢出、限幅及 target reached 容差/持续时间；按启用模式覆盖 |
+| T-MODEL-UNITS | Target 不被覆盖、PP profile 不重复、正负方向、单位缩放/溢出、限幅及 target reached 容差/持续时间 |
 
 建议以 canopennode-rtt 的 `examples/cia402_multi_axis_device/` 与 `examples/demo_device/` 为参考，编写 host 侧（x86）测试，不依赖 RT-Thread。
 
 ### 10.2 集成测试（xnet）
 
 - 使用 `xnet_intergration/tests/fake_xnet` 与 `tests/test_integration.cpp` 扩展 402 场景。
+- 使用一份普通设备 JSON 和一份启用 402 的 EDS 转换 JSON 验证初始化分支；后者缺少 PP 必需 OD 或 PDO 配置时必须启动失败。
 - 通过 SDO / PDO 写 0x6040，检查 0x6041 状态序列。
-- 覆盖 Reset Node、Reset Communication、NMT 切换、Node Guarding 超时场景。
+- 覆盖 Reset Node、Reset Communication、NMT 切换和 Node Guarding 超时；验证 NMT 层不直接执行电机控制动作，PDS/Statusword 变化只由 DS402 产生。
 - 使用 fake XNET 加同进程模型线程验证 RPDO → 402 → TPDO 顺序、帧提交与消费、多轴独立序号/代次及本地/网络权限。
 - 注入单帧写失败、批量其他条目失败、模型延迟/无锁挂起、持续故障和复位竞争；验证失败不被心跳成功掩盖，拒绝帧可恢复重算。
 - 理想跟随模型先验收，再加入可配置延迟、斜坡跟踪误差、限幅、故障源；同一契约下替换复杂模型。若采用 Simulink 生成代码，验证 initialize/step/terminate、端口类型与固定步长；TwinCAT TcCOM 或 FMU 不是本地 C API 的隐式运行时。
-- 在目标平台按 §8.4 记录时序指标，对照 §9.6 阈值逐项验收；仅桌面测试通过不代表满足实时预算。
+- 以功能正确性为验收标准；可按 §8.4 记录周期与延迟诊断信息，但不设性能门槛或实时性验收结论。
 
-### 10.3 硬件验收（Kinco FD124，待确认）
+### 10.3 可选设备行为对照（Kinco FD124）
 
-- 上电 → Shutdown → Switch On → Enable Operation → Quick Stop → Fault Reset 的完整序列。
-- 记录每一步 Statusword 与驱动实际状态的对应关系。
+- 如有 Kinco FD124 实物，可对比 EDS 转换 JSON 与设备实际支持的对象/PDO 配置，并检查上电 → Shutdown → Switch On → Enable Operation → Quick Stop → Fault Reset 的功能序列。
+- 此项为可选功能对照，不是首期必需验收，也不包含实时性能或硬件安全认证。
 
 ### 10.4 验证命令
 
@@ -605,13 +608,13 @@ CANopen 主站 → CANopenNode / OD
 
 | 阶段 | 内容 | 出口标准 |
 |---|---|---|
-| M0 | 决策：§9 待确认项、帧布局/配置/错误码冻结 | 模式与目标时序预算明确，接口编码往返测试可执行 |
+| M0 | 决策：§9 待确认项、PP 帧布局/JSON 配置/错误码冻结 | EDS 转换配置与 PP 必需对象/PDO 校验规则明确，接口编码往返测试可执行 |
 | M1 | Pure-C 核心骨架：DriveIF、PDS 状态机、Controlword/Statusword | T-PDS、T-CW、T-SW 通过 |
-| M2 | OD 绑定、多轴、0x6502 与模式开关 | T-MODE、T-MULTI 通过 |
+| M2 | JSON OD/PDO 初始化校验、OD 绑定、多轴与 PP 能力声明 | T-CONFIG、T-MODE、T-MULTI 通过 |
 | M3 | 故障、复位、安全抢占 | T-SAFE、T-FLT、T-RST 通过 |
 | M4 | xnet 与模型适配：每轴帧/OD 权限、握手、独立线程、消费与 Reset 重绑 | T-MODEL-* 与 fake XNET 集成测试通过，ABI 无破坏，故障/旧帧不污染有效状态 |
-| M5 | 模式扩展（PP/PV 首期，其余按 §9.4） | 对应模式测试通过 |
-| M6 | 目标平台时序与 Kinco FD124 硬件验收（若纳入范围） | §8.4 及 §9.6 阈值通过，§10.3 记录完整 |
+| M5 | 未来模式扩展（不属于首期） | 另行定义范围与需求后启动 |
+| M6 | 可选 Kinco FD124 行为对照 | §10.3 的对象/PDO 与功能序列记录完成；非首期出口条件 |
 
 ---
 
@@ -621,15 +624,16 @@ CANopen 主站 → CANopenNode / OD
 - [ ] 所有回调非阻塞，不获取锁。
 - [ ] Statusword 状态位与 PDS 状态一一对应。
 - [ ] Fault Reset 为边沿触发。
-- [ ] 0x6502 与编译开关一致。
+- [ ] 0x6502 只声明 PP，且 JSON、对象与能力保持一致。
+- [ ] 设备 JSON 在初始化阶段完成 OD/PDO 校验；缺项或冲突明确报配置错误。
 - [ ] Reset 后重新绑定 OD 扩展。
 - [ ] `xnet_canopen.h` 未破坏式修改。
 - [ ] Target / Demand / Actual 唯一所有权，模型无第二份 PDS 和 profile。
 - [ ] 完整帧布局已冻结，失败无污染；处理确认包含拒绝结果，模型可恢复。
 - [ ] 模型在待机、故障反应和 FAULT 中持续反馈/心跳，不把实际值强制清零。
-- [ ] 动作/模式握手、epoch 与序号校验、旧帧和旧 DONE 拒绝均有测试。
+- [ ] 动作握手、epoch 与序号校验、旧帧和旧 DONE 拒绝均有测试；首期无运行时模式切换。
 - [ ] 故障条件、锁存记录、复位许可分离；external 超时不切换 InternalModel。
-- [ ] 模型计算在锁外，线程退出与句柄释放有序；时序实测达标且说明进程隔离限制。
+- [ ] 模型计算在锁外，线程退出与句柄释放有序；功能验证通过并说明进程隔离限制，不宣称硬实时达标。
 - [ ] 注释仅用于需要澄清之处。
 - [ ] 提交信息包含 Co-authored-by trailer。
 
