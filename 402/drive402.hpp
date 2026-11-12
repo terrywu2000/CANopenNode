@@ -3,13 +3,14 @@
 
 /**
  * @file
- * CiA 402 drive core: power-drive state machine, PP/PV profile generation, and
+ * CiA 402 drive core: power-drive state machine and PP profile generation at
  * the motor model boundary. This unit has no CANopen or XNET dependency. The
  * device passes OD values in through Inputs and reads Status back out, all under
  * the device runtime mutex, so the core itself is not thread-safe.
  */
 
 #include <cstdint>
+#include "CO_402_protocol.h"
 
 namespace xco::d402 {
 
@@ -26,7 +27,6 @@ enum class Pds : uint8_t {
 };
 
 constexpr int8_t mode_profile_position = 1;
-constexpr int8_t mode_profile_velocity = 3;
 
 /** Actual axis state reported by a motor model for one cycle. */
 struct Feedback {
@@ -65,6 +65,7 @@ public:
     Feedback sample(int32_t demand_position, int32_t demand_velocity, uint32_t dt_us) override;
     bool fresh() const override { return has_feedback_ && age_us_ < timeout_us_; }
     bool has_feedback() const { return has_feedback_; }
+    void reset() { age_us_ = 0; has_feedback_ = false; last_ = {}; }
 
 private:
     uint32_t timeout_us_;
@@ -77,13 +78,19 @@ private:
 struct Inputs {
     uint16_t controlword = 0;
     int8_t mode_requested = 0; /**< 0x6060. */
+    bool nmt_operational = true; /**< NMT state is owned by the lower CANopen layer. */
     int32_t target_position = 0; /**< 0x607A. */
-    int32_t target_velocity = 0; /**< 0x60FF. */
     uint32_t profile_velocity = 0; /**< 0x6081 PP profile velocity. */
     uint32_t max_profile_velocity = 0; /**< 0x607F. */
     uint32_t profile_acceleration = 0; /**< 0x6083. */
     uint32_t profile_deceleration = 0; /**< 0x6084. */
     uint32_t quick_stop_deceleration = 0; /**< 0x6085. */
+    uint32_t position_tolerance = 0; /**< Position difference accepted for target reached. */
+    uint32_t target_reached_time_us = 0; /**< Required in-tolerance duration. */
+    bool model_ready = true; /**< External model has acknowledged readiness for PP operation. */
+    bool reset_permitted = true; /**< External model permits the fault-reset edge. */
+    uint32_t action_response_seq = 0;
+    uint8_t action_result = CO_402_ACTION_RESULT_NONE;
     int16_t quick_stop_option = 2; /**< 0x605A. */
     int16_t fault_reaction_option = 0; /**< 0x605E. */
 };
@@ -98,12 +105,15 @@ struct Status {
     bool feedback_fresh = false;
     bool model_fault = false;
     bool external_model = false;
+    bool model_ready = true;
+    uint8_t action = CO_402_ACTION_NONE;
+    uint32_t action_seq = 1;
+    bool action_pending = false;
+    bool output_allowed = false;
 };
 
 /**
- * Drive state machine and profile generator. Implemented modes are PP and PV.
- * Adding a mode extends the mode switch in motion() and mode_supported(); the
- * state machine and fault paths do not depend on the mode.
+ * Drive state machine and PP profile generator. Additional modes are future work.
  */
 class Drive {
 public:
@@ -114,6 +124,10 @@ public:
     bool external_model() const { return use_external_; }
     /** Post host feedback; false when the external model is not selected. */
     bool post_feedback(const Feedback& feedback);
+    /** Set an external transport/startup fault that cannot be inferred from feedback alone. */
+    void set_external_fault(bool fault);
+    /** Set PP readiness and reset permission from the latest accepted model frame. */
+    void set_external_permissions(bool ready, bool reset_permitted);
 
     /** Run one cycle: state transitions, profile update, then the model sample. */
     void step(const Inputs& in, uint32_t dt_us);
@@ -129,6 +143,7 @@ public:
 private:
     MotorModel& model();
     void transition(const Inputs& in);
+    void request_transition(uint8_t action, Pds target);
     void motion(const Inputs& in, double dt_s);
     void latch_setpoint(const Inputs& in);
     void approach(double target_velocity, uint32_t accel, uint32_t decel, double dt_s);
@@ -150,7 +165,17 @@ private:
     double pending_pos_ = 0.0;
     bool halt_ = false;
     bool model_fault_ = false;
+    bool external_transport_fault_ = false;
+    bool external_model_ready_ = false;
+    bool external_reset_permitted_ = false;
+    uint8_t action_ = CO_402_ACTION_NONE;
+    uint32_t action_seq_ = 1;
+    bool action_pending_ = false;
+    uint8_t pending_action_ = CO_402_ACTION_NONE;
+    Pds pending_pds_ = Pds::switch_on_disabled;
+    bool action_failed_ = false;
     bool speed_reached_ = false;
+    uint64_t target_reached_age_us_ = 0;
     int16_t reaction_option_ = 0;
     int16_t quick_stop_option_ = 2;
     /** Model fault, or external feedback that is stale (a timeout is a fault). */

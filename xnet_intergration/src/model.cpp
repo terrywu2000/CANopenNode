@@ -196,7 +196,7 @@ static Json scalar(const char* type, const Json& value, const char* access = "ro
 void Model::load(const Json& root) {
     check_user_inputs(root);
     keys(root, {"schema_version", "node_id", "bitrate_kbps", "can_termination", "identity", "heartbeat_ms", "worker_period_us",
-                "device_type", "device_name", "objects", "rpdos", "tpdos", "node_guarding", "sync", "emcy"}, "model");
+                "device_type", "device_name", "objects", "rpdos", "tpdos", "node_guarding", "sync", "emcy", "drive_402"}, "model");
     require(unsigned_number(root.at("schema_version"), 1, "schema_version") == 1, XNET_CO_MODEL_ERROR, "unsupported schema_version");
     startup_node = static_cast<uint8_t>(unsigned_number(root.at("node_id"), 255, "node_id"));
     require((startup_node >= 1 && startup_node <= 127) || startup_node == 255, XNET_CO_MODEL_ERROR, "invalid node_id");
@@ -209,6 +209,54 @@ void Model::load(const Json& root) {
     }
     worker_period_us = static_cast<uint32_t>(unsigned_number(root.value("worker_period_us", Json(1000)), 100000, "worker_period_us"));
     require(worker_period_us >= 100, XNET_CO_MODEL_ERROR, "worker_period_us must be 100..100000");
+    drive_402_enabled = root.contains("drive_402");
+    if (drive_402_enabled) {
+        const auto& drive = root.at("drive_402");
+        keys(drive, {"profile", "model", "position_tolerance_counts", "target_reached_time_us",
+                     "startup_timeout_us", "heartbeat_timeout_us", "feedback_timeout_us",
+                     "action_timeout_us", "command_max_age_us"}, "drive_402");
+        require(drive.at("profile").is_string() && drive.at("profile") == "PP",
+                XNET_CO_MODEL_ERROR, "drive_402.profile must be PP in this release");
+        require(drive.at("model").is_string()
+                && (drive.at("model") == "internal" || drive.at("model") == "external"),
+                XNET_CO_MODEL_ERROR, "drive_402.model must be internal or external");
+        drive_402_external = drive.at("model") == "external";
+        drive_position_tolerance = static_cast<uint32_t>(
+            unsigned_number(drive.at("position_tolerance_counts"), INT32_MAX, "drive_402.position_tolerance_counts"));
+        drive_target_reached_time_us = static_cast<uint32_t>(
+            unsigned_number(drive.at("target_reached_time_us"), UINT32_MAX, "drive_402.target_reached_time_us"));
+        auto timeout = [&](const char* key) {
+            require(drive.contains(key), XNET_CO_MODEL_ERROR, std::string("external drive_402 requires ") + key);
+            const auto value = static_cast<uint32_t>(unsigned_number(drive.at(key), UINT32_MAX,
+                std::string("drive_402.") + key));
+            require(value > worker_period_us, XNET_CO_MODEL_ERROR,
+                std::string("drive_402.") + key + " must exceed worker_period_us");
+            return value;
+        };
+        if (drive_402_external) {
+            drive_startup_timeout_us = timeout("startup_timeout_us");
+            drive_heartbeat_timeout_us = timeout("heartbeat_timeout_us");
+            drive_feedback_timeout_us = timeout("feedback_timeout_us");
+            drive_action_timeout_us = timeout("action_timeout_us");
+            drive_command_max_age_us = timeout("command_max_age_us");
+        } else {
+            drive_startup_timeout_us = drive_heartbeat_timeout_us = drive_feedback_timeout_us = 0;
+            drive_action_timeout_us = drive_command_max_age_us = 0;
+            for (const char* key : {"startup_timeout_us", "heartbeat_timeout_us", "feedback_timeout_us",
+                                    "action_timeout_us", "command_max_age_us"}) {
+                require(!drive.contains(key), XNET_CO_MODEL_ERROR,
+                        std::string("drive_402.") + key + " is only valid for external models");
+            }
+        }
+    } else {
+        drive_402_external = false;
+        drive_has_error_code = false;
+        drive_has_quick_stop_deceleration = false;
+        drive_position_tolerance = 0;
+        drive_target_reached_time_us = 0;
+        drive_startup_timeout_us = drive_heartbeat_timeout_us = drive_feedback_timeout_us = 0;
+        drive_action_timeout_us = drive_command_max_age_us = 0;
+    }
     const auto& id = root.at("identity");
     keys(id, {"vendor_id", "product_code", "revision_number", "serial_number"}, "identity");
     const char* id_keys[] = {"vendor_id", "product_code", "revision_number", "serial_number"};
@@ -289,8 +337,7 @@ void Model::load(const Json& root) {
     var(0x1019, scalar("UNSIGNED8", counter));
     auto& sdo = add(0x1200, {scalar("UNSIGNED8", 2), scalar("UNSIGNED32", 0x600), scalar("UNSIGNED32", 0x580)}, false);
     sdo.values[1].is_node_relative = sdo.values[2].is_node_relative = true;
-    // Application objects are only storage/access metadata here. For example,
-    // adding 0x6040 does not give the library a CiA 402 controlword interpreter.
+    // Application objects remain plain OD storage unless drive_402 is explicit.
     require(root.at("objects").is_array() && root.at("objects").size() <= 4096, XNET_CO_MODEL_ERROR, "objects must be an array of at most 4096 entries");
     for (const auto& j : root.at("objects")) {
         const uint16_t index = static_cast<uint16_t>(unsigned_number(j.at("index"), 0xbfff, "index"));
@@ -381,6 +428,10 @@ void Model::load(const Json& root) {
                 uint8_t sub = static_cast<uint8_t>(unsigned_number(m.value("subindex", Json(0)), 254, "mapping subindex"));
                 auto& v = value(index, sub);
                 require((v.attr & (is_transmit_pdo ? ODA_TPDO : ODA_RPDO)) != 0 && v.size <= 8, XNET_CO_MODEL_ERROR, "PDO mapping attribute/type mismatch");
+                if (enabled) {
+                    if (is_transmit_pdo) v.mapped_tpdo = true;
+                    else v.mapped_rpdo = true;
+                }
                 bytes += v.size;
                 // CiA mapping word: index in bits 31..16, subindex in 15..8, mapped bit length in 7..0.
                 mapping.push_back(scalar("UNSIGNED32", (uint32_t(index) << 16) | (uint32_t(sub) << 8) | (v.size * 8)));
@@ -390,6 +441,100 @@ void Model::load(const Json& root) {
         }
     };
     pdos("rpdos", false); pdos("tpdos", true);
+    if (drive_402_enabled) {
+        auto has_object = [&](uint16_t index) {
+            return std::any_of(objects.begin(), objects.end(), [index](const auto& candidate) {
+                return candidate->index == index;
+            });
+        };
+        auto required = [&](uint16_t index, const char* type, uint32_t size, bool writable,
+                            bool command, bool feedback) -> Value& {
+            auto object = std::find_if(objects.begin(), objects.end(), [&](const auto& candidate) {
+                return candidate->index == index;
+            });
+            std::ostringstream where;
+            where << "drive_402 requires OD 0x" << std::hex << index;
+            require(object != objects.end(), XNET_CO_MODEL_ERROR, where.str() + ": missing object");
+            require((*object)->is_var_object && (*object)->values.size() == 1
+                    && (*object)->values[0].sub == 0,
+                    XNET_CO_MODEL_ERROR, where.str() + ": expected scalar VAR at subindex 0");
+            auto& v = (*object)->values[0];
+            require(v.type == type && v.size == size, XNET_CO_MODEL_ERROR,
+                    where.str() + ": expected " + type);
+            require((v.attr & ODA_SDO_R) != 0 && ((v.attr & ODA_SDO_W) != 0) == writable,
+                    XNET_CO_MODEL_ERROR, where.str() + ": invalid SDO access");
+            require(writable || (!v.allows_local_write && !v.mapped_rpdo),
+                    XNET_CO_MODEL_ERROR, where.str() + ": output object must not be locally or RPDO writable");
+            require(!command || !v.mapped_tpdo, XNET_CO_MODEL_ERROR,
+                    where.str() + ": command object must not be mapped to a TPDO");
+            require(!feedback || !v.mapped_rpdo, XNET_CO_MODEL_ERROR,
+                    where.str() + ": feedback object must not be mapped to an RPDO");
+            return v;
+        };
+        drive_has_error_code = has_object(0x603f);
+        if (drive_has_error_code) required(0x603f, "UNSIGNED16", 2, false, false, false);
+        required(0x6040, "UNSIGNED16", 2, true, true, false);
+        required(0x6041, "UNSIGNED16", 2, false, false, true);
+        auto& mode = required(0x6060, "INTEGER8", 1, true, false, false);
+        required(0x6061, "INTEGER8", 1, false, false, false);
+        required(0x6064, "INTEGER32", 4, false, false, true);
+        auto& target = required(0x607a, "INTEGER32", 4, true, true, false);
+        auto& velocity = required(0x6081, "UNSIGNED32", 4, true, false, false);
+        auto& acceleration = required(0x6083, "UNSIGNED32", 4, true, false, false);
+        auto& deceleration = required(0x6084, "UNSIGNED32", 4, true, false, false);
+        int8_t selected_mode = 0;
+        uint32_t profile_velocity = 0, profile_acceleration = 0, profile_deceleration = 0;
+        std::memcpy(&selected_mode, mode.data(), sizeof(selected_mode));
+        std::memcpy(&profile_velocity, velocity.data(), sizeof(profile_velocity));
+        std::memcpy(&profile_acceleration, acceleration.data(), sizeof(profile_acceleration));
+        std::memcpy(&profile_deceleration, deceleration.data(), sizeof(profile_deceleration));
+        require(selected_mode == 1, XNET_CO_MODEL_ERROR, "drive_402 requires 0x6060 initialized to PP (1)");
+        if (has_object(0x6502)) {
+            auto& supported = required(0x6502, "UNSIGNED32", 4, false, false, false);
+            uint32_t supported_modes = 0;
+            std::memcpy(&supported_modes, supported.data(), sizeof(supported_modes));
+            require((supported_modes & 1U) != 0, XNET_CO_MODEL_ERROR, "drive_402 0x6502 must advertise PP");
+        }
+        require(profile_velocity > 0 && profile_acceleration > 0 && profile_deceleration > 0,
+                XNET_CO_MODEL_ERROR, "drive_402 PP profile velocity/acceleration/deceleration must be positive");
+        drive_has_quick_stop_deceleration = has_object(0x6085);
+        if (drive_has_quick_stop_deceleration) {
+            auto& quick_stop_deceleration = required(0x6085, "UNSIGNED32", 4, true, false, false);
+            uint32_t quick_stop_decel = 0;
+            std::memcpy(&quick_stop_decel, quick_stop_deceleration.data(), sizeof(quick_stop_decel));
+            require(quick_stop_decel > 0, XNET_CO_MODEL_ERROR, "drive_402 0x6085 must be positive when configured");
+        }
+        (void)target;
+        if (drive_402_external) {
+            const struct RequiredExchange { uint16_t index; const char* type; uint32_t size; bool local_write; } exchange[] = {
+                {0x2f00, "UNSIGNED16", 2, false},
+                {0x2f01, "UNSIGNED32", 4, true},
+                {0x2f02, "OCTET_STRING", CO_402_COMMAND_FRAME_SIZE, false},
+                {0x2f03, "OCTET_STRING", CO_402_FEEDBACK_FRAME_SIZE, true},
+                {0x2f04, "UNSIGNED32", 4, false},
+                {0x2f05, "UNSIGNED16", 2, false},
+            };
+            for (const auto& requirement : exchange) {
+                auto object = std::find_if(objects.begin(), objects.end(), [&](const auto& candidate) {
+                    return candidate->index == requirement.index;
+                });
+                std::ostringstream where;
+                where << "external drive_402 requires OD 0x" << std::hex << requirement.index;
+                require(object != objects.end(), XNET_CO_MODEL_ERROR, where.str() + ": missing object");
+                require((*object)->is_var_object && (*object)->values.size() == 1
+                        && (*object)->values[0].sub == 0,
+                        XNET_CO_MODEL_ERROR, where.str() + ": expected scalar VAR at subindex 0");
+                const auto& v = (*object)->values[0];
+                require(v.type == requirement.type && v.size == requirement.size,
+                        XNET_CO_MODEL_ERROR, where.str() + ": invalid type or size");
+                require((v.attr & ODA_SDO_R) && !(v.attr & ODA_SDO_W)
+                        && !(v.attr & (ODA_RPDO | ODA_TPDO)) && !v.mapped_rpdo && !v.mapped_tpdo,
+                        XNET_CO_MODEL_ERROR, where.str() + ": must be SDO read-only and unmapped");
+                require(v.allows_local_write == requirement.local_write,
+                        XNET_CO_MODEL_ERROR, where.str() + ": invalid local_write permission");
+            }
+        }
+    }
     // OD_find uses binary search. Publish pointers only after all owning storage is finalized.
     std::sort(objects.begin(), objects.end(), [](const auto& a, const auto& b) { return a->index < b->index; });
     for (size_t i = 1; i < objects.size(); ++i) require(objects[i - 1]->index != objects[i]->index, XNET_CO_MODEL_ERROR, "duplicate OD index");

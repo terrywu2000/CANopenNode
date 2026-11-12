@@ -6,9 +6,9 @@
  * C ABI for one CANopen slave simulated over NI-XNET.
  *
  * The library owns CAN transport, protocol processing and OD storage; an external
- * model supplies application behavior through batch access. PDO tx/rx directions
- * are relative to the simulated slave, not to the VeriStand model. No function
- * interprets a CiA 402 controlword or generates the application's statusword.
+ * model supplies ordinary application behavior through batch access. A JSON model
+ * may explicitly enable the integrated single-axis CiA 402 PP profile. PDO tx/rx
+ * directions are relative to the simulated slave, not to the VeriStand model.
  *
  * Runtime state, CANopen NMT state and an application's drive state are separate.
  * Unless explicitly documented otherwise, output values are usable only after

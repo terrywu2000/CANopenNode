@@ -19,7 +19,8 @@ set(STACK_SOURCES
     "${STACK_ROOT}/301/CO_PDO.c"
     "${STACK_ROOT}/305/CO_LSSslave.c")
 set(DS402_ROOT "${STACK_ROOT}/402")
-set(PORT_SOURCES src/model.cpp src/persistence.cpp src/driver.cpp src/device.cpp src/logging.cpp "${DS402_ROOT}/drive402.cpp")
+set(PORT_SOURCES src/model.cpp src/persistence.cpp src/driver.cpp src/device.cpp src/logging.cpp
+    "${DS402_ROOT}/drive402.cpp" "${DS402_ROOT}/CO_402_protocol.c")
 
 add_library(xnet_canopen_objects OBJECT ${STACK_SOURCES} ${PORT_SOURCES})
 set_target_properties(xnet_canopen_objects PROPERTIES POSITION_INDEPENDENT_CODE ON
@@ -81,6 +82,12 @@ if(XNET_CANOPEN_BUILD_TESTS)
     target_include_directories(xnet_canopen_drive402_tests PRIVATE "${DS402_ROOT}")
     target_compile_options(xnet_canopen_drive402_tests PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME xnet_canopen_drive402_tests COMMAND xnet_canopen_drive402_tests)
+    add_executable(xnet_canopen_drive402_protocol_tests
+        "${DS402_ROOT}/test_drive402_protocol.c" "${DS402_ROOT}/CO_402_protocol.c")
+    target_compile_features(xnet_canopen_drive402_protocol_tests PRIVATE c_std_99)
+    target_include_directories(xnet_canopen_drive402_protocol_tests PRIVATE "${DS402_ROOT}")
+    target_compile_options(xnet_canopen_drive402_protocol_tests PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME xnet_canopen_drive402_protocol_tests COMMAND xnet_canopen_drive402_protocol_tests)
     if(XNET_CANOPEN_BUILD_APP AND NOT XNET_CANOPEN_BUILD_LIBRARY)
         add_library(xnet_canopen_app_mock SHARED tests/fake_xnet.cpp)
         target_link_libraries(xnet_canopen_app_mock PRIVATE xnet_canopen_objects Threads::Threads)

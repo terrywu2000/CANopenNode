@@ -10,6 +10,8 @@
  */
 #define OD_DEFINITION
 #include "CANopen.h"
+#include "402/CO_402_protocol.h"
+#include "402/drive402.hpp"
 #include "xnet_canopen.h"
 #include "nlohmann/json.hpp"
 #include "spdlog/common.h"
@@ -73,6 +75,8 @@ struct Value {
     bool allows_local_write = false; /**< Allows host batch writes; independent of network SDO write permission. */
     bool is_node_relative = false; /**< Live uint32_t COB-ID is its default base plus node ID (unless unconfigured). */
     bool default_node_relative = false; /**< Add node ID to an integer application default only when that default is restored. */
+    bool mapped_rpdo = false; /**< Present in an enabled RPDO mapping. */
+    bool mapped_tpdo = false; /**< Present in an enabled TPDO mapping. */
     /** Address published to OD descriptors; stable while storage is not resized. */
     void* data() { return storage.data(); }
 };
@@ -111,6 +115,17 @@ struct Model {
     std::optional<bool> can_termination;
     uint16_t rpdo_count = 0, tpdo_count = 0; /**< Configured receive/transmit PDO counts, respectively. */
     uint32_t worker_period_us = 1000; /**< Worker wait interval in microseconds; not a hard real-time guarantee. */
+    bool drive_402_enabled = false; /**< True only when the JSON explicitly enables the PP profile. */
+    bool drive_402_external = false; /**< Selects the validated 0x2F00..0x2F05 model exchange. */
+    bool drive_has_error_code = false; /**< Optional 0x603F fault-code output. */
+    bool drive_has_quick_stop_deceleration = false; /**< Optional 0x6085; defaults to PP profile deceleration. */
+    uint32_t drive_position_tolerance = 0; /**< Allowed actual-to-target position error in counts. */
+    uint32_t drive_target_reached_time_us = 0; /**< In-tolerance duration before Statusword bit 10 is set. */
+    uint32_t drive_startup_timeout_us = 0;
+    uint32_t drive_heartbeat_timeout_us = 0;
+    uint32_t drive_feedback_timeout_us = 0;
+    uint32_t drive_action_timeout_us = 0;
+    uint32_t drive_command_max_age_us = 0;
     bool emcy_reconfigured = false; /**< An SDO-selected EMCY ID must survive stop/start without startup rebasing. */
     bool sync_reconfigured = false; /**< An SDO-selected SYNC ID overrides a node-relative startup default until reset. */
     /** Construct storage/descriptors before stack allocation; not a runtime OD merge. */
@@ -174,6 +189,7 @@ struct xnet_canopen_device {
     std::condition_variable_any wake; /**< Interrupts the worker's timed wait when shutdown is requested. */
     std::thread worker; /**< Protocol/frame-processing thread; joined before releasing its resources. */
     std::atomic<bool> stop_requested{false}; /**< Shutdown request visible even when the worker releases mutex. */
+    bool shutdown_joining = false; /**< Stop is waiting for a model safety action; only model OD traffic is admitted. */
     uint32_t state = XNET_CO_RUNTIME_UNINITIALIZED; /**< XNET_CO_RUNTIME_* lifecycle state, not NMT state. */
     /**
      * Runtime-lock-protected completion counters, kept outside Model/CO_t so
@@ -213,6 +229,47 @@ struct xnet_canopen_device {
         OD_extension_t extension{};
     };
     std::array<CommunicationOD, 8> communication_od{}; /**< Writable SYNC, guarding, EMCY and heartbeat settings. */
+    struct DriveModeOD {
+        xnet_canopen_device* device = nullptr;
+        OD_IO_t original{};
+        OD_extension_t extension{};
+    } drive_mode_od; /**< SDO mode-write guard; refreshed after each stack rebuild. */
+    struct DriveFeedbackOD {
+        xnet_canopen_device* device = nullptr;
+        OD_IO_t original{};
+        OD_extension_t extension{};
+    } drive_feedback_od; /**< Atomic local feedback-frame submitter; refreshed after stack rebuilds. */
+    std::unique_ptr<xco::d402::Drive> drive_402; /**< Present only when enabled by JSON. */
+    uint64_t drive_epoch = 0;
+    uint32_t drive_command_seq = 0, drive_action_seq = 1, drive_last_feedback_seq = 0;
+    uint32_t drive_last_submitted_seq = 0;
+    struct DriveCommandRecord {
+        uint32_t seq = 0;
+        uint32_t action_seq = 0;
+        xco::Clock::time_point published{};
+    };
+    std::array<DriveCommandRecord, 64> drive_command_history{};
+    CO_402_feedback_frame_t drive_pending_feedback{};
+    CO_402_feedback_frame_t drive_last_feedback{};
+    std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> drive_pending_feedback_bytes{};
+    std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> drive_last_feedback_bytes{};
+    std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> drive_last_submitted_bytes{};
+    bool drive_feedback_pending = false, drive_has_last_feedback = false;
+    bool drive_has_last_submitted = false;
+    uint32_t drive_last_heartbeat = 0;
+    uint32_t drive_heartbeat_baseline = 0;
+    bool drive_has_heartbeat = false;
+    xco::Clock::time_point drive_heartbeat_changed{};
+    xco::Clock::time_point drive_started_at{};
+    uint32_t drive_timed_action_seq = 0;
+    xco::Clock::time_point drive_action_started{};
+    bool drive_action_timed_out = false;
+    uint16_t drive_latched_fault = 0;
+    uint16_t drive_current_fault = 0;
+    bool drive_emcy_active = false;
+    xco::d402::Pds drive_previous_pds = xco::d402::Pds::switch_on_disabled;
+    bool drive_has_previous_pds = false;
+    bool drive_pp_ready = false, drive_reset_permitted = false;
     uint8_t pending_node = 10, active_node = 10; /**< LSS-selected and stack-applied node IDs; 255 means unconfigured. */
     uint16_t pending_bitrate = 125, active_bitrate = 125; /**< Requested and applied physical bitrates in kbit/s. */
     uint32_t next_batch = 1; /**< Next batch ID; never reused within this handle, with 0 marking exhaustion. */
@@ -267,6 +324,12 @@ struct xnet_canopen_device {
     static bool_t store(void*, uint8_t node, uint16_t bitrate);
     static ODR_t read_communication(OD_stream_t*, void*, OD_size_t, OD_size_t*);
     static ODR_t write_communication(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
+    static ODR_t read_drive_mode(OD_stream_t*, void*, OD_size_t, OD_size_t*);
+    static ODR_t write_drive_mode(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
+    static ODR_t read_drive_feedback(OD_stream_t*, void*, OD_size_t, OD_size_t*);
+    static ODR_t write_drive_feedback(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
+    void process_drive_402(uint32_t dt_us, bool force_non_operational = false);
+    void start_drive_epoch();
 };
 
 #endif

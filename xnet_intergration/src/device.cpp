@@ -3,7 +3,7 @@
  * Public ABI, device lifecycle and the single protocol-processing worker.
  * The lifecycle mutex serializes host calls; the recursive runtime mutex protects
  * OD/service state shared with the worker. Application/drive behavior remains in
- * the external model, which exchanges values through the batch API.
+ * a JSON-enabled DS402 core and ordinary application OD values.
  */
 #include "internal.hpp"
 
@@ -22,12 +22,14 @@ namespace {
  * owned even when an operation unlocks the runtime mutex to join the worker.
  * This cannot make a fabricated handle or concurrent destroy safe.
  */
-template<class Function> int32_t call(xnet_canopen_handle d, Function function) noexcept {
+template<class Function> int32_t call(xnet_canopen_handle d, Function function, bool allow_shutdown = false) noexcept {
     if (!d) return XNET_CO_INVALID_ARGUMENT;
     try {
         // Keep lifecycle ownership even when a call releases the OD lock to join the worker.
         std::lock_guard<std::mutex> lifecycle(d->lifecycle);
         std::unique_lock<std::recursive_mutex> lock(d->mutex);
+        require(allow_shutdown || !d->shutdown_joining, XNET_CO_INVALID_STATE,
+            "device shutdown is waiting for the DS402 model safety response");
         return function(*d, lock);
     } catch (const Error& e) {
         std::lock_guard<std::recursive_mutex> lock(d->mutex);
@@ -56,6 +58,22 @@ const char* nmt_log_message(CO_NMT_internalState_t state) {
         case CO_NMT_STOPPED: return "NMT Stopped";
         default: return "NMT Unknown";
     }
+}
+template<class T> T read_drive_value(xco::Model& model, uint16_t index) {
+    T value{};
+    std::memcpy(&value, model.value(index, 0).data(), sizeof(value));
+    return value;
+}
+template<class T> void write_drive_value(xco::Model& model, uint16_t index, T value) {
+    std::memcpy(model.value(index, 0).data(), &value, sizeof(value));
+}
+bool sequence_newer(uint32_t value, uint32_t previous) {
+    const uint32_t distance = value - previous;
+    return distance != 0 && distance < 0x80000000U;
+}
+uint32_t increment_nonzero(uint32_t value) {
+    ++value;
+    return value == 0 ? 1 : value;
 }
 }
 
@@ -120,6 +138,8 @@ void xnet_canopen_device::setup_stack() {
     outgoing.clear();
     // Extensions point into the old stack allocation; detach them before rebuilding services.
     for (auto& entry : model->entries) entry.extension = nullptr;
+    drive_mode_od = {};
+    drive_feedback_od = {};
     if (co) { CO_delete(co); co = nullptr; }
     // Also reached by ordinary start/restart: update node-dependent identifiers,
     // but do not restore OD defaults here, since stop/start preserves device data.
@@ -162,6 +182,30 @@ void xnet_canopen_device::setup_stack() {
             binding.extension.write = write_communication;
             require(OD_extension_init(entry, &binding.extension) == ODR_OK,
                 XNET_CO_STACK_ERROR, "cannot install communication OD handler");
+        }
+        if (model->drive_402_enabled) {
+            drive_mode_od.device = this;
+            drive_mode_od.original = {};
+            drive_mode_od.extension = {};
+            auto* entry = OD_find(&model->od, 0x6060);
+            require(OD_getSub(entry, 0, &drive_mode_od.original, false) == ODR_OK,
+                XNET_CO_STACK_ERROR, "cannot bind DS402 mode OD handler");
+            drive_mode_od.extension.object = &drive_mode_od;
+            drive_mode_od.extension.read = read_drive_mode;
+            drive_mode_od.extension.write = write_drive_mode;
+            require(OD_extension_init(entry, &drive_mode_od.extension) == ODR_OK,
+                XNET_CO_STACK_ERROR, "cannot install DS402 mode OD handler");
+            if (model->drive_402_external) {
+                drive_feedback_od.device = this;
+                auto* feedback_entry = OD_find(&model->od, 0x2f03);
+                require(OD_getSub(feedback_entry, 0, &drive_feedback_od.original, false) == ODR_OK,
+                    XNET_CO_STACK_ERROR, "cannot bind external DS402 feedback OD handler");
+                drive_feedback_od.extension.object = &drive_feedback_od;
+                drive_feedback_od.extension.read = read_drive_feedback;
+                drive_feedback_od.extension.write = write_drive_feedback;
+                require(OD_extension_init(feedback_entry, &drive_feedback_od.extension) == ODR_OK,
+                    XNET_CO_STACK_ERROR, "cannot install external DS402 feedback OD handler");
+            }
         }
     }
     log(xco::LogLevel::info, "CANopen services initialized");
@@ -227,8 +271,295 @@ ODR_t xnet_canopen_device::write_communication(
     return result;
 }
 
+ODR_t xnet_canopen_device::write_drive_mode(
+    OD_stream_t* stream, const void* buffer, OD_size_t count, OD_size_t* transferred) {
+    auto& binding = *static_cast<DriveModeOD*>(stream->object);
+    if (!buffer || !transferred || stream->subIndex != 0 || count != sizeof(int8_t))
+        return ODR_TYPE_MISMATCH;
+    int8_t mode = 0;
+    std::memcpy(&mode, buffer, sizeof(mode));
+    if (mode != xco::d402::mode_profile_position) return ODR_INVALID_VALUE;
+    auto original = *stream;
+    original.object = binding.original.stream.object;
+    const auto result = binding.original.write(&original, buffer, count, transferred);
+    stream->dataOffset = original.dataOffset;
+    return result;
+}
+
+ODR_t xnet_canopen_device::read_drive_mode(
+    OD_stream_t* stream, void* buffer, OD_size_t count, OD_size_t* transferred) {
+    auto& binding = *static_cast<DriveModeOD*>(stream->object);
+    auto original = *stream;
+    original.object = binding.original.stream.object;
+    const auto result = binding.original.read(&original, buffer, count, transferred);
+    stream->dataOffset = original.dataOffset;
+    return result;
+}
+
+ODR_t xnet_canopen_device::read_drive_feedback(
+    OD_stream_t* stream, void* buffer, OD_size_t count, OD_size_t* transferred) {
+    auto& binding = *static_cast<DriveFeedbackOD*>(stream->object);
+    auto original = *stream;
+    original.object = binding.original.stream.object;
+    const auto result = binding.original.read(&original, buffer, count, transferred);
+    stream->dataOffset = original.dataOffset;
+    return result;
+}
+
+ODR_t xnet_canopen_device::write_drive_feedback(
+    OD_stream_t* stream, const void* buffer, OD_size_t count, OD_size_t* transferred) {
+    auto& binding = *static_cast<DriveFeedbackOD*>(stream->object);
+    auto& d = *binding.device;
+    if (!buffer || !transferred || stream->subIndex != 0 || count != CO_402_FEEDBACK_FRAME_SIZE
+        || count != stream->dataLength || stream->dataOffset != 0) return ODR_TYPE_MISMATCH;
+    CO_402_feedback_frame_t frame{};
+    const auto* bytes = static_cast<const uint8_t*>(buffer);
+    if (!CO_402_feedback_unpack(&frame, bytes, count)) return ODR_INVALID_VALUE;
+    if (d.drive_feedback_pending) {
+        if (frame.feedback_seq == d.drive_pending_feedback.feedback_seq
+            && std::memcmp(bytes, d.drive_pending_feedback_bytes.data(), count) == 0) {
+            *transferred = count;
+            stream->dataOffset += count;
+            return ODR_OK;
+        }
+        return ODR_DATA_DEV_STATE;
+    }
+    if (d.drive_has_last_submitted && frame.feedback_seq == d.drive_last_submitted_seq
+        && std::memcmp(bytes, d.drive_last_submitted_bytes.data(), count) == 0) {
+        *transferred = count;
+        stream->dataOffset += count;
+        return ODR_OK;
+    }
+    if (d.drive_has_last_submitted && !sequence_newer(frame.feedback_seq, d.drive_last_submitted_seq))
+        return ODR_DATA_DEV_STATE;
+    d.drive_pending_feedback = frame;
+    d.drive_last_submitted_seq = frame.feedback_seq;
+    d.drive_last_submitted_bytes = {};
+    std::memcpy(d.drive_last_submitted_bytes.data(), bytes, count);
+    d.drive_has_last_submitted = true;
+    std::memcpy(d.drive_pending_feedback_bytes.data(), bytes, count);
+    d.drive_feedback_pending = true;
+    std::memcpy(d.model->value(0x2f03, 0).data(), bytes, count);
+    *transferred = count;
+    stream->dataOffset += count;
+    return ODR_OK;
+}
+
+void xnet_canopen_device::start_drive_epoch() {
+    if (!model || !model->drive_402_external) return;
+    require(drive_epoch != UINT64_MAX, XNET_CO_STACK_ERROR, "DS402 external epoch exhausted");
+    ++drive_epoch;
+    drive_command_seq = 0;
+    drive_action_seq = 1;
+    drive_last_feedback_seq = 0;
+    drive_last_submitted_seq = 0;
+    drive_command_history = {};
+    drive_feedback_pending = false;
+    drive_has_last_feedback = false;
+    drive_has_last_submitted = false;
+    drive_pending_feedback = {};
+    drive_last_feedback = {};
+    drive_pending_feedback_bytes = {};
+    drive_last_feedback_bytes = {};
+    drive_last_submitted_bytes = {};
+    drive_has_heartbeat = false;
+    drive_heartbeat_baseline = read_drive_value<uint32_t>(*model, 0x2f01);
+    drive_last_heartbeat = drive_heartbeat_baseline;
+    drive_heartbeat_changed = {};
+    drive_started_at = xco::Clock::now();
+    drive_timed_action_seq = 0;
+    drive_action_started = {};
+    drive_action_timed_out = false;
+    drive_latched_fault = 0;
+    drive_current_fault = 0;
+    drive_emcy_active = false;
+    drive_previous_pds = xco::d402::Pds::switch_on_disabled;
+    drive_has_previous_pds = false;
+    drive_pp_ready = false;
+    drive_reset_permitted = false;
+    write_drive_value(*model, 0x2f00, uint16_t{0});
+    write_drive_value(*model, 0x2f04, uint32_t{0});
+    write_drive_value(*model, 0x2f05, uint16_t{0});
+}
+
+void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_operational) {
+    if (!model || !model->drive_402_enabled) return;
+    require(drive_402 != nullptr, XNET_CO_INTERNAL_ERROR, "DS402 profile is enabled without a drive instance");
+    const int8_t requested_mode = read_drive_value<int8_t>(*model, 0x6060);
+    const bool unsupported_mode = !xco::d402::Drive::mode_supported(requested_mode);
+
+    xco::d402::Inputs input;
+    input.controlword = read_drive_value<uint16_t>(*model, 0x6040);
+    if (unsupported_mode)
+        input.controlword = static_cast<uint16_t>((input.controlword | 0x0002U) & ~0x0004U);
+    input.mode_requested = requested_mode;
+    input.nmt_operational = !force_non_operational && !stop_requested
+        && CO_NMT_getInternalState(co->NMT) == CO_NMT_OPERATIONAL;
+    input.target_position = read_drive_value<int32_t>(*model, 0x607a);
+    input.profile_velocity = read_drive_value<uint32_t>(*model, 0x6081);
+    input.profile_acceleration = read_drive_value<uint32_t>(*model, 0x6083);
+    input.profile_deceleration = read_drive_value<uint32_t>(*model, 0x6084);
+    input.quick_stop_deceleration = model->drive_has_quick_stop_deceleration
+        ? read_drive_value<uint32_t>(*model, 0x6085) : input.profile_deceleration;
+    input.position_tolerance = model->drive_position_tolerance;
+    input.target_reached_time_us = model->drive_target_reached_time_us;
+    uint16_t external_fault_code = 0;
+    if (model->drive_402_external) {
+        const auto now = xco::Clock::now();
+        const uint32_t heartbeat = read_drive_value<uint32_t>(*model, 0x2f01);
+        if (heartbeat != 0 && ((!drive_has_heartbeat && heartbeat != drive_heartbeat_baseline)
+            || (drive_has_heartbeat && sequence_newer(heartbeat, drive_last_heartbeat)))) {
+            drive_last_heartbeat = heartbeat;
+            drive_has_heartbeat = true;
+            drive_heartbeat_changed = now;
+        }
+        const bool startup_expired = now - drive_started_at
+            >= std::chrono::microseconds(model->drive_startup_timeout_us)
+            && (!drive_has_heartbeat || !drive_402->status().feedback_fresh);
+        const bool heartbeat_expired = drive_has_heartbeat
+            && now - drive_heartbeat_changed >= std::chrono::microseconds(model->drive_heartbeat_timeout_us);
+
+        if (drive_feedback_pending) {
+            const auto frame = drive_pending_feedback;
+            const auto& record = drive_command_history[frame.command_seq % drive_command_history.size()];
+            const bool identity_valid = frame.epoch == drive_epoch && frame.action_seq == drive_action_seq
+                && record.seq == frame.command_seq && record.action_seq == frame.action_seq;
+            const bool command_expired = identity_valid
+                && now - record.published > std::chrono::microseconds(model->drive_command_max_age_us);
+            const bool command_valid = identity_valid && !command_expired;
+            uint16_t result = command_valid ? 1 : command_expired ? 2 : 3;
+            if (command_valid) {
+                if (frame.action_result == CO_402_ACTION_RESULT_DONE
+                    && frame.action_seq == drive_timed_action_seq)
+                    drive_action_timed_out = false;
+                const bool velocity_valid = (frame.flags & 0x02U) != 0;
+                xco::d402::Feedback feedback{frame.actual_position,
+                    velocity_valid ? frame.actual_velocity : drive_402->status().actual_velocity,
+                    frame.fault_code != 0 || frame.action_result == CO_402_ACTION_RESULT_ERROR};
+                drive_402->post_feedback(feedback);
+                drive_pp_ready = (frame.flags & 0x04U) != 0;
+                drive_reset_permitted = (frame.flags & 0x10U) != 0;
+                drive_402->set_external_permissions(drive_pp_ready, drive_reset_permitted);
+                drive_last_feedback = frame;
+                drive_last_feedback_seq = frame.feedback_seq;
+                drive_last_feedback_bytes = drive_pending_feedback_bytes;
+                drive_has_last_feedback = true;
+                drive_current_fault = frame.fault_code
+                    ? frame.fault_code
+                    : frame.action_result == CO_402_ACTION_RESULT_ERROR ? CO_EMC_GENERIC : 0;
+                input.action_response_seq = frame.action_seq;
+                input.action_result = frame.action_result;
+            }
+            write_drive_value(*model, 0x2f04, frame.feedback_seq);
+            write_drive_value(*model, 0x2f05, result);
+            drive_feedback_pending = false;
+        }
+        const bool feedback_expired = drive_has_last_feedback && !drive_402->status().feedback_fresh;
+        const bool transport_fault = startup_expired || heartbeat_expired || feedback_expired || drive_action_timed_out;
+        drive_402->set_external_fault(transport_fault);
+        external_fault_code = transport_fault ? 0x8130 : drive_current_fault;
+        input.model_ready = drive_pp_ready;
+        input.reset_permitted = drive_reset_permitted;
+    }
+    drive_402->step(input, dt_us);
+    const auto status = drive_402->status();
+    if (model->drive_402_external) {
+        if (status.action_pending && status.action_seq != drive_timed_action_seq) {
+            drive_timed_action_seq = status.action_seq;
+            drive_action_started = xco::Clock::now();
+        } else if (status.action_pending && drive_timed_action_seq != 0
+            && xco::Clock::now() - drive_action_started >= std::chrono::microseconds(model->drive_action_timeout_us)) {
+            drive_action_timed_out = true;
+            drive_402->set_external_fault(true);
+            external_fault_code = 0x8130;
+        }
+        drive_action_seq = status.action_seq;
+        uint32_t command_seq = increment_nonzero(drive_command_seq);
+        drive_command_seq = command_seq;
+        CO_402_command_frame_t command{};
+        command.epoch = drive_epoch;
+        command.command_seq = command_seq;
+        command.action_seq = status.action_seq;
+        command.controlword = input.controlword;
+        command.statusword = status.statusword;
+        command.action = status.action;
+        command.flags = static_cast<uint8_t>((status.output_allowed ? 0x01U : 0U)
+            | (status.model_ready ? 0x02U : 0U));
+        command.pds = static_cast<uint8_t>(status.pds);
+        command.mode = status.mode_display;
+        command.demand_position = status.demand_position;
+        command.target_position = input.target_position;
+        command.profile_velocity = input.profile_velocity;
+        command.profile_acceleration = input.profile_acceleration;
+        command.profile_deceleration = input.profile_deceleration;
+        command.quick_stop_deceleration = input.quick_stop_deceleration;
+        command.demand_velocity = status.demand_velocity;
+        std::array<uint8_t, CO_402_COMMAND_FRAME_SIZE> command_bytes{};
+        require(CO_402_command_pack(&command, command_bytes.data(), command_bytes.size()),
+            XNET_CO_INTERNAL_ERROR, "cannot encode DS402 command frame");
+        std::memcpy(model->value(0x2f02, 0).data(), command_bytes.data(), command_bytes.size());
+        drive_command_history[command_seq % drive_command_history.size()] =
+            DriveCommandRecord{command_seq, status.action_seq, xco::Clock::now()};
+        const bool fault_active = status.model_fault || external_fault_code != 0;
+        const uint16_t current_fault = external_fault_code != 0 ? external_fault_code
+            : (status.model_fault ? uint16_t{0x1000} : uint16_t{0});
+        write_drive_value(*model, 0x2f00, current_fault);
+        const bool reset_completed = drive_has_previous_pds
+            && drive_previous_pds == xco::d402::Pds::fault
+            && status.pds == xco::d402::Pds::switch_on_disabled && !fault_active;
+        if (fault_active) {
+            if (drive_latched_fault == 0) drive_latched_fault = current_fault;
+            if (!drive_emcy_active && co && co->em) {
+                CO_errorReport(co->em, CO_EM_GENERIC_ERROR, drive_latched_fault, static_cast<uint32_t>(drive_epoch));
+                drive_emcy_active = true;
+            }
+        } else if (reset_completed) {
+            drive_latched_fault = 0;
+            if (drive_emcy_active && co && co->em) {
+                CO_errorReset(co->em, CO_EM_GENERIC_ERROR, static_cast<uint32_t>(drive_epoch));
+                drive_emcy_active = false;
+            }
+        }
+        if (model->drive_has_error_code) write_drive_value(*model, 0x603f, drive_latched_fault);
+        drive_previous_pds = status.pds;
+        drive_has_previous_pds = true;
+    } else if (model->drive_has_error_code) {
+        write_drive_value(*model, 0x603f, static_cast<uint16_t>(status.model_fault ? 0x1000 : 0));
+    }
+    write_drive_value(*model, 0x6041, status.statusword);
+    write_drive_value(*model, 0x6061, status.mode_display);
+    write_drive_value(*model, 0x6064, status.actual_position);
+    if (unsupported_mode) {
+        log(xco::LogLevel::warning, "unsupported 0x6060 value {} received through PDO; requesting quick stop and restoring PP",
+            int(requested_mode));
+        write_drive_value(*model, 0x6040, input.controlword);
+        write_drive_value(*model, 0x6060, xco::d402::mode_profile_position);
+    }
+}
+
 void xnet_canopen_device::reset_stack(bool reset_all_objects) {
     log(xco::LogLevel::info, reset_all_objects ? "Reset Node requested" : "Reset Communication requested");
+    if (drive_402) {
+        for (uint32_t elapsed = 0; elapsed < 10000000; elapsed += 1000) {
+            const auto pds = drive_402->status().pds;
+            if (pds != xco::d402::Pds::operation_enabled && pds != xco::d402::Pds::quick_stop_active
+                && pds != xco::d402::Pds::fault_reaction_active) break;
+            process_drive_402(1000, true);
+            const auto next = drive_402->status();
+            if (model->drive_402_external && worker_lock && (next.action_pending
+                || next.pds == xco::d402::Pds::operation_enabled
+                || next.pds == xco::d402::Pds::quick_stop_active
+                || next.pds == xco::d402::Pds::fault_reaction_active)) {
+                worker_lock->unlock();
+                std::this_thread::sleep_for(std::chrono::microseconds(model->worker_period_us));
+                worker_lock->lock();
+            }
+        }
+        const auto pds = drive_402->status().pds;
+        require(pds != xco::d402::Pds::operation_enabled && pds != xco::d402::Pds::quick_stop_active
+                && pds != xco::d402::Pds::fault_reaction_active,
+                XNET_CO_STACK_ERROR, "DS402 did not reach a safe state before CANopen reset");
+    }
     adapter.stop_flush();
     // Reset Node reloads saved/startup LSS settings and restores all OD defaults.
     // Reset Communication preserves device data and the pending LSS settings.
@@ -241,6 +572,8 @@ void xnet_canopen_device::reset_stack(bool reset_all_objects) {
         adapter.bitrate(active_bitrate);
     }
     model->restore(reset_all_objects, pending_node);
+    if (drive_402) drive_402->reset();
+    start_drive_epoch();
     setup_stack();
     adapter.start();
     CO_CANsetNormalMode(co->CANmodule);
@@ -363,6 +696,7 @@ void xnet_canopen_device::run() {
                             // Apply RPDO commands before packing values for this cycle's TPDOs.
                             bool_t sync = CO_process_SYNC(co, dt, nullptr);
                             CO_process_RPDO(co, sync, dt, nullptr);
+                            process_drive_402(dt);
                             CO_process_TPDO(co, sync, dt, nullptr);
                         }
                         if (!stop_requested) transmit();
@@ -388,6 +722,29 @@ void xnet_canopen_device::run() {
             }
             // wait_for releases the OD lock, allowing channel calls between worker cycles.
             wake.wait_for(lock, std::chrono::microseconds(model->worker_period_us), [&] { return stop_requested.load(); });
+        }
+        if (drive_402) {
+            for (uint32_t elapsed = 0; elapsed < 10000000; elapsed += 1000) {
+                const auto pds = drive_402->status().pds;
+                if (pds != xco::d402::Pds::operation_enabled
+                    && pds != xco::d402::Pds::quick_stop_active
+                    && pds != xco::d402::Pds::fault_reaction_active) break;
+                process_drive_402(1000, true);
+                const auto next = drive_402->status();
+                if (model->drive_402_external && (next.action_pending
+                    || next.pds == xco::d402::Pds::operation_enabled
+                    || next.pds == xco::d402::Pds::quick_stop_active
+                    || next.pds == xco::d402::Pds::fault_reaction_active)) {
+                    lock.unlock();
+                    std::this_thread::sleep_for(std::chrono::microseconds(model->worker_period_us));
+                    lock.lock();
+                }
+            }
+            const auto pds = drive_402->status().pds;
+            require(pds != xco::d402::Pds::operation_enabled
+                    && pds != xco::d402::Pds::quick_stop_active
+                    && pds != xco::d402::Pds::fault_reaction_active,
+                    XNET_CO_STACK_ERROR, "DS402 did not reach a safe state before device stop");
         }
     } catch (const Error& e) {
         fail(e.code, e.what()); state = XNET_CO_RUNTIME_FAILED; stop_requested = true;
@@ -436,6 +793,7 @@ void xnet_canopen_device::release() {
     outgoing.clear();
     if (co || model) log(xco::LogLevel::info, "device uninitialized");
     if (co) { CO_delete(co); co = nullptr; }
+    drive_402.reset();
     model.reset();
     batches.clear();
     interface_name.clear(); persistence_path.clear();
@@ -474,10 +832,16 @@ int32_t xnet_canopen_initialize(xnet_canopen_handle handle, const char* interfac
             d.persistence_path = persistence_path;
             d.model = std::make_unique<xco::Model>();
             d.model->load(xco::read_json(model_path));
+            if (d.model->drive_402_enabled) {
+                d.drive_402 = std::make_unique<xco::d402::Drive>(
+                    d.model->drive_402_external ? d.model->drive_feedback_timeout_us : 1000000);
+                d.drive_402->use_external_model(d.model->drive_402_external);
+            }
             d.log_identity = d.model->identity;
             d.load_persistent();
             d.active_bitrate = d.pending_bitrate;
             d.model->restore(true, d.pending_node);
+            d.start_drive_epoch();
             d.adapter.open(d.interface_name, d.active_bitrate, d.model->can_termination);
             if (d.model->can_termination.has_value())
                 d.log(xco::LogLevel::info, "CAN termination configured: {}", *d.model->can_termination ? "on" : "off");
@@ -516,6 +880,8 @@ int32_t xnet_canopen_start(xnet_canopen_handle handle) {
         try {
             // A new stack restarts protocol state without resetting live OD
             // values. Launch only after sessions and CANnormal are ready.
+            if (d.drive_402) d.drive_402->reset();
+            d.start_drive_epoch();
             d.setup_stack();
             d.adapter.start();
             CO_CANsetNormalMode(d.co->CANmodule);
@@ -528,9 +894,44 @@ int32_t xnet_canopen_start(xnet_canopen_handle handle) {
     });
 }
 int32_t xnet_canopen_stop(xnet_canopen_handle handle) {
-    return call(handle, [](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>& lock) {
-        d.initialized(); lock.unlock(); d.stop(); return XNET_CO_OK;
-    });
+    if (!handle) return XNET_CO_INVALID_ARGUMENT;
+    bool owns_shutdown = false;
+    try {
+        std::unique_lock<std::mutex> lifecycle(handle->lifecycle);
+        std::unique_lock<std::recursive_mutex> runtime(handle->mutex);
+        require(!handle->shutdown_joining, XNET_CO_INVALID_STATE, "device shutdown is already in progress");
+        handle->initialized();
+        if (!handle->worker.joinable()) {
+            runtime.unlock();
+            lifecycle.unlock();
+            return call(handle, [](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>& lock) {
+                lock.unlock(); d.stop(); return XNET_CO_OK;
+            });
+        }
+        handle->shutdown_joining = true;
+        owns_shutdown = true;
+        handle->stop_requested = true;
+        handle->wake.notify_all();
+        runtime.unlock();
+        lifecycle.unlock();
+        handle->worker.join();
+        lifecycle.lock();
+        runtime.lock();
+        handle->shutdown_joining = false;
+        owns_shutdown = false;
+        handle->stop();
+        return XNET_CO_OK;
+    } catch (const Error& e) {
+        std::lock_guard<std::recursive_mutex> lock(handle->mutex);
+        if (owns_shutdown) handle->shutdown_joining = false;
+        handle->fail(e.code, e.what());
+        return e.code;
+    } catch (const std::exception& e) {
+        std::lock_guard<std::recursive_mutex> lock(handle->mutex);
+        if (owns_shutdown) handle->shutdown_joining = false;
+        handle->fail(XNET_CO_INTERNAL_ERROR, e.what());
+        return XNET_CO_INTERNAL_ERROR;
+    }
 }
 
 int32_t xnet_canopen_bind_batch(xnet_canopen_handle handle, const uint16_t* indices,
@@ -620,6 +1021,17 @@ static int32_t batch_io(xnet_canopen_handle handle, uint32_t batch_id, uint8_t* 
         require(statuses && (is_write ? write_buffer != nullptr : read_buffer != nullptr) && count == batch.bindings.size(),
                 XNET_CO_INVALID_ARGUMENT, "buffer/status pointer or entry count mismatch");
         require(buffer_size >= batch.size, XNET_CO_BUFFER_TOO_SMALL, "batch buffer too small");
+        if (d.shutdown_joining) {
+            for (const auto& binding : batch.bindings) {
+                const bool allowed = is_write
+                    ? (binding.index == 0x2f01 || binding.index == 0x2f03)
+                    : ((binding.index >= 0x2f00 && binding.index <= 0x2f05)
+                        || binding.index == 0x6040 || binding.index == 0x6041
+                        || binding.index == 0x6061 || binding.index == 0x603f);
+                require(allowed, XNET_CO_INVALID_STATE,
+                    "only DS402 external model exchange OD traffic is allowed during shutdown");
+            }
+        }
         bool has_entry_errors = false;
         for (uint32_t i = 0; i < count; ++i) {
             const auto& b = batch.bindings[i];
@@ -632,7 +1044,7 @@ static int32_t batch_io(xnet_canopen_handle handle, uint32_t batch_id, uint8_t* 
             }
         }
         return has_entry_errors ? XNET_CO_PARTIAL_FAILURE : XNET_CO_OK;
-    });
+    }, true);
 }
 
 int32_t xnet_canopen_read_batch(xnet_canopen_handle handle, uint32_t id, uint8_t* buffer,
@@ -647,6 +1059,9 @@ int32_t xnet_canopen_read_od(xnet_canopen_handle handle, uint16_t index, uint8_t
                             uint8_t* buffer, uint32_t buffer_size, uint32_t* value_size) {
     return call(handle, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) -> int32_t {
         require_od_access(d);
+        require(!d.shutdown_joining || (index >= 0x2f00 && index <= 0x2f05)
+                || index == 0x6040 || index == 0x6041 || index == 0x6061 || index == 0x603f,
+            XNET_CO_INVALID_STATE, "only DS402 external model exchange reads are allowed during shutdown");
         require(value_size && (buffer || buffer_size == 0), XNET_CO_INVALID_ARGUMENT, "invalid OD read arguments");
         const auto& v = d.model->value(index, subindex);
         *value_size = v.size;
@@ -656,19 +1071,21 @@ int32_t xnet_canopen_read_od(xnet_canopen_handle handle, uint16_t index, uint8_t
         const auto result = entry_io(d, index, subindex, v, buffer, nullptr, false);
         if (result < 0) d.fail(result, "OD " + std::to_string(index) + ":" + std::to_string(subindex) + " read failed");
         return result;
-    });
+    }, true);
 }
 int32_t xnet_canopen_write_od(xnet_canopen_handle handle, uint16_t index, uint8_t subindex,
                              const uint8_t* buffer, uint32_t buffer_size) {
     return call(handle, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) -> int32_t {
         require_od_access(d);
+        require(!d.shutdown_joining || index == 0x2f01 || index == 0x2f03,
+            XNET_CO_INVALID_STATE, "only DS402 heartbeat and feedback writes are allowed during shutdown");
         require(buffer != nullptr, XNET_CO_INVALID_ARGUMENT, "OD write buffer is required");
         const auto& v = d.model->value(index, subindex);
         require(buffer_size == v.size, XNET_CO_INVALID_ARGUMENT, "OD write size must equal the OD length");
         const auto result = entry_io(d, index, subindex, v, nullptr, buffer, true);
         if (result < 0) d.fail(result, "OD " + std::to_string(index) + ":" + std::to_string(subindex) + " write failed");
         return result;
-    });
+    }, true);
 }
 int32_t xnet_canopen_request_tpdo(xnet_canopen_handle handle, uint16_t number) {
     return call(handle, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
