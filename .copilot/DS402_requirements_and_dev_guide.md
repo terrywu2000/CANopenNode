@@ -3,6 +3,7 @@
 > 适用范围：当前仓库 CANopenNode 核心，以及 `xnet_intergration/` NI-XNET CANopen 从站集成。
 > 参考资料：`reference/canopennode-rtt`（Pure-C CiA 402 Device 核心 + RT-Thread 适配）、`reference/EtherCAT_Slave`（EtherCAT 侧 CiA 402 示例应用）。
 > 本文是后续开发的需求基线。首期范围已确定为 PP 位置控制；仅将仍需负责人决策的事项标注为 **[待确认]**。
+> 实现进度：单轴 PP 的 internal 路径及 external v1 帧交换已接入 CANopenNode worker；JSON 启动校验、反馈提交、epoch/序号/超时与异步动作确认已有实现和 fake-XNET 覆盖。本文其余硬件语义、诊断覆盖和实物验收仍需逐项验证；功能验证不构成硬实时或安全认证。
 
 ---
 
@@ -11,9 +12,10 @@
 ### 1.1 现状
 
 - 当前 CANopenNode（根 `README.md`）是 ANSI C、MISRA C:2012 风格的协议栈，分层为 `301/`、`303/`、`304/`、`305/`、`309/`、`storage/`、`extra/`，**不包含** CiA 402 实现。
-- `xnet_intergration/` 把 CANopen 从站通过 NI-XNET 暴露给 VeriStand 模型，**只做通信**：
-  - `include/xnet_canopen.h` 文件头明确声明："No function interprets a CiA 402 controlword or generates the application's statusword."，并声明 NMT 状态、CANopen 状态、应用驱动状态是三个独立概念。
-  - `xnet_intergration/src/model.cpp:280` 注释："adding 0x6040 does not give the library a CiA 402 controlword interpreter."。即 0x6040 等对象目前只是 OD 存储与访问元数据。
+- `xnet_intergration/` 把 CANopen 从站通过 NI-XNET 暴露给 VeriStand 模型。当前已增加显式 JSON 启用的单轴 PP internal/external 路径；普通配置仍只做通信与 OD 存储。NMT 状态、CANopen 状态、DS402 驱动状态仍是三个独立概念。
+  - `include/xnet_canopen.h` 说明库可按 JSON 显式启用 DS402 PP；未新增公共 ABI。
+  - `src/model.cpp` 对启用配置校验必需对象、权限、类型和已启用 PDO 映射；不自动补建对象。
+  - external 帧交换通过本地 OD API 接入；模型仍由宿主应用运行，不由库隐式创建线程或模型实例。
   - `xnet_intergration/tests/app/README.md:113` 说明测试应用不实现 CiA 402。
 - 设备 OD 由 JSON 配置描述；JSON 由工具从目标真实驱动设备的 EDS 转换生成。普通 CANopen 设备配置可以不包含 CiA 402 对象，电机驱动设备配置则包含其实际提供的 402 对象与 PDO 配置。
 - 仓库已有 Kinco FD124 的 EDS（`xnet_intergration/eds/Kinco_FD_20250417_V1.2.eds`）与 JSON 配置样例（`examples/kinco_FD124.json`、`tests/app/kinco_FD124.config.json`）。
@@ -50,7 +52,7 @@
 | 安全所有权 | QuickStop、DisableVoltage、FaultReaction 可抢占 BUSY 动作 | 无显式所有权模型 | 无 |
 | 故障复位 | 0x6040 bit7 上升沿（edge-triggered） | 固定掩码 `CONTROLWORD_COMMAND_FAULTRESET_MASK`（`cia402appl.h:57`） | 无 |
 | 多轴 | 参考实现支持，OD 基址 `0x6000 + n*0x0800` | 参考示例支持（`LocalAxes[]`） | 当前范围为单轴 |
-| 模式 | 首期仅 PP（1） | 按 JSON/EDS 中 0x6502 与 PDO 配置校验 | 无 |
+| 模式 | 首期仅 PP（1） | 0x6502 存在时校验 PP 位，PDO 按 JSON 校验 | 无 |
 | 堆使用 | 无堆，应用持有所有存储 | 静态 | 有 C++ 动态对象 |
 
 **结论**：canopennode-rtt 的 Pure-C 核心在结构上最适合 xnet 复用（无堆、回调边界清晰、有安全所有权模型）。EtherCAT 示例更接近"验证用法"，状态转换表可用于交叉核对。
@@ -83,13 +85,13 @@ CANopen NMT 是底层通信层状态机，DS402 PDS 是上层电机控制状态�
 
 | ID | 需求 | 验收标准 |
 |---|---|---|
-| FR-OD-01 | 配置启用 `drive_402` 时，PP 必需对象为 0x603F（U16 Error code）、0x6040（U16 Controlword）、0x6041（U16 Statusword）、0x6060（I8 Modes of operation）、0x6061（I8 Modes of operation display）、0x6064（I32 Position actual）、0x607A（I32 Target position）、0x6081（U32 Profile velocity）、0x6083（U32 Profile acceleration）、0x6084（U32 Profile deceleration）及 0x6502（U32 Supported drive modes）。0x606C 等非 PP 必需对象按 JSON/设备 EDS 配置作为可选对象。 | 仅在初始化载入 JSON 后校验：上述必需对象必须存在且类型、子索引、长度、访问属性正确；PDO 配置必须与 JSON/EDS 中声明的方向、映射对象及映射长度一致，并包含 RPDO 的 0x6040/0x607A 命令输入映射和 TPDO 的 0x6041/0x6064 状态输出映射。缺项或冲突视为配置错误，初始化失败并返回 `XNET_CO_MODEL_ERROR`（或核心对应错误码）。 |
+| FR-OD-01 | 配置启用 `drive_402` 时，核心对象为 0x6040、0x6041、0x6060、0x6061；当前 PP 运行还依赖 0x6064、0x607A、0x6081、0x6083、0x6084。0x603F、0x6502、0x6085 等为可选对象。 | 初始化校验必需对象的类型、子索引、长度、访问属性；可选对象存在时也校验。PDO 映射不强制，已有映射须与 JSON/EDS 中的方向、对象和长度一致；未映射对象可通过 SDO 访问。必需项缺失或配置冲突时返回 `XNET_CO_MODEL_ERROR`。 |
 | FR-OD-02 | 当前仅支持单轴，使用 JSON/EDS 描述的该轴标准对象索引，不做轴索引偏移或多轴实例化 | 配置中的单个 PP 轴绑定且运行；声明多个 DS402 轴的配置必须拒绝初始化，不得被误解释为多个 DS402 轴 |
 | FR-OD-03 | 核心不得假定对象有符号语义；符号/无符号由 OD/EDS 决定 | 0x6060 为 INTEGER8，0x6061 为 INTEGER8，读写不做错误的符号扩展 |
 | FR-OD-04 | 对象访问须经过 OD 锁（与 xnet 的批量 API 锁序一致，见 §8.2） | 通过 SDO 写 0x6040 与批量写 API 并发时无数据竞争 |
 | FR-OD-05 | 主站独占写入 target 与 profile 参数，核心独占发布 demand、状态和已接受实际值；模型只写本地交换对象 | 覆盖命令、反馈的网络/本地权限；核心不得覆盖 0x607A 或 PP profile 参数 |
 
-JSON 是 OD 与 PDO 配置的唯一运行时来源，初始化阶段不根据 `drive_402` 自动补建对象，也不在运行时动态添加 PDO 映射。普通设备 JSON 未声明 `drive_402` 时按普通 CANopen 设备初始化，不执行 402 对象校验或状态机；声明启用时，若 EDS 转换得到的 JSON 缺少任一 PP 协议必需对象或必要配置，必须作为配置错误拒绝初始化，不得静默降级为普通设备或自动补默认对象。若使用 external 模型，所需本地交换对象必须作为本设备 JSON 的本地扩展项提供并通过同一初始化校验；不得由运行时绕过 JSON 创建。
+JSON 是 OD 与 PDO 配置的唯一运行时来源，初始化阶段不根据 `drive_402` 自动补建对象，也不在运行时动态添加 PDO 映射。普通设备 JSON 未声明 `drive_402` 时按普通 CANopen 设备初始化，不执行 402 对象校验或状态机；声明启用时，若 EDS 转换得到的 JSON 缺少当前 PP 实现必需的对象或其他必要配置，必须作为配置错误拒绝初始化，不得静默降级为普通设备或自动补默认对象。0x603F 不存在时不发布该对象，但 external 故障仍通过状态机和 EMCY 处理。若使用 external 模型，所需本地交换对象必须作为本设备 JSON 的本地扩展项提供并通过同一初始化校验；不得由运行时绕过 JSON 创建。
 
 **实现说明**：`canopennode-rtt` 的 OD 扩展通过 `CO_402_device_bindOD()` 绑定，并在 Communication Reset 时重新绑定（见 `docs/en/cia402-device-rtt.md`）。xnet 中对应的是 `Model` 的 `resolve_node` / `configure` 流程（`xnet_intergration/src/model.cpp:427`、`:494`），绑定点应放在同一流程里。
 
@@ -118,8 +120,8 @@ JSON 是 OD 与 PDO 配置的唯一运行时来源，初始化阶段不根据 `d
 
 | ID | 需求 |
 |---|---|
-| FR-MODE-01 | 首期只启用 PP（模式值 1）；其他模式的能力声明与运行逻辑不属于首期 |
-| FR-MODE-02 | 0x6502 只公布 PP 能力（bit0），并要求 JSON 中该能力与 PP 必需 OD 对象、PDO 配置及模型能力一致；不宣称支持其他模式 |
+| FR-MODE-01 | 首期只启用 PP（模式值 1）；其他模式的运行逻辑不属于首期 |
+| FR-MODE-02 | 0x6502 可缺省；存在时须包含 PP 能力（bit0），允许保留源设备声明的其他位。其他位不表示模拟器支持这些模式。 |
 | FR-MODE-03 | 0x6060 写入 1 表示 PP；写入任何其他模式值必须拒绝（SDO Abort 或返回错误），不得改变当前模式；0x6061 仅在 PP 初始化/就绪后发布 1 |
 | FR-MODE-04 | 首期不支持运行时模式切换；0x6060 不得从 PP 切换到其他模式。该能力作为未来需求另行设计 |
 | FR-MODE-05 | PP profile 位置命令按 Controlword 的 new-set-point、change-immediately、relative 等相关位处理，并由核心生成 profile demand；同一命令不得重复触发，确认及 target reached 判据必须有单元测试 |
@@ -230,10 +232,10 @@ CANopen 主站 → CANopenNode / OD
 
 ### 7.3 与 xnet 集成点
 
-1. **OD 来源与校验**：启动时加载 JSON；该 JSON 由设备 EDS 转换工具生成并决定 OD 与 PDO，不由 402 核心补建对象。未声明 `drive_402` 时按普通设备初始化；声明启用时，在初始化阶段校验 PP 必需对象、权限、类型、长度及 PDO 映射，缺失/不匹配即作为配置错误拒绝启动。
-2. **绑定**：在 JSON/OD/PDO 校验成功并完成 OD 初始化后，于 `Model::configure()`（`model.cpp:494`）或 `device.cpp` 调用 `CO_402_device_bindOD()`；只有显式启用 402 的设备才绑定。
+1. **OD 来源与校验**：启动时加载 JSON；该 JSON 由设备 EDS 转换工具生成并决定 OD 与 PDO，不由 402 核心补建对象。未声明 `drive_402` 时按普通设备初始化；声明启用时，校验 PP 必需对象、存在的可选对象及配置中的 PDO 映射；不强制指定 PDO 映射，必需对象缺失或配置不匹配时拒绝启动。
+2. **绑定（当前实现）**：`Model::load()` 完成 PP 必需 OD 与已配置 PDO 校验；显式启用时由 `device.cpp` 在 `setup_stack()` 安装 0x6060 SDO 写扩展，拒绝非 PP 模式。当前是 C++ `Drive` 直接读写已校验 OD，尚无通用 `CO_402_device_bindOD()` API。
 3. **周期调用**：402 只在现有 device worker 中处理，插入 RPDO 处理之后、TPDO 处理之前；另设应用拥有的模型线程，不在 worker 内执行模型计算。
-4. **Reset**：`xnet_canopen_device::reset_stack()`（`src/device.cpp:230`）在 `model->restore()`（`:243`）之后完成复位。402 重新绑定应放在该流程中，并在成功完成后才发布计数（参考 `device.cpp:247-249` 的注释）；复位过程中仍由 DS402 处理电机控制状态，不由 NMT 层直接修改 PDS。
+4. **Reset**：Reset Node/Communication 与 worker stop 在重建或退出前请求 DS402 安全动作；external 路径等待匹配动作反馈，并通过新 epoch 使旧帧失效。NMT 层不直接修改 PDS。
 5. **状态快照**：402 与模型诊断通过只读 OD 对象暴露，不新增 C 函数，不修改已有 40 字节 `xnet_canopen_status_t`；复位代次随模型命令快照发布。
 
 ### 7.4 DriveIF 对 Kinco FD124 的适配 **[待确认]**
@@ -248,7 +250,7 @@ CANopen 主站 → CANopenNode / OD
 
 > 本节假定已有 **Slave 侧驱动行为模型**（下文简称“模型”），负责跟踪、动态响应、限幅及故障条件，可在其内部组合电机和负载模型。借鉴 Beckhoff Torque Controller 的强类型端口、固定步长、模式门控与诊断方式，不直接接入其主站控制逻辑。
 
-**结论：保留现有 C ABI，新增本地交换对象和 OD 扩展。** 模型通过 `bind_batch`、`read_batch`、`write_batch` 交互。PDS 状态机与 Statusword 只有库内一份；已有模型若包含 PDS，应拆出或关闭该部分。以下为待实现协议，不表示现有库已支持。
+**结论：保留现有 C ABI，新增本地交换对象和 OD 扩展。** 宿主模型通过 `bind_batch`、`read_batch`、`write_batch` 或等价的单对象 API 交互。PDS 状态机与 Statusword 只有库内一份；已有模型若包含 PDS，应拆出或关闭该部分。以下 v1 帧契约已实现为当前接口基线，模型计算仍由宿主应用负责。
 
 #### 7.5.1 职责分工
 
@@ -267,8 +269,8 @@ CANopen 主站 → CANopenNode / OD
 |---|---|---|---|---|
 | 0x2F00 | 当前模型故障 | UNSIGNED16 | 核心发布 | 来自最新已接受反馈帧，0 表示故障条件已消失，不是锁存记录 |
 | 0x2F01 | 模型心跳 | UNSIGNED32 | 模型 | 独立于反馈提交；模型存活时持续递增 |
-| 0x2F02 | 命令快照 | 固定长度 OCTET_STRING | 核心 | 带版本、epoch、command_seq、action_seq、动作、PP 模式状态、有效输出使能、位置 demand 和参数；未来模式扩展另行定义 |
-| 0x2F03 | 完整反馈提交 | 固定长度 OCTET_STRING | 模型 | 带版本、epoch、feedback_seq、源 command_seq、action_seq、动作结果、PP 就绪响应、实际位置、有效掩码、限幅、当前故障码、reset_permitted |
+| 0x2F02 | 命令快照 | OCTET_STRING，56 字节 | 核心 | 版本 1 命令帧；字段布局见下表 |
+| 0x2F03 | 完整反馈提交 | OCTET_STRING，36 字节 | 模型 | 版本 1 反馈帧；字段布局见下表 |
 | 0x2F04 | 处理确认 | UNSIGNED32 | 核心 | 最后被 worker 完成处理的 feedback_seq，0 表示本代次尚无结果；须同时检查 0x2F05 |
 | 0x2F05 | 处理结果 | UNSIGNED16 | 核心 | 0=无结果、1=已接受、2=命令过期、3=内容无效；epoch 失效通过新命令快照通知 |
 
@@ -277,6 +279,50 @@ CANopen 主站 → CANopenNode / OD
 - 0x2F01、0x2F03 为 SDO 只读、`local_write: true`，禁止 RPDO 写入；其余为核心只读发布、`local_write: false`。启动时验证权限及索引冲突。
 - 旧草案中的模型直接写 0x2F00、标准实际值以及“心跳最后写”方案被本协议替代；不改变现有通用批量 API 的逐条尝试语义。
 - 快照和反馈帧采用显式小端字段编码、固定长度、无隐式填充，不直接 memcpy 编译器结构体。实现前在接口头文件冻结版本 1 的逐字节偏移、长度、枚举、保留位和有效掩码；未知版本、错误长度、非法枚举/保留位须返回错误并诊断，不得截断或默认成功。
+- **协议 v1 已冻结**（`402/CO_402_protocol.h`）：所有整数均为小端，二补数 I32；固定长度，不允许尾随字节。版本为 1，长度字段必须精确匹配；保留位必须为 0。
+
+命令帧（0x2F02，56 字节）：
+
+| 偏移 | 宽度 | 字段 | 约束 |
+|---:|---:|---|---|
+| 0 | U8 | version | 必须为 1 |
+| 1 | U8 | length | 必须为 56 |
+| 2 | U8 | action | 0 none、1 shutdown、2 switchOn、3 enableOperation、4 disableOperation、5 quickStop、6 faultReaction、7 faultReset、8 disableVoltage |
+| 3 | U8 | flags | bit0 output_allowed、bit1 pp_ready；bit2..7 保留 |
+| 4 | U64 | epoch | 非零 |
+| 12 | U32 | command_seq | 非零 |
+| 16 | U32 | action_seq | 非零；无动作时仍为当前代次动作序号 |
+| 20 | U16 | controlword | 最近接受的原始主站值，仅供诊断/模型上下文，不授权模型重解析 |
+| 22 | U16 | statusword | 核心当前值 |
+| 24 | U8 | pds | 枚举 0..7，顺序同 `CO_402_PDS_*` |
+| 25 | I8 | mode | 0 未显示、1 PP；其他值非法 |
+| 26 | U16 | reserved | 必须为 0 |
+| 28 | I32 | demand_position | PP 核心 profile 输出，counts |
+| 32 | I32 | target_position | 最近接受的主站目标，counts |
+| 36 | U32 | profile_velocity | counts/s |
+| 40 | U32 | profile_acceleration | counts/s² |
+| 44 | U32 | profile_deceleration | counts/s² |
+| 48 | U32 | quick_stop_deceleration | counts/s² |
+| 52 | I32 | demand_velocity | counts/s |
+
+反馈帧（0x2F03，36 字节）：
+
+| 偏移 | 宽度 | 字段 | 约束 |
+|---:|---:|---|---|
+| 0 | U8 | version | 必须为 1 |
+| 1 | U8 | length | 必须为 36 |
+| 2 | U8 | action_result | 0 none、1 BUSY、2 DONE、3 ERROR |
+| 3 | U8 | flags | bit0 position_valid（必需）、bit1 velocity_valid、bit2 pp_ready、bit3 limited、bit4 reset_permitted；bit5..7 保留 |
+| 4 | U64 | epoch | 必须等于当前 epoch 且非零 |
+| 12 | U32 | feedback_seq | 非零、模序递增 |
+| 16 | U32 | command_seq | 必须引用保留历史内且未超 `command_max_age_us` 的核心命令 |
+| 20 | U32 | action_seq | 必须匹配当前动作序号 |
+| 24 | I32 | actual_position | 当 position_valid 时有效，counts |
+| 28 | I32 | actual_velocity | 仅 velocity_valid 时有效，counts/s |
+| 32 | U16 | fault_code | 0 无当前故障，非零为设备故障表代码 |
+| 34 | U16 | reserved | 必须为 0 |
+
+序号 0 保留为无值；U32 比较使用模序且有效窗口小于 2³¹。相同 `feedback_seq` 的完全相同重试可幂等应答但不刷新新鲜度；同序号不同内容、旧序号、未知命令或不匹配 action_seq 均拒绝。0x2F03 一次写入必须正好 36 字节；pending 未消费时只允许同帧重试，否则返回设备状态错误。0x2F04/0x2F05 分别发布被消费的 feedback_seq 和结果（0 none、1 accepted、2 stale、3 invalid）。
 - 位置为 I32 counts；U16 故障码原样对应设备故障表。PP 的位置比例、正方向、速度/加速度/减速度单位、限幅、target-reached 容差及持续时间由 JSON 明确，初始化时拒绝缺失或不一致配置。模型内部可用浮点，适配层负责有界转换，溢出不得静默回绕。
 - 首期 PP 必须具备有效位置反馈及 profile 参数；速度、力矩对象和 PT/CST 能力仅在未来模式扩展时纳入要求。
 - 模型故障经完整反馈进入核心，不使用 `xnet_canopen_set_fault` 代替 PDS 故障路径。心跳计数仅指示更新，超时使用 worker 本机单调时钟，不依赖模型墙钟。
@@ -351,7 +397,7 @@ CANopen 主站 → CANopenNode / OD
 
 #### 7.5.9 对外部接口文档的影响
 
-`xnet_canopen.h` 文件头声明"No function interprets a CiA 402 controlword"。库内运行 402 核心后，这句话需要修订为：模型不解释 Controlword，库内 402 核心按 JSON 声明启用后解释它。开发时需同步修改头文件注释。
+`xnet_canopen.h` 文件头已修订为：普通应用行为由外部模型提供，配置可显式启用库内单轴 PP 核心；NMT 与 DS402 状态仍分层。后续完成 external 接口时继续同步更新中英文说明。
 
 同时补充单次批量调用的锁语义、跨调用不原子及无数据年龄保证；不能把一次 read_batch 宣称为“所有字段必定同一产生周期”。帧协议的版本、布局、提交/消费、权限、代次和错误语义须在接口头文件及 xnet 中英文 README 中同步说明。保留通用 write_batch 无回滚语义，不修改其行为来实现事务。
 
@@ -553,6 +599,7 @@ CANopen 主站 → CANopenNode / OD
 9. **执行与轨迹所有权（已确定）**：同进程、独立模型线程、库锁外计算；核心负责 PP profile/斜坡，模型负责跟踪动态与限幅，不实现第二份 PDS。
 10. **交换与生命周期（已确定）**：单条目完整帧校验提交，独立心跳，worker 统一消费；代次/序号防旧帧，external 缺失或失联不回退 internal。
 11. **实现前协议冻结（实现前完成）**：按 §7.5 冻结帧版本 1 的逐字节布局、首期动作/反馈枚举、错误码表、JSON schema 和诊断字段，提供编码往返测试；不得边联调边猜测结构体布局。
+12. **实现状态**：协议 v1 已冻结，JSON external 配置校验、帧编解码/提交、心跳与命令新鲜度校验、反馈消费、动作 BUSY/DONE/ERROR、PP readiness/reset permission、故障发布和 reset/stop epoch 更新已接入。仍须持续验证设备 EDS 的实际语义、故障码映射、驱动时序和硬件行为；不得据此宣称硬实时或硬件安全认证。
 
 本次确定项是后续开发约束，不代表实现完成或硬件安全认证；§1.1 与 §7.5.8 描述的现有实现差距仍需开发验证。
 
@@ -567,8 +614,8 @@ CANopen 主站 → CANopenNode / OD
 | T-PDS | 全部 PDS 合法转换；非法转换忽略；0x000F 回调顺序 |
 | T-CW | Controlword 位解析；边沿复位；保留位处理 |
 | T-SW | 每个 PDS 状态下 Statusword 的状态位 |
-| T-MODE | 只接受 PP 的 0x6060 写入校验；0x6061 回读；0x6502 仅声明 PP 能力 |
-| T-CONFIG | 普通设备 JSON 不触发 402 校验；402 JSON 完整时初始化成功；必需对象/PDO 缺失、类型或映射冲突时初始化失败 |
+| T-MODE | 只接受 PP 的 0x6060 写入校验；0x6061 回读；0x6502 存在时包含 PP 位，允许其他位 |
+| T-CONFIG | 普通设备 JSON 不触发 402 校验；可选对象及 PDO 映射缺失时仍可初始化；必需对象缺失、类型或映射冲突时初始化失败 |
 | T-SAFE | QuickStop、DisableVoltage 抢占 BUSY 动作 |
 | T-FLT | 故障路径、故障锁存、0x603F 更新、fail-closed |
 | T-RST | Reset Node / Communication 对 OD 与绑定的影响 |
@@ -585,13 +632,13 @@ CANopen 主站 → CANopenNode / OD
 ### 10.2 集成测试（xnet）
 
 - 使用 `xnet_intergration/tests/fake_xnet` 与 `tests/test_integration.cpp` 扩展 402 场景。
-- 使用一份普通设备 JSON 和一份启用 402 的 EDS 转换 JSON 验证初始化分支；后者缺少 PP 必需 OD 或 PDO 配置时必须启动失败。
+- 使用一份普通设备 JSON 和一份启用 402 的 EDS 转换 JSON 验证初始化分支；后者缺少 PP 必需 OD 或 PDO 配置不合法时必须启动失败。
 - 通过 SDO / PDO 写 0x6040，检查 0x6041 状态序列。
 - 覆盖 Reset Node、Reset Communication、NMT 切换和 Node Guarding 超时；验证 NMT 层不直接执行电机控制动作，PDS/Statusword 变化只由 DS402 产生。
 - 使用 fake XNET 加同进程模型线程验证单轴 RPDO → 402 → TPDO 顺序、帧提交与消费、序号/代次及本地/网络权限；验证当前配置不创建或隐式处理额外 402 轴。
 - 注入单帧写失败、批量其他条目失败、模型延迟/无锁挂起、持续故障和复位竞争；验证失败不被心跳成功掩盖，拒绝帧可恢复重算。
 - 理想跟随模型先验收，再加入可配置延迟、斜坡跟踪误差、限幅、故障源；同一契约下替换复杂模型。若采用 Simulink 生成代码，验证 initialize/step/terminate、端口类型与固定步长；TwinCAT TcCOM 或 FMU 不是本地 C API 的隐式运行时。
-- 以功能正确性为验收标准；可按 §8.4 记录周期与延迟诊断信息，但不设性能门槛或实时性验收结论。
+- 以功能正确性及 CANopen 毫秒级基本控制目标为验收方向；可按 §8.4 记录周期与延迟，但功能验证不构成硬实时性能门槛或实时性认证。
 
 ### 10.3 可选设备行为对照（Kinco FD124）
 
@@ -624,7 +671,7 @@ CANopen 主站 → CANopenNode / OD
 - [ ] 所有回调非阻塞，不获取锁。
 - [ ] Statusword 状态位与 PDS 状态一一对应。
 - [ ] Fault Reset 为边沿触发。
-- [ ] 0x6502 只声明 PP，且 JSON、对象与能力保持一致。
+- [ ] 0x6502 存在时包含 PP 位；即使声明其他模式，模拟器仍只接受 PP。
 - [ ] 当前只绑定一个 DS402 轴；多轴配置被明确拒绝，不做轴偏移或每轴数组处理。
 - [ ] 设备 JSON 在初始化阶段完成 OD/PDO 校验；缺项或冲突明确报配置错误。
 - [ ] Reset 后重新绑定 OD 扩展。
