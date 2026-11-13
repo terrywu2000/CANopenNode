@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "node_id": 10,
+  "bitrate_kbps": 125,
+  "identity": {"vendor_id": 1, "product_code": 402, "revision_number": 1, "serial_number": 1001},
+  "heartbeat_ms": 1000,
+  "worker_period_us": 1000,
+  "drive_402": {
+    "profile": "PP",
+    "model": "external",
+    "position_tolerance_counts": 5,
+    "target_reached_time_us": 20000,
+    "startup_timeout_us": 1000000,
+    "heartbeat_timeout_us": 200000,
+    "feedback_timeout_us": 200000,
+    "action_timeout_us": 1000000,
+    "command_max_age_us": 100000
+  },
+  "objects": [
+    {"index": "0x603F", "type": "UNSIGNED16", "value": 0, "access": "ro"},
+    {"index": "0x6040", "type": "UNSIGNED16", "value": 0, "access": "rw", "pdo": "rx"},
+    {"index": "0x6041", "type": "UNSIGNED16", "value": 0, "access": "ro", "pdo": "tx"},
+    {"index": "0x605A", "type": "INTEGER16", "value": 2, "access": "rw"},
+    {"index": "0x6060", "type": "INTEGER8", "value": 1, "access": "rw", "pdo": "rx"},
+    {"index": "0x6061", "type": "INTEGER8", "value": 0, "access": "ro", "pdo": "tx"},
+    {"index": "0x6064", "type": "INTEGER32", "value": 0, "access": "ro", "pdo": "tx"},
+    {"index": "0x607A", "type": "INTEGER32", "value": 0, "access": "rw", "pdo": "rx"},
+    {"index": "0x6081", "type": "UNSIGNED32", "value": 10000, "access": "rw"},
+    {"index": "0x6083", "type": "UNSIGNED32", "value": 100000, "access": "rw"},
+    {"index": "0x6084", "type": "UNSIGNED32", "value": 100000, "access": "rw"},
+    {"index": "0x6085", "type": "UNSIGNED32", "value": 100000, "access": "rw"},
+    {"index": "0x6502", "type": "UNSIGNED32", "value": 1, "access": "ro"},
+    {"index": "0x2F00", "type": "UNSIGNED16", "value": 0, "access": "ro", "local_write": false},
+    {"index": "0x2F01", "type": "UNSIGNED32", "value": 0, "access": "ro", "local_write": true},
+    {"index": "0x2F02", "type": "OCTET_STRING", "size": 56, "value": [], "access": "ro", "local_write": false},
+    {"index": "0x2F03", "type": "OCTET_STRING", "size": 36, "value": [], "access": "ro", "local_write": true},
+    {"index": "0x2F04", "type": "UNSIGNED32", "value": 0, "access": "ro", "local_write": false},
+    {"index": "0x2F05", "type": "UNSIGNED16", "value": 0, "access": "ro", "local_write": false}
+  ],
+  "rpdos": [
+    {"transmission_type": 255, "mapping": [
+      {"index": "0x6040", "subindex": 0},
+      {"index": "0x6060", "subindex": 0},
+      {"index": "0x607A", "subindex": 0}
+    ]}
+  ],
+  "tpdos": [
+    {"transmission_type": 255, "event_ms": 20, "inhibit_100us": 10, "mapping": [
+      {"index": "0x6041", "subindex": 0},
+      {"index": "0x6061", "subindex": 0},
+      {"index": "0x6064", "subindex": 0}
+    ]}
+  ]
+}

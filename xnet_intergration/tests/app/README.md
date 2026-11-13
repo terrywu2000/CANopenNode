@@ -116,6 +116,10 @@ This is a **passive application-layer slave**, not a CANopen master or drive mod
 - Node ID 255 may legitimately wait for LSS configuration.
 - The app does not write OD values, request TPDOs, inject faults, or implement CiA 402.
 
+For a slave with an independently threaded external PP motor model, see
+[modsim_app](../modsim_app/README.md). Both runners share loader, configuration
+and lifecycle support; this passive runner's behavior is unchanged.
+
 ## Mock validation
 
 With `XNET_CANOPEN_BUILD_TESTS=ON`, `XNET_CANOPEN_BUILD_LIBRARY=OFF` and the app

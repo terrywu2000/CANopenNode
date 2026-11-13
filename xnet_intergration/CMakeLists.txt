@@ -55,6 +55,7 @@ endif()
 if(XNET_CANOPEN_BUILD_APP)
     add_subdirectory(tests/app)
 endif()
+add_subdirectory(tests/modsim_app)
 
 if(XNET_CANOPEN_BUILD_TESTS)
     enable_testing()
@@ -88,9 +89,26 @@ if(XNET_CANOPEN_BUILD_TESTS)
     target_include_directories(xnet_canopen_drive402_protocol_tests PRIVATE "${DS402_ROOT}")
     target_compile_options(xnet_canopen_drive402_protocol_tests PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME xnet_canopen_drive402_protocol_tests COMMAND xnet_canopen_drive402_protocol_tests)
+    add_executable(xnet_canopen_modsim_tests tests/modsim_app/test_modsim.cpp tests/fake_xnet.cpp)
+    target_link_libraries(xnet_canopen_modsim_tests PRIVATE
+        xnet_canopen_objects xnet_canopen_modsim_model Threads::Threads)
+    target_compile_definitions(xnet_canopen_modsim_tests PRIVATE
+        MODSIM_DEVICE_MODEL="${CMAKE_CURRENT_SOURCE_DIR}/tests/modsim_app/device.json")
+    add_test(NAME xnet_canopen_modsim_tests COMMAND xnet_canopen_modsim_tests)
+    set_tests_properties(xnet_canopen_modsim_tests PROPERTIES RESOURCE_LOCK xnet_canopen_app_log TIMEOUT 30)
     if(XNET_CANOPEN_BUILD_APP AND NOT XNET_CANOPEN_BUILD_LIBRARY)
         add_library(xnet_canopen_app_mock SHARED tests/fake_xnet.cpp)
         target_link_libraries(xnet_canopen_app_mock PRIVATE xnet_canopen_objects Threads::Threads)
+        if(XNET_CANOPEN_BUILD_MODSIM_APP)
+            add_test(NAME xnet_canopen_modsim_smoke
+                COMMAND "${CMAKE_COMMAND}"
+                    "-DAPP=$<TARGET_FILE:xnet_canopen_modsim>"
+                    "-DLIB=$<TARGET_FILE:xnet_canopen_app_mock>"
+                    "-DMODEL=${CMAKE_CURRENT_SOURCE_DIR}/tests/modsim_app/device.json"
+                    "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/modsim-smoke"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/modsim_app/smoke.cmake")
+            set_tests_properties(xnet_canopen_modsim_smoke PROPERTIES RESOURCE_LOCK xnet_canopen_app_log TIMEOUT 30)
+        endif()
         add_test(NAME xnet_canopen_app_smoke
             COMMAND "${CMAKE_COMMAND}"
                 "-DAPP=$<TARGET_FILE:xnet_canopen_device>"
@@ -120,6 +138,24 @@ if(XNET_CANOPEN_BUILD_TESTS)
         set_tests_properties(xnet_canopen_app_smoke xnet_canopen_app_sigint PROPERTIES TIMEOUT 30)
         if(UNIX)
             set_tests_properties(xnet_canopen_app_sigterm PROPERTIES RESOURCE_LOCK xnet_canopen_app_log TIMEOUT 30)
+        endif()
+        if(XNET_CANOPEN_BUILD_MODSIM_APP)
+            file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/modsim-signals")
+            file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/modsim-signals/runner.json"
+                "{\"interface_name\":\"CAN1\",\"model_path\":\"${CMAKE_CURRENT_SOURCE_DIR}/tests/modsim_app/device.json\","
+                "\"persistence_path\":\"${CMAKE_CURRENT_BINARY_DIR}/modsim-signals/device.lss.json\"}")
+            add_test(NAME xnet_canopen_modsim_sigint COMMAND xnet_canopen_app_signal_tests
+                "$<TARGET_FILE:xnet_canopen_modsim>" "$<TARGET_FILE:xnet_canopen_app_mock>"
+                "${CMAKE_CURRENT_BINARY_DIR}/modsim-signals/runner.json"
+                "${CMAKE_CURRENT_BINARY_DIR}/modsim-signals/sigint.txt" INT)
+            set_tests_properties(xnet_canopen_modsim_sigint PROPERTIES RESOURCE_LOCK xnet_canopen_app_log TIMEOUT 30)
+            if(UNIX)
+                add_test(NAME xnet_canopen_modsim_sigterm COMMAND xnet_canopen_app_signal_tests
+                    "$<TARGET_FILE:xnet_canopen_modsim>" "$<TARGET_FILE:xnet_canopen_app_mock>"
+                    "${CMAKE_CURRENT_BINARY_DIR}/modsim-signals/runner.json"
+                    "${CMAKE_CURRENT_BINARY_DIR}/modsim-signals/sigterm.txt" TERM)
+                set_tests_properties(xnet_canopen_modsim_sigterm PROPERTIES RESOURCE_LOCK xnet_canopen_app_log TIMEOUT 30)
+            endif()
         endif()
     endif()
     find_package(Python3 3.10 COMPONENTS Interpreter)

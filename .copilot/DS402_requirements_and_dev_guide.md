@@ -632,6 +632,7 @@ CANopen 主站 → CANopenNode / OD
 ### 10.2 集成测试（xnet）
 
 - 使用 `xnet_intergration/tests/fake_xnet` 与 `tests/test_integration.cpp` 扩展 402 场景。
+- `xnet_intergration/tests/modsim_app/` 提供动态加载库的 external PP slave、独立模型线程、可配置跟踪动态/限幅/故障/超时注入，以及复用同一模型代码的 fake-XNET 端到端测试。构建、主站操作与验证命令见该目录 `README.md`；其中记录了无反馈故障反应未完成、首次超时锁存码分类的现有核心差距，不代表全部设计验收已完成。
 - 使用一份普通设备 JSON 和一份启用 402 的 EDS 转换 JSON 验证初始化分支；后者缺少 PP 必需 OD 或 PDO 配置不合法时必须启动失败。
 - 通过 SDO / PDO 写 0x6040，检查 0x6041 状态序列。
 - 覆盖 Reset Node、Reset Communication、NMT 切换和 Node Guarding 超时；验证 NMT 层不直接执行电机控制动作，PDS/Statusword 变化只由 DS402 产生。

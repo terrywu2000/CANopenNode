@@ -1,0 +1,18 @@
+{
+  "period_us": 2000,
+  "action_delay_us": 10000,
+  "position_gain": 40,
+  "velocity_time_constant_s": 0.01,
+  "max_velocity": 200000,
+  "max_acceleration": 2000000,
+  "stop_deceleration": 1000000,
+  "min_position": -1000000,
+  "max_position": 1000000,
+  "initial_position": 0,
+  "fault_code": 0,
+  "fault_after_us": 0,
+  "fault_duration_us": 0,
+  "freeze_feedback_after_us": 0,
+  "freeze_heartbeat_after_us": 0,
+  "error_action": 0
+}
