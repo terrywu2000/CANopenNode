@@ -129,14 +129,15 @@ with fake XNET: tracking/direction/limits, delayed actions and preemption,
 RPDO→PP→feedback→TPDO, Quick Stop, both protocol resets, stop/start with preserved
 plant state, persistent fault/clear/reset, independent heartbeat/feedback
 timeouts, invalid motor parameters, and dynamically loaded timed
-and signal shutdown.
+and signal shutdown. Missing feedback while moving is also exercised during
+native stop and Reset Communication; both complete their bounded fault path and
+retain an explicit unconfirmed-stop diagnostic.
 They do not certify NI-XNET hardware, motor accuracy or safety.
 
-Current core limitations exposed by feedback-freeze testing: the watchdog reports
-current fault `0x8130` and revokes output, but without any further feedback the pending
-Fault Reaction does not complete into FAULT. The simulator does not fabricate
-DONE or change the core to hide this gap against the design's no-feedback
-reaction requirement. Fault-condition injection with continued feedback does
-complete the FAULT/reset handshake.
-The first latched `0x603F` may be generic `0x1000`, rather than timeout `0x8130`,
-because core freshness expiry can precede the adapter's timeout classification.
+Feedback-freeze testing now verifies the first latched `0x603F` is `0x8130`,
+Fault Reaction Active is published with output revoked, and its action deadline
+enters FAULT without a fabricated DONE. Last accepted actuals remain unchanged;
+this state transition is not proof that a physical drive stopped. Heartbeat can
+continue while feedback is missing. Recovery requires fresh valid traffic and a
+new Fault Reset edge/acknowledgement; merely returning traffic never re-enables
+operation. See the integration [watchdog semantics](../../README.md#ds402-pp-configuration).

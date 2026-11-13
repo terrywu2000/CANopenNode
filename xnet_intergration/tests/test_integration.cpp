@@ -611,6 +611,174 @@ void drive_402_external_exchange() {
     }
 }
 
+void drive_402_watchdog_deadlines() {
+    Fixture f;
+    auto external = external_drive_402_model();
+    external["drive_402"]["feedback_timeout_us"] = 20000;
+    external["drive_402"]["action_timeout_us"] = 50000;
+    f.model(external);
+    CHECK(f.initialize() == XNET_CO_OK);
+    const auto tick = [&](uint32_t dt = 0) {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        f.device->process_drive_402(dt);
+    };
+    const auto command = [&] {
+        std::array<uint8_t, CO_402_COMMAND_FRAME_SIZE> bytes{};
+        uint32_t size = 0;
+        CHECK(xnet_canopen_read_od(f.device, 0x2f02, 0, bytes.data(), bytes.size(), &size) == XNET_CO_OK);
+        CO_402_command_frame_t frame{};
+        CHECK(CO_402_command_unpack(&frame, bytes.data(), size));
+        return frame;
+    };
+    const auto scalar = [&](uint16_t index) {
+        std::array<uint8_t, 4> bytes{};
+        uint32_t size = 0, value = 0;
+        CHECK(xnet_canopen_read_od(f.device, index, 0, bytes.data(), bytes.size(), &size) == XNET_CO_OK);
+        for (uint32_t i = 0; i < size; ++i) value |= uint32_t(bytes[i]) << (8 * i);
+        return value;
+    };
+    uint32_t seq = 0, heartbeat = 0;
+    std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> last_submission{};
+    const auto submit = [&](CO_402_command_frame_t source, uint8_t result = CO_402_ACTION_RESULT_NONE,
+                            uint16_t fault = 0, int32_t position = 123, bool consume = true) {
+        std::array<uint8_t, 4> alive{};
+        ++heartbeat;
+        for (size_t i = 0; i < alive.size(); ++i) alive[i] = static_cast<uint8_t>(heartbeat >> (8 * i));
+        CHECK(xnet_canopen_write_od(f.device, 0x2f01, 0, alive.data(), alive.size()) == XNET_CO_OK);
+        CO_402_feedback_frame_t frame{};
+        frame.epoch = source.epoch;
+        frame.feedback_seq = ++seq;
+        frame.command_seq = source.command_seq;
+        frame.action_seq = source.action_seq;
+        frame.actual_position = position;
+        frame.flags = 0x17;
+        frame.fault_code = fault;
+        frame.action_result = result;
+        CHECK(CO_402_feedback_pack(&frame, last_submission.data(), last_submission.size()));
+        CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, last_submission.data(), last_submission.size()) == XNET_CO_OK);
+        if (consume) tick();
+    };
+    const auto expire_feedback = [&](bool retry = false) {
+        {
+            std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+            f.device->drive_feedback_accepted_at = xco::Clock::now() - 20ms;
+        }
+        if (retry)
+            CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, last_submission.data(), last_submission.size()) == XNET_CO_OK);
+        tick();
+    };
+    const auto expire_action = [&] {
+        {
+            std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+            f.device->drive_action_started = xco::Clock::now() - 50ms;
+        }
+        tick();
+    };
+    const auto controlword = [&](uint16_t value) {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        std::memcpy(f.device->model->value(0x6040, 0).data(), &value, sizeof(value));
+        CO_NMT_sendInternalCommand(f.device->co->NMT, CO_NMT_ENTER_OPERATIONAL);
+        CHECK(CO_NMT_process(f.device->co->NMT, nullptr, 0, nullptr) == CO_RESET_NOT);
+    };
+
+    tick();
+    submit(command());
+    tick(1000000); // Elapsed motion dt must not age newly accepted feedback.
+    CHECK(f.device->drive_402->status().feedback_fresh && scalar(0x603f) == 0);
+    expire_feedback(true);
+    CHECK(scalar(0x603f) == 0x8130);
+    CHECK(f.device->drive_402->status().pds == xco::d402::Pds::fault_reaction_active);
+    const auto reaction = command();
+    CHECK(reaction.action == CO_402_ACTION_FAULT_REACTION && !(reaction.flags & 1));
+    expire_action();
+    auto status = f.device->drive_402->status();
+    CHECK(status.pds == xco::d402::Pds::fault && status.reaction_unconfirmed && !status.action_pending);
+    CHECK(command().action_seq != reaction.action_seq && scalar(0x6064) == 123);
+    submit(reaction, CO_402_ACTION_RESULT_DONE, 0, 999);
+    CHECK(scalar(0x2f05) == 3 && scalar(0x6064) == 123);
+    CHECK(!f.device->drive_402->status().feedback_fresh && scalar(0x603f) == 0x8130);
+
+    submit(command());
+    CHECK(f.device->drive_402->status().feedback_fresh && !f.device->drive_action_timed_out);
+    CHECK(f.device->drive_402->status().pds == xco::d402::Pds::fault && scalar(0x603f) == 0x8130);
+    controlword(0x80);
+    tick();
+    CHECK(command().action == CO_402_ACTION_FAULT_RESET);
+    CHECK(scalar(0x603f) == 0x8130);
+    submit(command(), CO_402_ACTION_RESULT_DONE);
+    CHECK(f.device->drive_402->status().pds == xco::d402::Pds::switch_on_disabled);
+    CHECK(scalar(0x603f) == 0 && !f.device->drive_402->status().output_allowed);
+
+    controlword(0);
+    submit(command(), CO_402_ACTION_RESULT_NONE, 0x2310);
+    CHECK(scalar(0x603f) == 0x2310);
+    const auto fifo_before = f.device->co->em->fifoWrPtr;
+    expire_feedback();
+    CHECK(scalar(0x603f) == 0x2310);
+    CHECK(f.device->co->em->fifoWrPtr != fifo_before); // A distinct timeout still reports EMCY.
+    CHECK(CO_isError(f.device->co->em, CO_EM_MANUFACTURER_START + 2));
+    expire_action();
+    submit(command());
+    controlword(0x80);
+    tick();
+    submit(command(), CO_402_ACTION_RESULT_DONE);
+    CHECK(scalar(0x603f) == 0);
+
+    controlword(0x06);
+    tick();
+    submit(command(), CO_402_ACTION_RESULT_DONE, 0, 123, false);
+    {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        f.device->drive_action_started = xco::Clock::now() - 50ms;
+        f.device->drive_pending_submitted_at = f.device->drive_action_started + 49999us;
+    }
+    tick(); // Completion received before the deadline remains valid if worker consumption is late.
+    CHECK(scalar(0x2f05) == 1 && scalar(0x603f) == 0);
+    CHECK(f.device->drive_402->status().pds == xco::d402::Pds::ready_to_switch_on);
+    controlword(0);
+    tick();
+    submit(command(), CO_402_ACTION_RESULT_DONE);
+
+    for (int lateness_us : {0, 1}) {
+        controlword(0x06);
+        tick();
+        const auto shutdown = command();
+        submit(shutdown, CO_402_ACTION_RESULT_DONE, 0, 123, false);
+        {
+            std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+            f.device->drive_action_started = xco::Clock::now() - 50ms;
+            f.device->drive_pending_submitted_at = f.device->drive_action_started
+                + 50ms + std::chrono::microseconds(lateness_us);
+        }
+        tick();
+        CHECK(scalar(0x2f05) == 3);
+        CHECK(command().action == CO_402_ACTION_FAULT_REACTION && scalar(0x603f) == 0x8130);
+        expire_action();
+        submit(command());
+        controlword(0x80);
+        tick();
+        submit(command(), CO_402_ACTION_RESULT_DONE);
+        CHECK(scalar(0x603f) == 0);
+    }
+}
+
+void drive_402_missing_model_startup() {
+    Fixture f;
+    f.model(external_drive_402_model());
+    CHECK(f.initialize() == XNET_CO_OK);
+    std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+    f.device->drive_started_at = xco::Clock::now() - 1s;
+    f.device->process_drive_402(0);
+    auto status = f.device->drive_402->status();
+    CHECK(status.pds == xco::d402::Pds::fault_reaction_active && !status.feedback_fresh && !status.output_allowed);
+    CHECK(f.device->drive_latched_fault == 0x8130);
+    f.device->drive_action_started = xco::Clock::now() - 1s;
+    f.device->process_drive_402(0);
+    status = f.device->drive_402->status();
+    CHECK(status.pds == xco::d402::Pds::fault && status.reaction_unconfirmed && !status.action_pending);
+    CHECK(status.actual_position == 0 && !f.device->drive_has_last_feedback);
+}
+
 void drive_402_sdo_only() {
     Fixture f;
     auto j = drive_402_model();
@@ -2013,7 +2181,9 @@ int main(int argc, char** argv) {
         {"model validation", model_validation}, {"DS402 model validation", drive_402_model_validation},
         {"DS402 SDO only", drive_402_sdo_only},
         {"DS402 PP integration", drive_402_integration},
-        {"DS402 external exchange", drive_402_external_exchange}, {"NODE_ID offsets", node_id_offsets},
+        {"DS402 external exchange", drive_402_external_exchange},
+        {"DS402 watchdog deadlines", drive_402_watchdog_deadlines}, {"NODE_ID offsets", node_id_offsets},
+        {"DS402 missing model startup", drive_402_missing_model_startup},
         {"adapter session configuration", adapter_session_configuration},
         {"CAN termination configuration", can_termination_configuration},
         {"startup bitrates", startup_bitrates}, {"scalar limits", scalar_limits},

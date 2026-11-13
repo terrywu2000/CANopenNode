@@ -63,6 +63,8 @@ public:
     /** Store feedback and reset its age. */
     void post(const Feedback& feedback);
     Feedback sample(int32_t demand_position, int32_t demand_velocity, uint32_t dt_us) override;
+    void set_age(uint64_t age_us) { age_us_ = age_us; }
+    void advance_age(uint32_t dt_us);
     bool fresh() const override { return has_feedback_ && age_us_ < timeout_us_; }
     bool has_feedback() const { return has_feedback_; }
     void reset() { age_us_ = 0; has_feedback_ = false; last_ = {}; }
@@ -91,6 +93,9 @@ struct Inputs {
     bool reset_permitted = true; /**< External model permits the fault-reset edge. */
     uint32_t action_response_seq = 0;
     uint8_t action_result = CO_402_ACTION_RESULT_NONE;
+    bool external_feedback_age_valid = false; /**< Host owns age when true; no second age accumulator. */
+    uint64_t external_feedback_age_us = 0;
+    uint32_t action_timeout_seq = 0; /**< Host deadline event for the current action; zero means none. */
     int16_t quick_stop_option = 2; /**< 0x605A. */
     int16_t fault_reaction_option = 0; /**< 0x605E. */
 };
@@ -110,6 +115,7 @@ struct Status {
     uint32_t action_seq = 1;
     bool action_pending = false;
     bool output_allowed = false;
+    bool reaction_unconfirmed = false; /**< FAULT reached through failed/timed-out reaction, not DONE. */
 };
 
 /**
@@ -144,6 +150,8 @@ private:
     MotorModel& model();
     void transition(const Inputs& in);
     void request_transition(uint8_t action, Pds target);
+    void begin_fault_reaction(const Inputs& in);
+    void fail_fault_reaction();
     void motion(const Inputs& in, double dt_s);
     void latch_setpoint(const Inputs& in);
     void approach(double target_velocity, uint32_t accel, uint32_t decel, double dt_s);
@@ -174,6 +182,7 @@ private:
     uint8_t pending_action_ = CO_402_ACTION_NONE;
     Pds pending_pds_ = Pds::switch_on_disabled;
     bool action_failed_ = false;
+    bool reaction_unconfirmed_ = false;
     bool speed_reached_ = false;
     uint64_t target_reached_age_us_ = 0;
     int16_t reaction_option_ = 0;

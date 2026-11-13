@@ -190,12 +190,16 @@ void faults(unsigned scenario) {
     CHECK(xnet_canopen_start(device.handle) == XNET_CO_OK);
     simulator.start();
     wait_for([&] { return simulator.snapshot().accepted > 2; });
-    fake::inject(0, {1, 10});
+    if (scenario == 1) {
+        enable(device);
+        rpdo(0x1f, 10000);
+        wait_for([&] { return simulator.snapshot().feedback.actual_velocity > 100; });
+    } else fake::inject(0, {1, 10});
     if (scenario == 1) {
         try {
             wait_for([&] {
                 const auto state = simulator.snapshot();
-                return device.read(0x2f00, 2) == 0x8130 && device.read(0x603f, 2) != 0
+                return device.read(0x603f, 2) == 0x8130
                     && state.command.action == CO_402_ACTION_FAULT_REACTION && !(state.command.flags & 1);
             });
         } catch (const std::exception&) {
@@ -208,6 +212,11 @@ void faults(unsigned scenario) {
         }
         const auto state = simulator.snapshot();
         CHECK(state.command.action == CO_402_ACTION_FAULT_REACTION && !(state.command.flags & 1));
+        CHECK((device.read(0x6041, 2) & 0x6f) == 0x0f);
+        const auto last_position = device.read(0x6064, 4);
+        wait_for([&] { return (device.read(0x6041, 2) & 0x6f) == 8; });
+        CHECK(device.read(0x6064, 4) == last_position);
+        CHECK(device.read(0x603f, 2) == 0x8130);
     } else {
         wait_for([&] { return (device.read(0x6041, 2) & 0x6f) == 8; });
     }
@@ -225,6 +234,46 @@ void faults(unsigned scenario) {
     }
     CHECK(simulator.stop());
 }
+
+void missing_feedback_during_teardown(bool reset) {
+    Device device;
+    modsim::Parameters parameters;
+    parameters.freeze_feedback_after_us = 300000;
+    modsim::Simulator simulator(api(), device.handle, parameters);
+    CHECK(xnet_canopen_start(device.handle) == XNET_CO_OK);
+    const auto begin = std::chrono::steady_clock::now();
+    simulator.start();
+    wait_for([&] { return simulator.snapshot().accepted > 2; });
+    enable(device);
+    rpdo(0x1f, 10000);
+    wait_for([&] { return simulator.snapshot().feedback.actual_velocity > 100; });
+    std::this_thread::sleep_until(begin + 350ms);
+    const auto accepted = simulator.snapshot().accepted;
+    std::this_thread::sleep_for(20ms);
+    CHECK(simulator.snapshot().accepted == accepted);
+    if (reset) {
+        fake::inject(0, {0x82, 10});
+        wait_for([&] {
+            xnet_canopen_status_t status{};
+            CHECK(xnet_canopen_get_status(device.handle, &status) == XNET_CO_OK);
+            return status.reset_communication_count == 1;
+        });
+    }
+    CHECK(simulator.stop());
+    xnet_canopen_status_t status{};
+    CHECK(xnet_canopen_get_status(device.handle, &status) == XNET_CO_OK);
+    CHECK(status.runtime_state == XNET_CO_RUNTIME_STOPPED);
+    int32_t code = 0;
+    uint32_t required = 0;
+    char diagnostic[2048]{};
+    CHECK(xnet_canopen_get_last_error(device.handle, &code, diagnostic, sizeof(diagnostic), &required) == XNET_CO_OK);
+    CHECK(code == XNET_CO_STACK_ERROR);
+    CHECK(std::string(diagnostic).find("physical stop unconfirmed") != std::string::npos);
+    if (!reset) {
+        CHECK(device.read(0x603f, 2) == 0x8130);
+        CHECK((device.read(0x6041, 2) & 0x6f) == 8);
+    }
+}
 }
 
 int main() {
@@ -234,7 +283,9 @@ int main() {
         faults(0);
         faults(1);
         faults(2);
-        std::cout << "modsim plant, RPDO/TPDO, quick stop, resets/restart, fault/reset and independent timeouts passed\n";
+        missing_feedback_during_teardown(false);
+        missing_feedback_during_teardown(true);
+        std::cout << "modsim plant, RPDO/TPDO, resets/restart, fault/recovery and missing-feedback teardown passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

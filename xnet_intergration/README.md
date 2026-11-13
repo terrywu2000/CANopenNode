@@ -380,7 +380,34 @@ External feedback must refer to a retained command and the current epoch/action
 sequence. Exact retries are idempotent and do not refresh feedback age; stale,
 invalid, missing, or timed-out model traffic never falls back to the internal
 model. Stop and CANopen reset allow only external model exchange OD traffic
-while waiting for a matching safety-action response, then invalidate the epoch.
+while draining safety actions to a terminal drive state, then invalidate the epoch.
+The adapter owns feedback age using monotonic timestamps of accepted frames;
+the core does not independently add motion-step time to that age. Startup,
+heartbeat, feedback and action deadlines are classified before each drive step.
+Timeouts use `0x8130`; actual model faults retain their supplied codes. `0x603F`
+keeps the first fault until a successful Fault Reset, while later distinct
+watchdog sources independently produce EMCY. DS402 reserves internal emergency
+bits `0x30..0x33` for startup/heartbeat/feedback/action timeout respectively;
+their EMCY info codes are `1`, `2`, `4`, `8`. This does not use the application's
+`set_fault` range `0x40..0x4F`.
+
+Faults immediately revoke output and enter Fault Reaction Active. Matching DONE
+enters FAULT; Fault Reaction ERROR or its action deadline also enters FAULT,
+retires the action sequence, and explicitly diagnoses unconfirmed physical stop
+without inventing DONE. Other timed-out actions escalate to a separately timed
+Fault Reaction. Completion submitted at/after its deadline is rejected, even if
+it is consumed before the timeout was previously observed. A valid completion
+submitted before the deadline may still be consumed later within command age.
+Actuals remain the last accepted values when feedback is stale.
+
+After fresh heartbeat/feedback and model readiness/reset permission recover,
+current timeout conditions can clear, but FAULT and its first code remain.
+A new bit-7 edge in FAULT and matching Fault Reset DONE are still required.
+Edges sampled during Fault Reaction are not deferred into FAULT. Stop/reset
+waiting uses a monotonic bound of two action timeouts plus two worker periods
+for external drives; expired safety reaction is a terminal failure, not proof of
+physical standstill. Failure to reach a terminal state within that bound is
+reported explicitly rather than silently completing.
 These behaviors provide functional validation, not a hard real-time guarantee
 or a hardware safety certification.
 

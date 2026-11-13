@@ -258,6 +258,120 @@ static void test_target_reached_waits_for_actual_tolerance() {
     CHECK(d.status().statusword & 0x0400);
 }
 
+static void test_external_deadline_and_recovery() {
+    Drive d(5000);
+    d.use_external_model(true);
+    d.set_external_permissions(true, true);
+    CHECK(d.post_feedback(Feedback{123, 45, false}));
+    Inputs in = base_inputs();
+    in.external_feedback_age_valid = true;
+    in.external_feedback_age_us = 4999;
+    d.step(in, 1000000);
+    CHECK(d.status().feedback_fresh && !d.status().model_fault);
+    in.external_feedback_age_us = 5000;
+    d.step(in, 0);
+    auto reaction = d.status();
+    CHECK(!reaction.feedback_fresh && reaction.model_fault);
+    CHECK(reaction.pds == Pds::fault_reaction_active && reaction.action_pending);
+    CHECK((reaction.statusword & 0x6f) == 0x0f && !reaction.output_allowed);
+    CHECK(reaction.actual_position == 123 && reaction.actual_velocity == 45);
+
+    in.external_feedback_age_us = 5001;
+    in.action_response_seq = reaction.action_seq;
+    in.action_result = CO_402_ACTION_RESULT_BUSY;
+    d.step(in, 1000000);
+    CHECK(d.status().pds == Pds::fault_reaction_active && d.status().action_pending);
+    in.action_timeout_seq = reaction.action_seq + 1;
+    d.step(in, 0);
+    CHECK(d.status().action_pending);
+    in.action_timeout_seq = reaction.action_seq;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    d.step(in, 0);
+    auto fault = d.status();
+    CHECK(fault.pds == Pds::fault && !fault.action_pending && fault.reaction_unconfirmed);
+    CHECK(fault.action_seq != reaction.action_seq && fault.action == CO_402_ACTION_NONE);
+    CHECK((fault.statusword & 0x6f) == 8 && !fault.output_allowed);
+    CHECK(fault.actual_position == 123 && fault.actual_velocity == 45);
+
+    in.action_timeout_seq = 0;
+    d.step(in, 0); // A late DONE cannot resurrect the retired action.
+    CHECK(d.status().pds == Pds::fault);
+    CHECK(d.post_feedback(Feedback{123, 0, false}));
+    in.external_feedback_age_us = 0;
+    in.controlword = 0x80;
+    in.action_result = CO_402_ACTION_RESULT_NONE;
+    d.step(in, 0);
+    CHECK(d.status().action == CO_402_ACTION_FAULT_RESET && d.status().pds == Pds::fault);
+    in.action_response_seq = d.status().action_seq;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    d.step(in, 0);
+    CHECK(d.status().pds == Pds::switch_on_disabled && !d.status().reaction_unconfirmed);
+    CHECK(!d.status().output_allowed);
+}
+
+static void test_fault_preempts_quick_stop_and_failed_reaction() {
+    Drive d;
+    d.use_external_model(true);
+    CHECK(d.post_feedback(Feedback{0, 0, false}));
+    Inputs in = base_inputs();
+    enable(d, in);
+    CHECK(d.status().pds == Pds::operation_enabled);
+    in.controlword = 0x0b;
+    d.step(in, 0);
+    const auto quick_stop_seq = d.status().action_seq;
+    CHECK(d.status().action == CO_402_ACTION_QUICK_STOP);
+    d.set_external_fault(true);
+    in.action_response_seq = quick_stop_seq;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    d.step(in, 0);
+    CHECK(d.status().pds == Pds::fault_reaction_active && d.status().action == CO_402_ACTION_FAULT_REACTION);
+    CHECK(d.status().action_seq != quick_stop_seq && !d.status().output_allowed);
+    d.step(in, 0);
+    CHECK(d.status().pds == Pds::fault_reaction_active && d.status().action_pending);
+    in.action_response_seq = d.status().action_seq;
+    in.action_result = CO_402_ACTION_RESULT_ERROR;
+    d.step(in, 0);
+    CHECK(d.status().pds == Pds::fault && d.status().reaction_unconfirmed && !d.status().action_pending);
+}
+
+static void test_action_timeout_takes_priority_over_done() {
+    Drive d;
+    d.use_external_model(true);
+    CHECK(d.post_feedback(Feedback{0, 0, false}));
+    Inputs in = base_inputs();
+    in.controlword = cw_shutdown;
+    d.step(in, 0);
+    const auto seq = d.status().action_seq;
+    in.action_response_seq = in.action_timeout_seq = seq;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    d.step(in, 0);
+    CHECK(d.status().pds == Pds::fault_reaction_active);
+    CHECK(d.status().action == CO_402_ACTION_FAULT_REACTION && d.status().action_seq != seq);
+}
+
+static void test_reset_edge_during_reaction_is_not_deferred() {
+    Drive d;
+    d.use_external_model(true);
+    d.set_external_permissions(true, true);
+    CHECK(d.post_feedback(Feedback{0, 0, true}));
+    Inputs in = base_inputs();
+    d.step(in, 0);
+    const auto reaction_seq = d.status().action_seq;
+    CHECK(d.post_feedback(Feedback{0, 0, false}));
+    in.controlword = 0x80;
+    in.action_response_seq = reaction_seq;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    d.step(in, 0);
+    CHECK(d.status().pds == Pds::fault && !d.status().action_pending);
+    d.step(in, 0);
+    CHECK(d.status().pds == Pds::fault && !d.status().action_pending);
+    in.controlword = 0;
+    d.step(in, 0);
+    in.controlword = 0x80;
+    d.step(in, 0);
+    CHECK(d.status().action == CO_402_ACTION_FAULT_RESET);
+}
+
 int main() {
     test_pds_path();
     test_pp_profile_reaches_target();
@@ -271,6 +385,10 @@ int main() {
     test_internal_model_follows_demand();
     test_nmt_exit_requests_quick_stop();
     test_target_reached_waits_for_actual_tolerance();
+    test_external_deadline_and_recovery();
+    test_fault_preempts_quick_stop_and_failed_reaction();
+    test_action_timeout_takes_priority_over_done();
+    test_reset_edge_during_reaction_is_not_deferred();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return EXIT_FAILURE;

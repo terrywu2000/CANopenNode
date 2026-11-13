@@ -350,7 +350,7 @@ CANopen 主站 → CANopenNode / OD
 
 **动作与 PP 握手**：核心先发布动作请求而不是先提交目标 PDS 状态。`action_seq` 对每个新动作或抢占递增；模型以同 epoch、同 action_seq 返回 BUSY/DONE/ERROR。模型计算只执行有效命令，不自行重解原始 Controlword。PP 就绪通过匹配的动作/反馈确认；匹配动作的旧响应或被抢占动作的延迟 DONE 均不得生效。模式进入/退出握手属于未来模式扩展。
 
-安全命令使核心立即撤销旧动作的逻辑输出权限，并发布优先安全动作；模型每次施加输出前检查最新动作/代次，发现抢占则丢弃旧计算。PDS 的完成仍等待匹配反馈。异步交换只能提供有界响应，不能承诺同步撤销物理效果；不得用于真实硬件安全保证。`action_timeout_us` 到期须锁存故障并切入失败关闭策略；若安全反应本身无反馈，则撤销输出许可、保留故障诊断并按已定义的无反馈反应进入 FAULT，不伪造 DONE。
+安全命令使核心立即撤销旧动作的逻辑输出权限，并发布优先安全动作；模型每次施加输出前检查最新动作/代次，发现抢占则丢弃旧计算。普通 PDS 转换完成仍等待匹配反馈；故障发生即进入 `FAULT_REACTION_ACTIVE` 并请求反应动作，反应 DONE 后进入 FAULT。异步交换只能提供有界响应，不能承诺同步撤销物理效果；不得用于真实硬件安全保证。`action_timeout_us` 到期须锁存故障并切入失败关闭策略；普通/其他安全动作超时升级为单独计时的 Fault Reaction，Fault Reaction 自身 ERROR/超时则进入 FAULT、退役动作序号并诊断物理停止未确认，不伪造 DONE。适配层以完整帧首次提交时间判定完成响应是否在截止前到达；截止时刻及之后的 DONE/ERROR 不能解除超时，截止前提交的合法响应可在命令年龄窗口内稍后消费。
 
 #### 7.5.5 所有权与权限
 
@@ -632,7 +632,7 @@ CANopen 主站 → CANopenNode / OD
 ### 10.2 集成测试（xnet）
 
 - 使用 `xnet_intergration/tests/fake_xnet` 与 `tests/test_integration.cpp` 扩展 402 场景。
-- `xnet_intergration/tests/modsim_app/` 提供动态加载库的 external PP slave、独立模型线程、可配置跟踪动态/限幅/故障/超时注入，以及复用同一模型代码的 fake-XNET 端到端测试。构建、主站操作与验证命令见该目录 `README.md`；其中记录了无反馈故障反应未完成、首次超时锁存码分类的现有核心差距，不代表全部设计验收已完成。
+- `xnet_intergration/tests/modsim_app/` 提供动态加载库的 external PP slave、独立模型线程、可配置跟踪动态/限幅/故障/超时注入，以及复用同一模型代码的 fake-XNET 端到端测试。构建、主站操作与验证命令见该目录 `README.md`；现已验证无反馈反应超时进入 FAULT、不伪造 DONE、首次超时锁存 `0x8130`。其余硬件语义等仍须按本文逐项验收。
 - 使用一份普通设备 JSON 和一份启用 402 的 EDS 转换 JSON 验证初始化分支；后者缺少 PP 必需 OD 或 PDO 配置不合法时必须启动失败。
 - 通过 SDO / PDO 写 0x6040，检查 0x6041 状态序列。
 - 覆盖 Reset Node、Reset Communication、NMT 切换和 Node Guarding 超时；验证 NMT 层不直接执行电机控制动作，PDS/Statusword 变化只由 DS402 产生。

@@ -57,8 +57,11 @@ void ExternalModel::post(const Feedback& feedback) {
     has_feedback_ = true;
 }
 
-Feedback ExternalModel::sample(int32_t, int32_t, uint32_t dt_us) {
-    age_us_ += dt_us;
+void ExternalModel::advance_age(uint32_t dt_us) {
+    age_us_ += std::min<uint64_t>(dt_us, UINT64_MAX - age_us_);
+}
+
+Feedback ExternalModel::sample(int32_t, int32_t, uint32_t) {
     return last_;
 }
 
@@ -106,12 +109,17 @@ void Drive::reset() {
     action_pending_ = false;
     pending_pds_ = Pds::switch_on_disabled;
     action_failed_ = false;
+    reaction_unconfirmed_ = false;
     external_transport_fault_ = false;
     external_model_ready_ = false;
     external_reset_permitted_ = false;
 }
 
 void Drive::step(const Inputs& in, uint32_t dt_us) {
+    if (use_external_) {
+        if (in.external_feedback_age_valid) external_.set_age(in.external_feedback_age_us);
+        else external_.advance_age(dt_us);
+    }
     const double dt_s = dt_us / 1e6;
     const int8_t display = mode_supported(in.mode_requested) ? in.mode_requested : int8_t{0};
     if (display != previous_mode_) {
@@ -135,6 +143,7 @@ void Drive::step(const Inputs& in, uint32_t dt_us) {
     const bool within_tolerance = std::fabs(double(feedback_.position) - target_pos_)
         <= double(in.position_tolerance);
     if (pds_ == Pds::operation_enabled && mode_display_ == mode_profile_position
+        && (!use_external_ || external_.fresh()) && !model_faulted()
         && std::fabs(demand_vel_) < 1e-9 && within_tolerance) {
         target_reached_age_us_ = std::min<uint64_t>(
             target_reached_age_us_ + dt_us, std::numeric_limits<uint32_t>::max());
@@ -164,30 +173,45 @@ void Drive::transition(const Inputs& in) {
     }
     const bool disable_voltage = (cw & cw_disable_voltage) == 0;
     const bool quick_stop_request = (cw & cw_quick_stop) == 0;
-    const bool fault_reaction = model_faulted() || action_failed_;
+    const bool fault_reaction = model_faulted() || (action_failed_ && pds_ != Pds::fault);
+
+    if (use_external_ && action_pending_ && in.action_timeout_seq == action_seq_) {
+        action_failed_ = true;
+        if (pending_action_ == CO_402_ACTION_FAULT_REACTION) fail_fault_reaction();
+        else begin_fault_reaction(in);
+        return;
+    }
+    if (use_external_ && fault_reaction && (pds_ != Pds::fault || action_pending_)
+        && (!action_pending_ || pending_action_ != CO_402_ACTION_FAULT_REACTION)) {
+        begin_fault_reaction(in);
+        return;
+    }
 
     if (use_external_ && action_pending_) {
-        const bool safety_request = fault_reaction
-            || (!in.nmt_operational && pending_action_ == CO_402_ACTION_ENABLE_OPERATION)
+        const bool safety_request = (!in.nmt_operational && pending_action_ == CO_402_ACTION_ENABLE_OPERATION)
             || (pds_ == Pds::operation_enabled && (disable_voltage || quick_stop_request));
         if (safety_request && pending_action_ != CO_402_ACTION_FAULT_REACTION
             && pending_action_ != CO_402_ACTION_QUICK_STOP) {
-            reaction_option_ = in.fault_reaction_option;
-            request_transition(fault_reaction ? CO_402_ACTION_FAULT_REACTION : CO_402_ACTION_QUICK_STOP,
-                fault_reaction ? Pds::fault_reaction_active
-                    : (in.quick_stop_option == 0 ? Pds::switch_on_disabled : Pds::quick_stop_active));
+            quick_stop_option_ = in.quick_stop_option;
+            request_transition(CO_402_ACTION_QUICK_STOP,
+                in.quick_stop_option == 0 ? Pds::switch_on_disabled : Pds::quick_stop_active);
         }
         if (in.action_response_seq == action_seq_) {
             if (in.action_result == CO_402_ACTION_RESULT_DONE) {
+                const bool reaction_completed = pending_action_ == CO_402_ACTION_FAULT_REACTION;
                 pds_ = pending_pds_;
-                if (pending_action_ == CO_402_ACTION_FAULT_RESET) action_failed_ = false;
+                if (pending_action_ == CO_402_ACTION_FAULT_RESET) {
+                    action_failed_ = false;
+                    reaction_unconfirmed_ = false;
+                }
                 action_pending_ = false;
                 action_ = pending_action_ = CO_402_ACTION_NONE;
-            } else if (in.action_result == CO_402_ACTION_RESULT_ERROR
-                && pending_action_ != CO_402_ACTION_FAULT_REACTION) {
+                if (reaction_completed) return;
+            } else if (in.action_result == CO_402_ACTION_RESULT_ERROR) {
                 action_failed_ = true;
-                reaction_option_ = in.fault_reaction_option;
-                request_transition(CO_402_ACTION_FAULT_REACTION, Pds::fault_reaction_active);
+                if (pending_action_ == CO_402_ACTION_FAULT_REACTION) fail_fault_reaction();
+                else begin_fault_reaction(in);
+                return;
             }
         }
         if (action_pending_) return;
@@ -195,10 +219,6 @@ void Drive::transition(const Inputs& in) {
 
     if (fault_reaction && pds_ != Pds::fault_reaction_active && pds_ != Pds::fault) {
         reaction_option_ = in.fault_reaction_option;
-        if (use_external_) {
-            request_transition(CO_402_ACTION_FAULT_REACTION, Pds::fault_reaction_active);
-            return;
-        }
         pds_ = Pds::fault_reaction_active;
     }
 
@@ -265,6 +285,22 @@ void Drive::request_transition(uint8_t action, Pds target) {
     action_ = pending_action_ = action;
     pending_pds_ = target;
     action_pending_ = true;
+}
+
+void Drive::begin_fault_reaction(const Inputs& in) {
+    reaction_option_ = in.fault_reaction_option;
+    pds_ = Pds::fault_reaction_active;
+    request_transition(CO_402_ACTION_FAULT_REACTION, Pds::fault);
+}
+
+void Drive::fail_fault_reaction() {
+    // Retire the action without manufacturing a successful model response.
+    ++action_seq_;
+    if (action_seq_ == 0) ++action_seq_;
+    action_ = pending_action_ = CO_402_ACTION_NONE;
+    action_pending_ = false;
+    pds_ = pending_pds_ = Pds::fault;
+    reaction_unconfirmed_ = true;
 }
 
 void Drive::motion(const Inputs& in, double dt_s) {
@@ -383,6 +419,7 @@ Status Drive::status() const {
     s.action = action_;
     s.action_seq = action_seq_;
     s.action_pending = action_pending_;
+    s.reaction_unconfirmed = reaction_unconfirmed_;
     s.output_allowed = pds_ == Pds::operation_enabled && !action_pending_ && !s.model_fault;
 
     uint16_t sw = base_statusword(pds_) | sw_remote;

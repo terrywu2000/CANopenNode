@@ -16,6 +16,11 @@ using xco::Error;
 using xco::require;
 
 namespace {
+constexpr uint8_t drive_fault_startup = 0x01;
+constexpr uint8_t drive_fault_heartbeat = 0x02;
+constexpr uint8_t drive_fault_feedback = 0x04;
+constexpr uint8_t drive_fault_action = 0x08;
+constexpr uint8_t drive_transport_error_bit = CO_EM_MANUFACTURER_START;
 /**
  * C ABI gateway: serialize the operation and translate typed/standard exceptions
  * to operation results plus a per-handle diagnostic. The lifecycle lock stays
@@ -333,6 +338,7 @@ ODR_t xnet_canopen_device::write_drive_feedback(
     if (d.drive_has_last_submitted && !sequence_newer(frame.feedback_seq, d.drive_last_submitted_seq))
         return ODR_DATA_DEV_STATE;
     d.drive_pending_feedback = frame;
+    d.drive_pending_submitted_at = xco::Clock::now();
     d.drive_last_submitted_seq = frame.feedback_seq;
     d.drive_last_submitted_bytes = {};
     std::memcpy(d.drive_last_submitted_bytes.data(), bytes, count);
@@ -357,6 +363,7 @@ void xnet_canopen_device::start_drive_epoch() {
     drive_feedback_pending = false;
     drive_has_last_feedback = false;
     drive_has_last_submitted = false;
+    drive_pending_submitted_at = drive_feedback_accepted_at = {};
     drive_pending_feedback = {};
     drive_last_feedback = {};
     drive_pending_feedback_bytes = {};
@@ -367,9 +374,11 @@ void xnet_canopen_device::start_drive_epoch() {
     drive_last_heartbeat = drive_heartbeat_baseline;
     drive_heartbeat_changed = {};
     drive_started_at = xco::Clock::now();
+    drive_startup_complete = false;
     drive_timed_action_seq = 0;
     drive_action_started = {};
     drive_action_timed_out = false;
+    drive_transport_faults = drive_reported_transport_faults = 0;
     drive_latched_fault = 0;
     drive_current_fault = 0;
     drive_emcy_active = false;
@@ -404,8 +413,9 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
     input.position_tolerance = model->drive_position_tolerance;
     input.target_reached_time_us = model->drive_target_reached_time_us;
     uint16_t external_fault_code = 0;
+    const auto now = xco::Clock::now();
+    const auto previous_status = drive_402->status();
     if (model->drive_402_external) {
-        const auto now = xco::Clock::now();
         const uint32_t heartbeat = read_drive_value<uint32_t>(*model, 0x2f01);
         if (heartbeat != 0 && ((!drive_has_heartbeat && heartbeat != drive_heartbeat_baseline)
             || (drive_has_heartbeat && sequence_newer(heartbeat, drive_last_heartbeat)))) {
@@ -413,11 +423,11 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
             drive_has_heartbeat = true;
             drive_heartbeat_changed = now;
         }
-        const bool startup_expired = now - drive_started_at
-            >= std::chrono::microseconds(model->drive_startup_timeout_us)
-            && (!drive_has_heartbeat || !drive_402->status().feedback_fresh);
         const bool heartbeat_expired = drive_has_heartbeat
             && now - drive_heartbeat_changed >= std::chrono::microseconds(model->drive_heartbeat_timeout_us);
+        const auto action_deadline = drive_action_started + std::chrono::microseconds(model->drive_action_timeout_us);
+        bool action_expired = previous_status.action_pending && drive_timed_action_seq == previous_status.action_seq
+            && now >= action_deadline;
 
         if (drive_feedback_pending) {
             const auto frame = drive_pending_feedback;
@@ -426,12 +436,14 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
                 && record.seq == frame.command_seq && record.action_seq == frame.action_seq;
             const bool command_expired = identity_valid
                 && now - record.published > std::chrono::microseconds(model->drive_command_max_age_us);
-            const bool command_valid = identity_valid && !command_expired;
+            const bool late_completion = previous_status.action_pending
+                && (frame.action_result == CO_402_ACTION_RESULT_DONE || frame.action_result == CO_402_ACTION_RESULT_ERROR)
+                && drive_timed_action_seq == frame.action_seq && drive_pending_submitted_at >= action_deadline;
+            const bool command_valid = identity_valid && !command_expired && !late_completion;
             uint16_t result = command_valid ? 1 : command_expired ? 2 : 3;
             if (command_valid) {
-                if (frame.action_result == CO_402_ACTION_RESULT_DONE
-                    && frame.action_seq == drive_timed_action_seq)
-                    drive_action_timed_out = false;
+                if (frame.action_result == CO_402_ACTION_RESULT_DONE && frame.action_seq == drive_timed_action_seq)
+                    action_expired = false;
                 const bool velocity_valid = (frame.flags & 0x02U) != 0;
                 xco::d402::Feedback feedback{frame.actual_position,
                     velocity_valid ? frame.actual_velocity : drive_402->status().actual_velocity,
@@ -444,6 +456,7 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
                 drive_last_feedback_seq = frame.feedback_seq;
                 drive_last_feedback_bytes = drive_pending_feedback_bytes;
                 drive_has_last_feedback = true;
+                drive_feedback_accepted_at = now;
                 drive_current_fault = frame.fault_code
                     ? frame.fault_code
                     : frame.action_result == CO_402_ACTION_RESULT_ERROR ? CO_EMC_GENERIC : 0;
@@ -454,10 +467,36 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
             write_drive_value(*model, 0x2f05, result);
             drive_feedback_pending = false;
         }
-        const bool feedback_expired = drive_has_last_feedback && !drive_402->status().feedback_fresh;
-        const bool transport_fault = startup_expired || heartbeat_expired || feedback_expired || drive_action_timed_out;
-        drive_402->set_external_fault(transport_fault);
-        external_fault_code = transport_fault ? 0x8130 : drive_current_fault;
+        input.external_feedback_age_valid = true;
+        input.external_feedback_age_us = drive_has_last_feedback
+            ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - drive_feedback_accepted_at).count())
+            : 0;
+        const bool feedback_expired = drive_has_last_feedback
+            && input.external_feedback_age_us >= model->drive_feedback_timeout_us;
+        const bool healthy = drive_has_heartbeat && !heartbeat_expired && drive_has_last_feedback
+            && !feedback_expired && drive_current_fault == 0 && drive_pp_ready && drive_reset_permitted;
+        if (drive_has_heartbeat && !heartbeat_expired && drive_has_last_feedback && !feedback_expired)
+            drive_startup_complete = true;
+        const bool startup_expired = !drive_startup_complete && now - drive_started_at
+            >= std::chrono::microseconds(model->drive_startup_timeout_us);
+        if (action_expired) {
+            input.action_timeout_seq = previous_status.action_seq;
+            drive_action_timed_out = true;
+            log(xco::LogLevel::warning, "DS402 action deadline expired: epoch={} action={} action_seq={}",
+                drive_epoch, unsigned(previous_status.action), previous_status.action_seq);
+        } else if (previous_status.pds == xco::d402::Pds::fault && !previous_status.action_pending && healthy) {
+            drive_action_timed_out = false;
+        }
+        const uint8_t faults = static_cast<uint8_t>((startup_expired ? drive_fault_startup : 0)
+            | (heartbeat_expired ? drive_fault_heartbeat : 0) | (feedback_expired ? drive_fault_feedback : 0)
+            | (drive_action_timed_out ? drive_fault_action : 0));
+        if (faults != drive_transport_faults) {
+            log(xco::LogLevel::warning, "DS402 watchdog sources changed: epoch={} startup={} heartbeat={} feedback={} action={}",
+                drive_epoch, startup_expired, heartbeat_expired, feedback_expired, drive_action_timed_out);
+        }
+        drive_transport_faults = faults;
+        drive_402->set_external_fault(faults != 0);
+        external_fault_code = drive_current_fault ? drive_current_fault : faults ? 0x8130 : 0;
         input.model_ready = drive_pp_ready;
         input.reset_permitted = drive_reset_permitted;
     }
@@ -466,12 +505,13 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
     if (model->drive_402_external) {
         if (status.action_pending && status.action_seq != drive_timed_action_seq) {
             drive_timed_action_seq = status.action_seq;
-            drive_action_started = xco::Clock::now();
-        } else if (status.action_pending && drive_timed_action_seq != 0
-            && xco::Clock::now() - drive_action_started >= std::chrono::microseconds(model->drive_action_timeout_us)) {
-            drive_action_timed_out = true;
-            drive_402->set_external_fault(true);
-            external_fault_code = 0x8130;
+            drive_action_started = now;
+        } else if (!status.action_pending) {
+            drive_timed_action_seq = 0;
+            drive_action_started = {};
+        }
+        if (status.reaction_unconfirmed && !previous_status.reaction_unconfirmed) {
+            fail(XNET_CO_STACK_ERROR, "DS402 fault reaction failed or timed out; output revoked, physical stop unconfirmed");
         }
         drive_action_seq = status.action_seq;
         uint32_t command_seq = increment_nonzero(drive_command_seq);
@@ -501,17 +541,24 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
         drive_command_history[command_seq % drive_command_history.size()] =
             DriveCommandRecord{command_seq, status.action_seq, xco::Clock::now()};
         const bool fault_active = status.model_fault || external_fault_code != 0;
-        const uint16_t current_fault = external_fault_code != 0 ? external_fault_code
-            : (status.model_fault ? uint16_t{0x1000} : uint16_t{0});
+        const uint16_t current_fault = external_fault_code;
+        require(!status.model_fault || current_fault != 0, XNET_CO_STACK_ERROR, "DS402 model fault has no classified cause");
         write_drive_value(*model, 0x2f00, current_fault);
         const bool reset_completed = drive_has_previous_pds
             && drive_previous_pds == xco::d402::Pds::fault
             && status.pds == xco::d402::Pds::switch_on_disabled && !fault_active;
         if (fault_active) {
             if (drive_latched_fault == 0) drive_latched_fault = current_fault;
-            if (!drive_emcy_active && co && co->em) {
-                CO_errorReport(co->em, CO_EM_GENERIC_ERROR, drive_latched_fault, static_cast<uint32_t>(drive_epoch));
+            if (drive_current_fault && !drive_emcy_active && co && co->em) {
+                CO_errorReport(co->em, CO_EM_GENERIC_ERROR, drive_current_fault, static_cast<uint32_t>(drive_epoch));
                 drive_emcy_active = true;
+            }
+            for (uint8_t source = 0; source < 4; ++source) {
+                const uint8_t mask = static_cast<uint8_t>(1U << source);
+                if ((drive_transport_faults & mask) && !(drive_reported_transport_faults & mask) && co && co->em) {
+                    CO_errorReport(co->em, static_cast<uint8_t>(drive_transport_error_bit + source), 0x8130, mask);
+                    drive_reported_transport_faults |= mask;
+                }
             }
         } else if (reset_completed) {
             drive_latched_fault = 0;
@@ -519,6 +566,11 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
                 CO_errorReset(co->em, CO_EM_GENERIC_ERROR, static_cast<uint32_t>(drive_epoch));
                 drive_emcy_active = false;
             }
+            for (uint8_t source = 0; source < 4; ++source) {
+                if ((drive_reported_transport_faults & (1U << source)) && co && co->em)
+                    CO_errorReset(co->em, static_cast<uint8_t>(drive_transport_error_bit + source), 0);
+            }
+            drive_reported_transport_faults = 0;
         }
         if (model->drive_has_error_code) write_drive_value(*model, 0x603f, drive_latched_fault);
         drive_previous_pds = status.pds;
@@ -537,29 +589,34 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
     }
 }
 
+void xnet_canopen_device::drain_drive_402() {
+    if (!drive_402) return;
+    const auto terminal = [&] {
+        const auto status = drive_402->status();
+        return !status.action_pending && status.pds != xco::d402::Pds::operation_enabled
+            && status.pds != xco::d402::Pds::quick_stop_active && status.pds != xco::d402::Pds::fault_reaction_active;
+    };
+    auto previous = xco::Clock::now();
+    const uint64_t budget_us = model->drive_402_external
+        ? uint64_t(model->drive_action_timeout_us) * 2 + uint64_t(model->worker_period_us) * 2 : 10000000;
+    const auto deadline = previous + std::chrono::microseconds(budget_us);
+    while (!terminal()) {
+        const auto now = xco::Clock::now();
+        const auto dt = std::chrono::duration_cast<std::chrono::microseconds>(now - previous).count();
+        previous = now;
+        process_drive_402(static_cast<uint32_t>(std::min<int64_t>(dt, UINT32_MAX)), true);
+        if (terminal()) break;
+        require(xco::Clock::now() < deadline, XNET_CO_STACK_ERROR,
+            "DS402 did not reach a terminal state before the shutdown/reset deadline");
+        worker_lock->unlock();
+        std::this_thread::sleep_for(std::chrono::microseconds(model->worker_period_us));
+        worker_lock->lock();
+    }
+}
+
 void xnet_canopen_device::reset_stack(bool reset_all_objects) {
     log(xco::LogLevel::info, reset_all_objects ? "Reset Node requested" : "Reset Communication requested");
-    if (drive_402) {
-        for (uint32_t elapsed = 0; elapsed < 10000000; elapsed += 1000) {
-            const auto pds = drive_402->status().pds;
-            if (pds != xco::d402::Pds::operation_enabled && pds != xco::d402::Pds::quick_stop_active
-                && pds != xco::d402::Pds::fault_reaction_active) break;
-            process_drive_402(1000, true);
-            const auto next = drive_402->status();
-            if (model->drive_402_external && worker_lock && (next.action_pending
-                || next.pds == xco::d402::Pds::operation_enabled
-                || next.pds == xco::d402::Pds::quick_stop_active
-                || next.pds == xco::d402::Pds::fault_reaction_active)) {
-                worker_lock->unlock();
-                std::this_thread::sleep_for(std::chrono::microseconds(model->worker_period_us));
-                worker_lock->lock();
-            }
-        }
-        const auto pds = drive_402->status().pds;
-        require(pds != xco::d402::Pds::operation_enabled && pds != xco::d402::Pds::quick_stop_active
-                && pds != xco::d402::Pds::fault_reaction_active,
-                XNET_CO_STACK_ERROR, "DS402 did not reach a safe state before CANopen reset");
-    }
+    drain_drive_402();
     adapter.stop_flush();
     // Reset Node reloads saved/startup LSS settings and restores all OD defaults.
     // Reset Communication preserves device data and the pending LSS settings.
@@ -723,29 +780,7 @@ void xnet_canopen_device::run() {
             // wait_for releases the OD lock, allowing channel calls between worker cycles.
             wake.wait_for(lock, std::chrono::microseconds(model->worker_period_us), [&] { return stop_requested.load(); });
         }
-        if (drive_402) {
-            for (uint32_t elapsed = 0; elapsed < 10000000; elapsed += 1000) {
-                const auto pds = drive_402->status().pds;
-                if (pds != xco::d402::Pds::operation_enabled
-                    && pds != xco::d402::Pds::quick_stop_active
-                    && pds != xco::d402::Pds::fault_reaction_active) break;
-                process_drive_402(1000, true);
-                const auto next = drive_402->status();
-                if (model->drive_402_external && (next.action_pending
-                    || next.pds == xco::d402::Pds::operation_enabled
-                    || next.pds == xco::d402::Pds::quick_stop_active
-                    || next.pds == xco::d402::Pds::fault_reaction_active)) {
-                    lock.unlock();
-                    std::this_thread::sleep_for(std::chrono::microseconds(model->worker_period_us));
-                    lock.lock();
-                }
-            }
-            const auto pds = drive_402->status().pds;
-            require(pds != xco::d402::Pds::operation_enabled
-                    && pds != xco::d402::Pds::quick_stop_active
-                    && pds != xco::d402::Pds::fault_reaction_active,
-                    XNET_CO_STACK_ERROR, "DS402 did not reach a safe state before device stop");
-        }
+        drain_drive_402();
     } catch (const Error& e) {
         fail(e.code, e.what()); state = XNET_CO_RUNTIME_FAILED; stop_requested = true;
     } catch (const std::exception& e) {

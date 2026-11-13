@@ -255,15 +255,18 @@ struct xnet_canopen_device {
     std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> drive_last_feedback_bytes{};
     std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> drive_last_submitted_bytes{};
     bool drive_feedback_pending = false, drive_has_last_feedback = false;
+    xco::Clock::time_point drive_pending_submitted_at{}, drive_feedback_accepted_at{};
     bool drive_has_last_submitted = false;
     uint32_t drive_last_heartbeat = 0;
     uint32_t drive_heartbeat_baseline = 0;
     bool drive_has_heartbeat = false;
     xco::Clock::time_point drive_heartbeat_changed{};
     xco::Clock::time_point drive_started_at{};
+    bool drive_startup_complete = false;
     uint32_t drive_timed_action_seq = 0;
     xco::Clock::time_point drive_action_started{};
     bool drive_action_timed_out = false;
+    uint8_t drive_transport_faults = 0, drive_reported_transport_faults = 0;
     uint16_t drive_latched_fault = 0;
     uint16_t drive_current_fault = 0;
     bool drive_emcy_active = false;
@@ -329,6 +332,7 @@ struct xnet_canopen_device {
     static ODR_t read_drive_feedback(OD_stream_t*, void*, OD_size_t, OD_size_t*);
     static ODR_t write_drive_feedback(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
     void process_drive_402(uint32_t dt_us, bool force_non_operational = false);
+    void drain_drive_402();
     void start_drive_epoch();
 };
 
