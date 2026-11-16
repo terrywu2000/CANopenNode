@@ -4,7 +4,7 @@
 > 参考资料：`reference/canopennode-rtt`（Pure-C CiA 402 Device 核心 + RT-Thread 适配）、`reference/EtherCAT_Slave`（EtherCAT 侧 CiA 402 示例应用）。
 > 本文是后续开发的需求基线。首期范围已确定为 PP 位置控制；仅将仍需负责人决策的事项标注为 **[待确认]**。
 > 实现进度：单轴 PP 的 internal 路径及 external v1 帧交换已接入 CANopenNode worker；JSON 启动校验、反馈提交、epoch/序号/超时与异步动作确认已有实现和 fake-XNET 覆盖。本文其余硬件语义、诊断覆盖和实物验收仍需逐项验证；功能验证不构成硬实时或安全认证。
-> 后续系统基线：机器人 ECU 是唯一 CANopen Master/SYNC Producer；VeriStand 是 HIL 引擎，异步 CD 可实例化多个单轴 slave，每节点对应一个在 PCL 固定步长运行的模型，通过 signal 独立交换。`motor_drive_` SI 接口、设备适配与带时间标识的数据流水线仍待实现；既有 counts v1 帧是兼容协议，不自动具备新增同步语义。
+> 后续系统基线：机器人 ECU 是唯一 CANopen Master/SYNC Producer；VeriStand 是 HIL 引擎，异步 CD 可实例化多个单轴 slave，每节点对应一个 PCL 固定步长模型。已实现可选设备适配、单位/scale 报告与 `motor_drive_` 异步 SI 接口；共享总线、SYNC/PCL 确定流水线和 VeriStand signal 桥接仍待实现。既有 counts v1 帧不自动具备新增同步语义。
 
 ---
 
@@ -296,7 +296,9 @@ Statusword 的状态位由 PDS 当前状态决定，PP 相关位由核心根据�
 
 SI 字段采用 `double`，字段名称携带单位，所有有效数值必须有限；NaN、Inf、非法负幅值及不可表示的 OD/核心转换值均明确拒绝。epoch、序号、枚举和位掩码不属于物理量，仍使用固定宽度整数；既有配置名中的 _us 与兼容帧的 counts 单位保持不变。
 
-建议 C 接口定义如下；它是后续实现基线，不是已存在或已冻结布局的公共头文件。动作编号复用 §7.5.2 的 0..8，动作结果复用 NONE/BUSY/DONE/ERROR；ABI 字段使用固定宽度整数，不直接存储 C enum/bool。
+以下接口已发布于 [motor_drive.h](../xnet_intergration/include/motor_drive.h)。动作编号复用 §7.5.2 的 0..8，结果为 NONE/BUSY/DONE/ERROR；ABI 不直接存 C enum/bool。v1 大小已冻结：time=16、cycle=64、model_step=56、request=88、view=208、feedback=184 字节，C 测试检查布局；既有 xnet 状态与 56/36 字节帧不变。
+
+**本轮实现边界**：READ_ASYNC/BOOTSTRAP/SAFETY 已实现，目标步/截止时间必须为 0；READ_SCHEDULED 明确返回 UNSUPPORTED，不执行下述未来定时选样。SYNC cycle/target_step 返回 0；publish_time 为进程 steady clock 秒、clock_domain_id=1，模型采样时间不自动映射至该域。反馈报告真实模型步、心跳验证执行进展；CD/signal 和共享总线未实现。backend 用 xnet_canopen_get_motor_drive_endpoint 创建绑定，模型端头文件无 XNET/OD 类型。
 
 ```c
 #include <stdint.h>
@@ -404,11 +406,15 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 
 **设备适配层的 OD 读写与转换**
 
-1. 绑定表关联通用字段角色与本设备 OD index/subindex，复用 EDS/JSON 的类型和权限，补充手册原始单位、比例、方向/零点、有效性及必需/可选条件。缺少必需项或必要单位依据拒绝配置，不在运行时补建对象。
+1. 绑定表关联通用角色与 OD，复用 EDS/JSON 类型/权限，补充单位、比例和坐标条件。缺少必需 OD、有效 counts/rev、非法比例或溢出拒绝；按本轮确认政策，未知单位先用 raw/core 1:1，告警并列入 assumed_identity，不能标为已验证，不在运行时补建对象。
 2. 通信执行者在正常 SYNC 的 RPDO 边界读取设备 OD 原始命令/参数，适配层转换为核心单位；核心生成 profile demand，再转换为 SI 快照。既有核心及兼容帧保留 counts 单位，不能把 Kinco 原始速度/加速度数值原样转发。
 3. CD 转发 SI 反馈，适配层在暂存前校验可转换性；通信执行者再校验代次、年龄、动作与完整性。当前兼容路径验收后直接发布实际值；新增流水线路径先保留已接受反馈历史，按 §7.5.11 截止选样，再按手册单位在同一 OD 锁内发布完整实际值集合。核心状态/安全处理仍由通信执行者决定，拒绝帧不污染值，API 提交本身不触发 TPDO 或推进 PDS。
-4. 主站独占 target/profile；适配层不得用有损往返值回写这些对象。只有已绑定且语义/单位确认的 demand/遥测对象才能发布；未知缩放不能默认按 SI 或按同名对象比例处理。批量读写、锁序与 Reset 后重绑仍遵守 §8。
+4. 主站独占 target/profile；适配层不回写有损往返值。已绑定 demand/遥测可按已确认比例或已报告的 1:1 假设发布；未知缩放不擅自套用同名对象公式，也不能将直通假设说成单位已确认。批量读写、锁序与 Reset 后重绑遵守 §8。
 5. 单位、编码器分辨率、方向、零点与机械换算在一次交换中必须一致；允许更换这些配置的后端须同时撤销旧 epoch 并重新握手，禁止把旧坐标下的计算结果按新比例发布。位置增量/相对命令不重复加零点，同一方向变换只应用一次。
+
+当前通过 `drive_402.device_adapter` 初始化配置：unit_profile 为 counts、identity 或 kinco_fd，counts_per_revolution 必须显式提供，direction=±1、zero_counts 为固定坐标配置。scales 按角色设置正整数 numerator/denominator；fault_mapping 按通用 class/detail 映射非零设备码。当前绑定 607A、6081/83/84/85、6064 及可选 60FC/606B/606C；不自动读取 607E/607C/6410、脉冲齿轮比或 6067/6068/607D。修改配置需 uninitialize/initialize，旧端口不恢复可用。
+
+**转换检查清单**：初始化日志与 xnet_canopen_get_drive_unit_report JSON 输出 converted、unchanged、assumed_identity、unbound，包括角色、OD、比例和依据。kinco_fd 已换算 6081/606C（×125/2048）、6083/6084（×15625/256）；607A 增量无需换算；6064/60FC 坐标、606B 速度、6085 减速度默认直通并待核对。缺失可选 OD 列为未绑定；原始单位直通不取消 counts↔SI 物理换算。配置/调用示例见 [英文说明](../xnet_intergration/README.md#device-units-and-motor_drive_-si-port) 与 [中文说明](../xnet_intergration/README.zh-CN.md#设备单位适配与-motor_drive_-si-接口)。
 
 #### 7.5.2 本地交换对象（兼容后端，厂商自定义区 0x2000–0x5FFF）
 
@@ -418,7 +424,7 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 
 | 索引 | 名称 | 类型 | 写入方 | 语义 |
 |---|---|---|---|---|
-| 0x2F00 | 当前模型故障 | UNSIGNED16 | 核心发布 | 来自最新已接受反馈帧，0 表示故障条件已消失，不是锁存记录 |
+| 0x2F00 | 当前模型故障 | UNSIGNED16 | 核心发布 | 当前已接受模型故障或适配/交换故障；缺失故障映射为 0x1000，交换看门狗为 0x8130；0 表示当前条件已消失，不是锁存记录 |
 | 0x2F01 | 模型心跳 | UNSIGNED32 | 模型 | 独立于反馈提交；模型存活时持续递增 |
 | 0x2F02 | 命令快照 | OCTET_STRING，56 字节 | 核心 | 版本 1 命令帧；字段布局见下表 |
 | 0x2F03 | 完整反馈提交 | OCTET_STRING，36 字节 | 模型 | 版本 1 反馈帧；字段布局见下表 |
@@ -480,7 +486,7 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 
 ##### 7.5.2.1 Kinco FD 设备单位与转换边界
 
-依据：[Kinco 低压伺服驱动器手册，2022-06](../reference/202206_english_1716367640937755.pdf)。下文同时列出手册印刷页码与 PDF 页序（从 1 开始），避免目录/封面导致定位偏差。手册覆盖 FD 系列，当前 EDS 为 2025-04-17 版本；以下是设备适配需求，不代表当前代码已完成单位转换，也不能作为其他厂商设备的默认规则。
+依据：[Kinco 低压伺服驱动器手册，2022-06](../reference/202206_english_1716367640937755.pdf)。下文同时列出印刷页码与 PDF 页序。手册覆盖 FD 系列，EDS 为 2025-04-17 版本；已实现明确的运动速度/加减速换算，未确认项仍待核对，不能套用于其他厂商。本轮按用户确认允许未知 raw/core 单位 1:1 直通，但须输出报告/告警，不能将其标为手册已确认。
 
 **三层单位必须分开**：设备 OD 保存 Kinco 原始整数；402 核心与兼容 v1 帧使用 counts、counts/s、counts/s²；motor_drive_ 外部接口必须使用 §7.5.1.1 的 SI 单位。设备适配层统一负责三层之间的转换及设备端 OD 读写，Kinco 缩放常数不进入通用模型或 PDS 规则。不得直接把设备速度/加速度原始整数当作同数值的帧字段，也不得改变兼容 v1 字段的单位或字节布局。
 
@@ -514,7 +520,7 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 - 只转换核心输入/反馈发布值，不把有损往返结果写回主站 target/profile OD；正反转换可能因整数帧量化而不能恢复原始设备值。拒绝反馈不得改变已接受实际值。
 - 手册 PP 通信示例（印刷 p.122 / PDF p.130）中 200 rpm 对应 `0x00085555 = 546133`。在示例 `E = 10000` 下，转换结果为 `33333.31298828125 counts/s`，帧就近舍入为 33333；不得解释成 546133 counts/s。
 - 原始加减速度 100000 对应 `6103515.625 counts/s²`，在 `E = 10000` 下为 `610.3515625 rev/s²`，与手册约 610.352 rps/s 一致；帧舍入为 6103516。该例用于检验换算，不是要求所有设备使用此默认值。
-- T-MODEL-UNITS 须覆盖上述样例、有符号速度、不同 `E` 的物理量转换、零点/方向、半值舍入、边界溢出以及到位窗口单一来源。0x606B、0x6085、0x6068 及位置坐标的未确认绑定必须保持显式待确认，不能用成功形状的默认比例掩盖。
+- T-MODEL-UNITS 覆盖样例、有符号速度、E/零点/方向、半值舍入和边界溢出。606B、6085、位置坐标的直通假设须列入报告并允许配置明确比例；6068 当前未绑定，到位窗口仍用现有 JSON 唯一来源，不伪称已确认时间单位。
 
 #### 7.5.3 批量分组（兼容后端适配层绑定，启动时完成）
 
@@ -535,7 +541,7 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 1. 通信域按逐 SYNC 边界读取正常运动命令、推进 profile 并冻结 SI 命令；实际时间安全/协议检测持续执行。当前 worker 每轮处理的实现须按 §7.5.11 扩展，不能把轮次当作 SYNC。
 2. 异步 CD 调用 `motor_drive_read_v1`，按目标 PCL 步和源截止时间选择 SI 命令，并向本节点模型发布完整 signal 快照。模型在自己的 PCL 步锁存合法快照，在待机/FAULT 中也持续积分和报告实际值；无新正常命令时保持最后获准 demand，不能将 SYNC 间隔当作模型 dt。
 3. 模型经 signal 回传 source token/cycle、实际执行步、SI 实际值、动作结果与故障条件；CD 只采集完整步快照并调用 `motor_drive_submit_v1`。成功只表示暂存；未确认时保留提交且继续采集进展。确定模式按预定模型步/decimation 提交，确认须在下一预定提交前完成，否则报违约；有界异步模式可在确认后提交最新合法测量，但不能据此宣称固定选样。拒绝时诊断、重新获取合法命令；事件故障保持至已接受确认。
-4. CD 的 `motor_drive_heartbeat_v1` 只转发实际递增的模型步记录，不由 CD 定时自增。独立反馈超时检测“模型有执行进展但无合法结果”；缓存重播/幂等重试不刷新年龄。上述接口与 signal 桥接仍待实现，当前 demo 暂用 batch/帧及独立模型线程。
+4. CD 的 `motor_drive_heartbeat_v1` 只转发实际递增模型步，不由 CD 自增。异步 C 接口已实现并测试，缓存/幂等重试不刷新年龄；signal 桥接/固定计划仍待实现，当前 demo 继续兼容 batch/帧及独立模型线程。
 
 **动作与 PP 握手**：核心先发布动作请求而不是先提交目标 PDS 状态。`action_seq` 对每个新动作或抢占递增；模型以同 epoch、同 action_seq 返回 BUSY/DONE/ERROR。模型计算只执行有效命令，不自行重解原始 Controlword。PP 就绪通过匹配的动作/反馈确认；匹配动作的旧响应或被抢占动作的延迟 DONE 均不得生效。模式进入/退出握手属于未来模式扩展。
 
@@ -577,12 +583,12 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 
 #### 7.5.8 与当前实现的差距（待开发）
 
-当前 v1 帧、pending/消费缓存、代次/序号、动作响应及独立超时已有实现。相对于新增的业务接口与 SI/设备单位边界，仍须：
+当前 v1 交换、异步 SI 端口和设备单位适配已实现；本轮按确认范围不实现共享总线/VeriStand 流水线：
 
-1. 实现 motor_drive_ 不透明端口、类型化 SI 快照/反馈、通用操作结果和故障映射，隐藏模型侧索引、batch ID 与编解码。
-2. 将当前直接读写 OD 的路径收敛至设备适配层，建立已校验的语义绑定与单位转换；按 §7.5.2.1 确认 Kinco 未明单位，不能声称现有原始整数透传已满足 SI 契约。
-3. 在同一套验收和状态机逻辑下封装兼容后端，保留 counts v1 帧及现有通用 batch 语义；专用邮箱后端不在本次文档修改中隐含实现。
-4. 增加 SI ↔ 核心/设备原始量、唯一写入者、后端错误映射、跨复位坐标变化及生命周期验证。
+1. **已实现** motor_drive_ 端口、版本化 SI 快照/反馈、通用结果/故障映射、模型步心跳；开端口后排除兼容反馈/心跳写入者。新结构及导出独立于既有 ABI。
+2. **已实现** 初始化 role→OD 绑定、Kinco 明确比例、显式覆盖与未知 1:1 报告、方向/零点/SI 转换及有界量化；不能将未明坐标/单位称为设备实物已确认。
+3. **已实现** 公共接口和兼容帧共用完整暂存/worker 消费逻辑，不改 v1 帧/通用 batch 布局；专用定时邮箱/时间侧车仍待开发。
+4. **已验证** 软件单位样例/溢出/假设报告、SI 参数/反馈、writer 排他、幂等/旧步拒绝、故障映射、端口跨初始化失效和真实 worker PP/停止握手；旧 counts 模型测试继续通过。
 5. 保存硬件 RX 时间戳并建立时间域映射；在 SYNC 标志合并前捕获每个事件，按有序 RPDO/SYNC 边界处理，增加必需 RPDO 接收代次/完整性检测。当前 RX 转换丢弃 Timestamp、每轮至多读取一个 8 KiB 批次，SYNC 布尔标志可能合并，不能直接作为逐周期流水线。
 6. 区分 SYNC 控制推进和实际时间安全/协议检测；当前 `process_drive_402(dt)` 每 worker 轮调用，不能将 worker 次数当作 SYNC 序号。
 7. 实现共享总线资源所有者、每节点隔离与公共 SYNC 身份分发，消除当前每句柄独占接口与多 CD 复用同一物理接口的冲突。
@@ -596,7 +602,7 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 
 同时补充单次批量调用的锁语义、跨调用不原子及无数据年龄保证；不能把一次 read_batch 宣称为“所有字段必定同一产生周期”。帧协议的版本、布局、提交/消费、权限、代次和错误语义须在接口头文件及 xnet 中英文 README 中同步说明。保留通用 write_batch 无回滚语义，不修改其行为来实现事务。
 
-实现 motor_drive_ 时另行提供通用接口说明，明确 SI 字段、endpoint/port 资源所有权、操作结果与异步确认；xnet 文档只说明设备后端绑定及手册单位。不能把业务接口命名或 SI 规则描述为已发布 xnet ABI 的变更。
+motor_drive.h 与中英文 README 已提供字段、结果、资源所有权/确认和配置/转换报告说明；业务接口不暴露 XNET，后端绑定函数单独提供。新函数不破坏已发布 xnet 布局；二进制 LabVIEW VI/CD 工程未自动更新。
 
 #### 7.5.10 外部电机驱动模型的 Slave 侧整合评估
 
@@ -609,7 +615,7 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 | 锁与抖动 | 短时交换、锁外计算 | 回调只校验/复制固定大小帧，不执行文件 I/O 或模型步进；耗时仅作诊断记录 |
 | 访问与完整性 | 仅心跳、完整帧允许本地模型写 | 网络写交换对象、直接写标准实际值均被拒绝；原子性来自单帧 OD 扩展，不来自 write_batch |
 | 复位与生命周期 | 批量 ID 可保留，模型会话必须失效 | uninitialize 后重新绑定；Reset/stop/start 更新 epoch 并重新握手 |
-| ABI | 保持已发布 xnet ABI、counts 兼容帧和通用 batch 语义；新增业务契约独立评审 | motor_drive_ 封装、SI 转换和专用邮箱均需实际开发；不得据文档宣称已实现或已批准新的库导出 |
+| ABI | 保持既有 xnet 布局和 counts 帧；已新增独立 motor_drive_ 头文件及 backend 绑定/报告函数 | 异步 SI 已实现；专用定时邮箱仍待开发，不能宣称已具备 SYNC/PCL 确定能力 |
 | 宿主执行 | 多 CD/slave 实例与每节点一个 PCL 模型，异步桥接 | 不要求模型线程或组级提交；进程隔离/崩溃恢复非本接口的隐含保证 |
 | 驱动响应 | 模型不拥有 PDS，但提供动作完成、PP 就绪和实际位置动态 | 核心保留状态生成权，避免双状态机及“先转换再等待完成”的循环依赖 |
 
@@ -846,7 +852,7 @@ ECU                 节点核心/适配           异步 CD             PCL 模�
 
 1. **许可证与复用 [待确认]**：确认 canopennode-rtt 的许可证是否允许将其实现移植到本仓库；若不允许，按其公开行为重新实现。
 2. **设备配置与实例范围（已确定/实现前核对）**：每 slave 单轴，多 CD 实例模拟多个节点，独立 OD/模型/端口和唯一 Node-ID，不做单节点轴偏移。核对 EDS 转换 JSON 的 PP 必需项，不满足则报告配置不兼容，不自动补项。共享一个 NI-XNET 接口需先实现总线资源所有者，不能直接复用当前独占句柄。
-3. **xnet ABI 与模型业务接口（已确定）**：不改已发布 xnet 结构和通用批量语义；保留 counts 本地帧作为兼容后端。后续业务接口采用 motor_drive_ 前缀、不透明端口和 SI 单位，设备适配层统一转换及执行 OD 读写。新接口的具体导出/后端集成另行评审，不因文档定义而默认批准增加 xnet 库导出。
+3. **xnet ABI 与模型业务接口（已确定/实现）**：既有 xnet 结构/通用 batch/v1 帧不变；新增 motor_drive_ 不透明 SI 端口及 backend endpoint/单位报告函数。设备适配层统一转换/OD 读写；writer 排他仅在显式开端口时生效，不影响普通旧配置。
 4. **首期模式（已确定）**：只实现 PP；PV、PT、HM、CSP、CSV、CST 等均为未来扩展。首期不支持运行时模式切换。
 5. **验证目标（已确定）**：CANopen 毫秒级功能验证不宣称硬实时；确定流水线另外配置/验证时钟误差、固定延迟、采纳与发送截止预算，违约显式诊断，不以普通功能通过替代。
 6. **NMT/DS402 边界（已确定）**：NMT 管理底层通信；DS402 查询 NMT 状态并独占决定电机控制动作、PDS 转换及相关 OD 更新。各 NMT 状态下 DS402 的具体命令接受与输出策略须在 DS402 行为表和测试中定义。

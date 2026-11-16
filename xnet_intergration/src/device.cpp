@@ -8,9 +8,11 @@
 #include "internal.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <set>
+#include <tuple>
 
 using xco::Error;
 using xco::require;
@@ -79,6 +81,78 @@ bool sequence_newer(uint32_t value, uint32_t previous) {
 uint32_t increment_nonzero(uint32_t value) {
     ++value;
     return value == 0 ? 1 : value;
+}
+int32_t motor_result(int32_t result) {
+    switch (result) {
+        case XNET_CO_OK: return MOTOR_DRIVE_OK;
+        case XNET_CO_INVALID_ARGUMENT: return MOTOR_DRIVE_INVALID_ARGUMENT;
+        case XNET_CO_INVALID_STATE: return MOTOR_DRIVE_INVALID_STATE;
+        case XNET_CO_ACCESS_ERROR: return MOTOR_DRIVE_INVALID_FEEDBACK;
+        case XNET_CO_BUFFER_TOO_SMALL: return MOTOR_DRIVE_BUFFER_TOO_SMALL;
+        default: return MOTOR_DRIVE_BACKEND_ERROR;
+    }
+}
+int32_t motor_reject(xnet_canopen_device& d, int32_t result, const char* message) {
+    d.fail(result == MOTOR_DRIVE_INVALID_ARGUMENT ? XNET_CO_INVALID_ARGUMENT : XNET_CO_ACCESS_ERROR, message);
+    return result;
+}
+template<class Function> int32_t motor_call(motor_drive_port_handle port, Function function) {
+    if (!port) return MOTOR_DRIVE_INVALID_ARGUMENT;
+    const auto device = port->endpoint->device.load();
+    if (!device) return MOTOR_DRIVE_INVALID_STATE;
+    int32_t result = MOTOR_DRIVE_BACKEND_ERROR;
+    const auto backend = call(device, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
+        d.initialized();
+        require(d.state != XNET_CO_RUNTIME_FAILED && d.drive_endpoint.get() == port->endpoint.get()
+            && port->endpoint->writer_open && d.model->drive_adapter, XNET_CO_INVALID_STATE, "motor port is not active");
+        if (port->epoch != d.drive_epoch) {
+            port->epoch = d.drive_epoch; port->pcl_epoch = 0; port->heartbeat_seq = 0;
+            port->heartbeat_step = {}; port->submitted.reset();
+        }
+        result = function(d, *port);
+        return XNET_CO_OK;
+    }, true);
+    return backend == XNET_CO_OK ? result : motor_result(backend);
+}
+bool empty_time(const motor_drive_time_v1& time) {
+    return time.clock_domain_id == 0 && time.flags == 0 && time.time_s == 0;
+}
+bool empty_step(const motor_drive_model_step_v1& step) {
+    return step.pcl_epoch == 0 && step.pcl_tick == 0 && step.model_step_seq == 0
+        && step.model_time_s == 0 && step.step_duration_s == 0 && empty_time(step.sample_time);
+}
+bool empty_cycle(const motor_drive_cycle_v1& cycle) {
+    return cycle.sync_domain_id == 0 && cycle.sync_domain_epoch == 0 && cycle.sync_cycle_id == 0
+        && cycle.sync_counter == 0 && cycle.flags == 0 && empty_time(cycle.rx_time) && empty_time(cycle.sync_time);
+}
+bool valid_step(const motor_drive_model_step_v1& step) {
+    const auto& time = step.sample_time;
+    const bool valid_time = empty_time(time) || ((time.flags & MOTOR_DRIVE_TIME_VALID) && !(time.flags & ~3U)
+        && time.clock_domain_id != 0
+        && std::isfinite(time.time_s) && time.time_s >= 0);
+    return step.pcl_epoch && step.pcl_tick && step.model_step_seq && std::isfinite(step.model_time_s)
+        && step.model_time_s >= 0 && std::isfinite(step.step_duration_s) && step.step_duration_s > 0 && valid_time;
+}
+bool same_step(const motor_drive_model_step_v1& a, const motor_drive_model_step_v1& b) {
+    return std::tie(a.pcl_epoch, a.pcl_tick, a.model_step_seq, a.model_time_s, a.step_duration_s,
+                    a.sample_time.clock_domain_id, a.sample_time.flags, a.sample_time.time_s)
+        == std::tie(b.pcl_epoch, b.pcl_tick, b.model_step_seq, b.model_time_s, b.step_duration_s,
+                    b.sample_time.clock_domain_id, b.sample_time.flags, b.sample_time.time_s);
+}
+bool advancing_step(const motor_drive_model_step_v1& step, const motor_drive_model_step_v1& previous) {
+    return step.pcl_epoch == previous.pcl_epoch && step.pcl_tick > previous.pcl_tick
+        && step.model_step_seq > previous.model_step_seq && step.model_time_s >= previous.model_time_s
+        && step.step_duration_s == previous.step_duration_s
+        && (!(step.sample_time.flags && previous.sample_time.flags)
+            || (step.sample_time.clock_domain_id == previous.sample_time.clock_domain_id
+                && step.sample_time.time_s >= previous.sample_time.time_s));
+}
+bool same_feedback(const motor_drive_feedback_v1& a, const motor_drive_feedback_v1& b) {
+    return std::tie(a.source.epoch, a.source.command_seq, a.source.action_seq, a.feedback_seq, a.action_result,
+                    a.flags, a.limit_flags, a.actual_position_rad, a.actual_velocity_rad_s, a.fault_class, a.fault_detail)
+        == std::tie(b.source.epoch, b.source.command_seq, b.source.action_seq, b.feedback_seq, b.action_result,
+                    b.flags, b.limit_flags, b.actual_position_rad, b.actual_velocity_rad_s, b.fault_class, b.fault_detail)
+        && same_step(a.executed_step, b.executed_step);
 }
 }
 
@@ -320,34 +394,32 @@ ODR_t xnet_canopen_device::write_drive_feedback(
     CO_402_feedback_frame_t frame{};
     const auto* bytes = static_cast<const uint8_t*>(buffer);
     if (!CO_402_feedback_unpack(&frame, bytes, count)) return ODR_INVALID_VALUE;
-    if (d.drive_feedback_pending) {
-        if (frame.feedback_seq == d.drive_pending_feedback.feedback_seq
-            && std::memcmp(bytes, d.drive_pending_feedback_bytes.data(), count) == 0) {
-            *transferred = count;
-            stream->dataOffset += count;
-            return ODR_OK;
-        }
-        return ODR_DATA_DEV_STATE;
-    }
-    if (d.drive_has_last_submitted && frame.feedback_seq == d.drive_last_submitted_seq
-        && std::memcmp(bytes, d.drive_last_submitted_bytes.data(), count) == 0) {
+    if (d.drive_endpoint && d.drive_endpoint->writer_open) return ODR_DATA_DEV_STATE;
+    const auto result = d.stage_drive_feedback(frame, bytes);
+    if (result == ODR_OK) {
         *transferred = count;
         stream->dataOffset += count;
-        return ODR_OK;
     }
-    if (d.drive_has_last_submitted && !sequence_newer(frame.feedback_seq, d.drive_last_submitted_seq))
+    return result;
+}
+
+ODR_t xnet_canopen_device::stage_drive_feedback(const CO_402_feedback_frame_t& frame, const uint8_t* bytes) {
+    if (drive_feedback_pending)
+        return frame.feedback_seq == drive_pending_feedback.feedback_seq
+            && std::memcmp(bytes, drive_pending_feedback_bytes.data(), CO_402_FEEDBACK_FRAME_SIZE) == 0
+            ? ODR_OK : ODR_DATA_DEV_STATE;
+    if (drive_has_last_submitted && frame.feedback_seq == drive_last_submitted_seq
+        && std::memcmp(bytes, drive_last_submitted_bytes.data(), CO_402_FEEDBACK_FRAME_SIZE) == 0) return ODR_OK;
+    if (drive_has_last_submitted && !sequence_newer(frame.feedback_seq, drive_last_submitted_seq))
         return ODR_DATA_DEV_STATE;
-    d.drive_pending_feedback = frame;
-    d.drive_pending_submitted_at = xco::Clock::now();
-    d.drive_last_submitted_seq = frame.feedback_seq;
-    d.drive_last_submitted_bytes = {};
-    std::memcpy(d.drive_last_submitted_bytes.data(), bytes, count);
-    d.drive_has_last_submitted = true;
-    std::memcpy(d.drive_pending_feedback_bytes.data(), bytes, count);
-    d.drive_feedback_pending = true;
-    std::memcpy(d.model->value(0x2f03, 0).data(), bytes, count);
-    *transferred = count;
-    stream->dataOffset += count;
+    drive_pending_feedback = frame;
+    drive_pending_submitted_at = xco::Clock::now();
+    drive_last_submitted_seq = frame.feedback_seq;
+    std::memcpy(drive_last_submitted_bytes.data(), bytes, CO_402_FEEDBACK_FRAME_SIZE);
+    drive_has_last_submitted = true;
+    std::memcpy(drive_pending_feedback_bytes.data(), bytes, CO_402_FEEDBACK_FRAME_SIZE);
+    drive_feedback_pending = true;
+    std::memcpy(model->value(0x2f03, 0).data(), bytes, CO_402_FEEDBACK_FRAME_SIZE);
     return ODR_OK;
 }
 
@@ -355,6 +427,7 @@ void xnet_canopen_device::start_drive_epoch() {
     if (!model || !model->drive_402_external) return;
     require(drive_epoch != UINT64_MAX, XNET_CO_STACK_ERROR, "DS402 external epoch exhausted");
     ++drive_epoch;
+    drive_adapter_fault = false;
     drive_command_seq = 0;
     drive_action_seq = 1;
     drive_last_feedback_seq = 0;
@@ -404,12 +477,18 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
     input.mode_requested = requested_mode;
     input.nmt_operational = !force_non_operational && !stop_requested
         && CO_NMT_getInternalState(co->NMT) == CO_NMT_OPERATIONAL;
-    input.target_position = read_drive_value<int32_t>(*model, 0x607a);
-    input.profile_velocity = read_drive_value<uint32_t>(*model, 0x6081);
-    input.profile_acceleration = read_drive_value<uint32_t>(*model, 0x6083);
-    input.profile_deceleration = read_drive_value<uint32_t>(*model, 0x6084);
+    const auto read_quantity = [&](xco::DriveQuantity quantity, uint16_t index, bool is_unsigned) -> int64_t {
+        if (model->drive_adapter) return model->drive_adapter->read(quantity);
+        return is_unsigned ? static_cast<int64_t>(read_drive_value<uint32_t>(*model, index))
+                           : static_cast<int64_t>(read_drive_value<int32_t>(*model, index));
+    };
+    input.target_position = static_cast<int32_t>(read_quantity(xco::DriveQuantity::target_position, 0x607a, false));
+    input.profile_velocity = static_cast<uint32_t>(read_quantity(xco::DriveQuantity::profile_velocity, 0x6081, true));
+    input.profile_acceleration = static_cast<uint32_t>(read_quantity(xco::DriveQuantity::profile_acceleration, 0x6083, true));
+    input.profile_deceleration = static_cast<uint32_t>(read_quantity(xco::DriveQuantity::profile_deceleration, 0x6084, true));
     input.quick_stop_deceleration = model->drive_has_quick_stop_deceleration
-        ? read_drive_value<uint32_t>(*model, 0x6085) : input.profile_deceleration;
+        ? static_cast<uint32_t>(read_quantity(xco::DriveQuantity::quick_stop_deceleration, 0x6085, true))
+        : input.profile_deceleration;
     input.position_tolerance = model->drive_position_tolerance;
     input.target_reached_time_us = model->drive_target_reached_time_us;
     uint16_t external_fault_code = 0;
@@ -447,7 +526,8 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
                 const bool velocity_valid = (frame.flags & 0x02U) != 0;
                 xco::d402::Feedback feedback{frame.actual_position,
                     velocity_valid ? frame.actual_velocity : drive_402->status().actual_velocity,
-                    frame.fault_code != 0 || frame.action_result == CO_402_ACTION_RESULT_ERROR};
+                    frame.fault_code != 0 || frame.action_result == CO_402_ACTION_RESULT_ERROR,
+                    (frame.flags & 0x08U) != 0};
                 drive_402->post_feedback(feedback);
                 drive_pp_ready = (frame.flags & 0x04U) != 0;
                 drive_reset_permitted = (frame.flags & 0x10U) != 0;
@@ -457,6 +537,7 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
                 drive_last_feedback_bytes = drive_pending_feedback_bytes;
                 drive_has_last_feedback = true;
                 drive_feedback_accepted_at = now;
+                drive_adapter_fault = false;
                 drive_current_fault = frame.fault_code
                     ? frame.fault_code
                     : frame.action_result == CO_402_ACTION_RESULT_ERROR ? CO_EMC_GENERIC : 0;
@@ -495,8 +576,9 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
                 drive_epoch, startup_expired, heartbeat_expired, feedback_expired, drive_action_timed_out);
         }
         drive_transport_faults = faults;
-        drive_402->set_external_fault(faults != 0);
-        external_fault_code = drive_current_fault ? drive_current_fault : faults ? 0x8130 : 0;
+        drive_402->set_external_fault(faults != 0 || drive_adapter_fault);
+        external_fault_code = drive_current_fault ? drive_current_fault
+            : drive_adapter_fault ? CO_EMC_GENERIC : faults ? 0x8130 : 0;
         input.model_ready = drive_pp_ready;
         input.reset_permitted = drive_reset_permitted;
     }
@@ -549,8 +631,8 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
             && status.pds == xco::d402::Pds::switch_on_disabled && !fault_active;
         if (fault_active) {
             if (drive_latched_fault == 0) drive_latched_fault = current_fault;
-            if (drive_current_fault && !drive_emcy_active && co && co->em) {
-                CO_errorReport(co->em, CO_EM_GENERIC_ERROR, drive_current_fault, static_cast<uint32_t>(drive_epoch));
+            if ((drive_current_fault || drive_adapter_fault) && !drive_emcy_active && co && co->em) {
+                CO_errorReport(co->em, CO_EM_GENERIC_ERROR, current_fault, static_cast<uint32_t>(drive_epoch));
                 drive_emcy_active = true;
             }
             for (uint8_t source = 0; source < 4; ++source) {
@@ -578,9 +660,10 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
     } else if (model->drive_has_error_code) {
         write_drive_value(*model, 0x603f, static_cast<uint16_t>(status.model_fault ? 0x1000 : 0));
     }
+    if (model->drive_adapter) model->drive_adapter->publish(status);
+    else write_drive_value(*model, 0x6064, status.actual_position);
     write_drive_value(*model, 0x6041, status.statusword);
     write_drive_value(*model, 0x6061, status.mode_display);
-    write_drive_value(*model, 0x6064, status.actual_position);
     if (unsupported_mode) {
         log(xco::LogLevel::warning, "unsupported 0x6060 value {} received through PDO; requesting quick stop and restoring PP",
             int(requested_mode));
@@ -824,6 +907,11 @@ void xnet_canopen_device::release() {
     if (worker.joinable()) stop();
     std::lock_guard<std::recursive_mutex> lock(mutex);
     adapter.close();
+    if (drive_endpoint) {
+        drive_endpoint->device = nullptr;
+        drive_endpoint->writer_open = false;
+        drive_endpoint.reset();
+    }
     can_state = {};
     outgoing.clear();
     if (co || model) log(xco::LogLevel::info, "device uninitialized");
@@ -867,6 +955,16 @@ int32_t xnet_canopen_initialize(xnet_canopen_handle handle, const char* interfac
             d.persistence_path = persistence_path;
             d.model = std::make_unique<xco::Model>();
             d.model->load(xco::read_json(model_path));
+            if (d.model->drive_adapter) {
+                const auto unit_report = d.model->drive_adapter->report();
+                d.log(xco::LogLevel::info, "drive unit conversion report: {}", unit_report.dump());
+                if (!unit_report["assumed_identity"].empty())
+                    d.log(xco::LogLevel::warning, "unconfirmed drive units use identity scales; review the unit conversion report");
+                if (d.model->drive_402_external) {
+                    d.drive_endpoint = std::make_shared<motor_drive_endpoint>();
+                    d.drive_endpoint->device = &d;
+                }
+            }
             if (d.model->drive_402_enabled) {
                 d.drive_402 = std::make_unique<xco::d402::Drive>(
                     d.model->drive_402_external ? d.model->drive_feedback_timeout_us : 1000000);
@@ -1025,6 +1123,8 @@ static void require_od_access(xnet_canopen_device& d) {
  */
 static int32_t entry_io(xnet_canopen_device& d, uint16_t index, uint8_t subindex, const xco::Value& v,
                         uint8_t* read_buffer, const uint8_t* write_buffer, bool is_write) {
+    if (is_write && (index == 0x2f01 || index == 0x2f03) && d.drive_endpoint && d.drive_endpoint->writer_open)
+        return XNET_CO_ACCESS_ERROR;
     // Local-write ownership is separate from network SDO permissions.
     // Local reads currently still require the network SDO-readable flag.
     if ((is_write && !v.allows_local_write) || (!is_write && !(v.attr & ODA_SDO_R))) return XNET_CO_ACCESS_ERROR;
@@ -1186,5 +1286,179 @@ int32_t xnet_canopen_clear_error(xnet_canopen_handle handle) {
     return call(handle, [](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
         d.fail(0, ""); return XNET_CO_OK;
     });
+}
+
+int32_t xnet_canopen_get_motor_drive_endpoint(xnet_canopen_handle handle, motor_drive_endpoint_handle* endpoint) {
+    if (endpoint) *endpoint = nullptr;
+    return call(handle, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
+        d.initialized();
+        require(endpoint != nullptr, XNET_CO_INVALID_ARGUMENT, "endpoint output is required");
+        require(d.drive_endpoint && d.model->drive_adapter && d.model->drive_402_external,
+            XNET_CO_INVALID_STATE, "external PP device_adapter is required for a motor endpoint");
+        *endpoint = d.drive_endpoint.get();
+        return XNET_CO_OK;
+    });
+}
+int32_t xnet_canopen_get_drive_unit_report(xnet_canopen_handle handle, char* buffer, uint32_t capacity, uint32_t* required_size) {
+    return call(handle, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
+        d.initialized();
+        require(required_size && (buffer || capacity == 0), XNET_CO_INVALID_ARGUMENT, "invalid unit report buffer");
+        require(d.model->drive_adapter.has_value(), XNET_CO_INVALID_STATE, "device_adapter is not configured");
+        const auto report = d.model->drive_adapter->report().dump(2);
+        require(report.size() < UINT32_MAX, XNET_CO_INTERNAL_ERROR, "unit report too large");
+        *required_size = static_cast<uint32_t>(report.size() + 1);
+        if (!buffer || capacity < *required_size) return XNET_CO_BUFFER_TOO_SMALL;
+        std::memcpy(buffer, report.c_str(), *required_size);
+        return XNET_CO_OK;
+    }, true);
+}
+
+int32_t motor_drive_open_v1(motor_drive_endpoint_handle endpoint, motor_drive_port_handle* port) {
+    if (port) *port = nullptr;
+    if (!endpoint) return MOTOR_DRIVE_INVALID_ARGUMENT;
+    const auto device = endpoint->device.load();
+    if (!device) return MOTOR_DRIVE_INVALID_STATE;
+    int32_t result = MOTOR_DRIVE_BACKEND_ERROR;
+    const auto backend = call(device, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
+        d.initialized();
+        require(port != nullptr, XNET_CO_INVALID_ARGUMENT, "motor port output is required");
+        require(d.state != XNET_CO_RUNTIME_FAILED && d.drive_endpoint.get() == endpoint,
+            XNET_CO_INVALID_STATE, "motor endpoint is not active");
+        if (endpoint->writer_open) {
+            result = motor_reject(d, MOTOR_DRIVE_BUSY, "motor endpoint already has a writer");
+            return XNET_CO_OK;
+        }
+        require(!d.drive_feedback_pending && !d.drive_has_last_submitted, XNET_CO_INVALID_STATE,
+            "restart the model epoch before replacing a legacy writer");
+        auto opened = std::make_unique<motor_drive_port>();
+        opened->endpoint = endpoint->shared_from_this();
+        opened->epoch = d.drive_epoch;
+        endpoint->writer_open = true;
+        *port = opened.release();
+        result = MOTOR_DRIVE_OK;
+        return XNET_CO_OK;
+    });
+    return backend == XNET_CO_OK ? result : motor_result(backend);
+}
+int32_t motor_drive_read_v1(motor_drive_port_handle port, const motor_drive_read_request_v1* request,
+                           motor_drive_view_v1* view, uint32_t capacity) {
+    return motor_call(port, [&](xnet_canopen_device& d, motor_drive_port&) {
+        require(request && view, XNET_CO_INVALID_ARGUMENT, "motor request and view are required");
+        require(capacity >= sizeof(*view), XNET_CO_BUFFER_TOO_SMALL, "motor view buffer too small");
+        require(request->abi_version == MOTOR_DRIVE_ABI_VERSION && request->struct_size == sizeof(*request)
+            && request->reserved == 0, XNET_CO_INVALID_ARGUMENT, "invalid motor read request ABI");
+        if (request->flags == MOTOR_DRIVE_READ_SCHEDULED || !empty_step(request->target_step)
+            || !empty_time(request->source_cutoff))
+            return motor_reject(d, MOTOR_DRIVE_UNSUPPORTED, "scheduled SYNC/PCL exchange is not implemented by this backend");
+        require(request->flags == MOTOR_DRIVE_READ_ASYNC || request->flags == MOTOR_DRIVE_READ_BOOTSTRAP
+            || request->flags == MOTOR_DRIVE_READ_SAFETY, XNET_CO_INVALID_ARGUMENT, "invalid motor read mode");
+        if (!d.drive_command_seq) return static_cast<int32_t>(MOTOR_DRIVE_NO_DATA);
+        CO_402_command_frame_t command{};
+        require(CO_402_command_unpack(&command, static_cast<const uint8_t*>(d.model->value(0x2f02, 0).data()),
+            CO_402_COMMAND_FRAME_SIZE), XNET_CO_INTERNAL_ERROR, "invalid backend command frame");
+        const bool safety = command.action == CO_402_ACTION_QUICK_STOP || command.action == CO_402_ACTION_FAULT_REACTION
+            || command.action == CO_402_ACTION_DISABLE_VOLTAGE;
+        require(request->flags != MOTOR_DRIVE_READ_SAFETY || safety, XNET_CO_INVALID_STATE, "no priority safety command");
+        require(request->flags != MOTOR_DRIVE_READ_BOOTSTRAP || !(command.flags & 1U),
+            XNET_CO_INVALID_STATE, "bootstrap read cannot return an enabled motion command");
+        const auto& adapter = *d.model->drive_adapter;
+        motor_drive_view_v1 output{};
+        output.abi_version = MOTOR_DRIVE_ABI_VERSION; output.struct_size = sizeof(output);
+        output.token = {command.epoch, command.command_seq, command.action_seq};
+        const auto& record = d.drive_command_history[command.command_seq % d.drive_command_history.size()];
+        require(record.seq == command.command_seq, XNET_CO_INTERNAL_ERROR, "missing command publication record");
+        output.publish_time = {1, MOTOR_DRIVE_TIME_VALID,
+            std::chrono::duration<double>(record.published.time_since_epoch()).count()};
+        output.action = command.action;
+        output.flags = command.flags | MOTOR_DRIVE_SAFETY_DECELERATION_VALID;
+        output.mode = command.mode;
+        output.demand_position_rad = adapter.position_rad(command.demand_position);
+        output.demand_velocity_rad_s = adapter.velocity_rad_s(command.demand_velocity);
+        const auto deceleration = safety ? command.quick_stop_deceleration : command.profile_deceleration;
+        output.safety_deceleration_rad_s2 = std::abs(adapter.velocity_rad_s(deceleration));
+        output.processed_feedback_seq = read_drive_value<uint32_t>(*d.model, 0x2f04);
+        output.processed_result = read_drive_value<uint16_t>(*d.model, 0x2f05);
+        *view = output;
+        return static_cast<int32_t>(MOTOR_DRIVE_OK);
+    });
+}
+int32_t motor_drive_submit_v1(motor_drive_port_handle port, const motor_drive_feedback_v1* feedback, uint32_t size) {
+    return motor_call(port, [&](xnet_canopen_device& d, motor_drive_port& p) {
+        require(feedback != nullptr, XNET_CO_INVALID_ARGUMENT, "motor feedback is required");
+        require(size == sizeof(*feedback) && feedback->abi_version == MOTOR_DRIVE_ABI_VERSION
+            && feedback->struct_size == sizeof(*feedback), XNET_CO_INVALID_ARGUMENT, "invalid motor feedback ABI/size");
+        const auto& f = *feedback;
+        require(f.feedback_seq && (f.flags & MOTOR_DRIVE_POSITION_VALID) && !(f.flags & ~0x17U)
+            && f.action_result <= MOTOR_DRIVE_RESULT_ERROR && valid_step(f.executed_step)
+            && empty_cycle(f.source_cycle) && std::isfinite(f.actual_position_rad)
+            && std::isfinite(f.actual_velocity_rad_s), XNET_CO_ACCESS_ERROR, "invalid motor feedback fields");
+        if (f.source.epoch != d.drive_epoch)
+            return motor_reject(d, MOTOR_DRIVE_STALE, "motor feedback belongs to an old node epoch");
+        if (p.submitted && f.feedback_seq == p.submitted->feedback_seq)
+            return same_feedback(f, *p.submitted) ? static_cast<int32_t>(MOTOR_DRIVE_OK)
+                : motor_reject(d, MOTOR_DRIVE_INVALID_FEEDBACK, "motor retry changed content");
+        if (d.drive_feedback_pending) return motor_reject(d, MOTOR_DRIVE_BUSY, "motor feedback mailbox is occupied");
+        if ((p.pcl_epoch && f.executed_step.pcl_epoch != p.pcl_epoch)
+            || (p.submitted && (!sequence_newer(f.feedback_seq, p.submitted->feedback_seq)
+                || !advancing_step(f.executed_step, p.submitted->executed_step))))
+            return motor_reject(d, MOTOR_DRIVE_STALE, "motor feedback step/sequence did not advance; restart on PCL epoch change");
+        const auto& record = d.drive_command_history[f.source.command_seq % d.drive_command_history.size()];
+        if (!f.source.command_seq || f.source.action_seq != d.drive_action_seq
+            || record.seq != f.source.command_seq || record.action_seq != f.source.action_seq
+            || xco::Clock::now() - record.published > std::chrono::microseconds(d.model->drive_command_max_age_us))
+            return motor_reject(d, MOTOR_DRIVE_STALE, "motor feedback source command is obsolete");
+        auto& adapter = *d.model->drive_adapter;
+        CO_402_feedback_frame_t frame{};
+        frame.epoch = f.source.epoch; frame.command_seq = f.source.command_seq; frame.action_seq = f.source.action_seq;
+        frame.feedback_seq = f.feedback_seq; frame.action_result = static_cast<uint8_t>(f.action_result);
+        frame.flags = static_cast<uint8_t>(f.flags | (f.limit_flags ? 0x08U : 0));
+        frame.actual_position = adapter.position_counts(f.actual_position_rad);
+        frame.actual_velocity = (f.flags & MOTOR_DRIVE_VELOCITY_VALID) ? adapter.velocity_counts(f.actual_velocity_rad_s) : 0;
+        (void)adapter.raw(xco::DriveQuantity::actual_position, frame.actual_position);
+        if ((f.flags & MOTOR_DRIVE_VELOCITY_VALID)
+            && adapter.bindings[static_cast<size_t>(xco::DriveQuantity::actual_velocity)].value)
+            (void)adapter.raw(xco::DriveQuantity::actual_velocity, frame.actual_velocity);
+        try { frame.fault_code = adapter.fault_code(f.fault_class, f.fault_detail); }
+        catch (const Error&) { d.drive_adapter_fault = true; throw; }
+        std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> bytes{};
+        require(CO_402_feedback_pack(&frame, bytes.data(), bytes.size()), XNET_CO_ACCESS_ERROR, "cannot encode motor feedback");
+        const auto staged = d.stage_drive_feedback(frame, bytes.data());
+        require(staged == ODR_OK, XNET_CO_ACCESS_ERROR, "motor feedback staging rejected");
+        p.submitted = f; p.pcl_epoch = f.executed_step.pcl_epoch;
+        return static_cast<int32_t>(MOTOR_DRIVE_OK);
+    });
+}
+int32_t motor_drive_heartbeat_v1(motor_drive_port_handle port, const motor_drive_token_v1* source,
+                               const motor_drive_model_step_v1* progress, uint32_t heartbeat_seq) {
+    return motor_call(port, [&](xnet_canopen_device& d, motor_drive_port& p) {
+        require(source && progress && heartbeat_seq && valid_step(*progress),
+            XNET_CO_INVALID_ARGUMENT, "valid motor heartbeat progress/source are required");
+        if (source->epoch != d.drive_epoch)
+            return motor_reject(d, MOTOR_DRIVE_STALE, "motor heartbeat belongs to an old node epoch");
+        if (p.heartbeat_seq == heartbeat_seq)
+            return same_step(*progress, p.heartbeat_step) ? static_cast<int32_t>(MOTOR_DRIVE_OK)
+                : motor_reject(d, MOTOR_DRIVE_INVALID_ARGUMENT, "motor heartbeat retry changed progress");
+        if ((p.pcl_epoch && progress->pcl_epoch != p.pcl_epoch)
+            || (p.heartbeat_seq && (!sequence_newer(heartbeat_seq, p.heartbeat_seq)
+                || !advancing_step(*progress, p.heartbeat_step))))
+            return motor_reject(d, MOTOR_DRIVE_STALE, "motor heartbeat has no new model progress");
+        write_drive_value(*d.model, 0x2f01, heartbeat_seq);
+        d.drive_last_heartbeat = heartbeat_seq; d.drive_has_heartbeat = true;
+        d.drive_heartbeat_changed = xco::Clock::now();
+        p.heartbeat_seq = heartbeat_seq; p.heartbeat_step = *progress; p.pcl_epoch = progress->pcl_epoch;
+        return static_cast<int32_t>(MOTOR_DRIVE_OK);
+    });
+}
+int32_t motor_drive_close_v1(motor_drive_port_handle port) {
+    if (!port) return MOTOR_DRIVE_INVALID_ARGUMENT;
+    int32_t result = XNET_CO_OK;
+    if (const auto device = port->endpoint->device.load()) {
+        result = call(device, [&](xnet_canopen_device&, std::unique_lock<std::recursive_mutex>&) {
+            port->endpoint->writer_open = false;
+            return XNET_CO_OK;
+        }, true);
+    }
+    if (result == XNET_CO_OK) delete port;
+    return motor_result(result);
 }
 } // extern "C"

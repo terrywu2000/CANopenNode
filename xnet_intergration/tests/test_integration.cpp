@@ -6,10 +6,12 @@
 #include "spdlog/sinks/ostream_sink.h"
 
 #include <cstring>
+#include <cmath>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <sstream>
 
 #define CHECK(condition) do { if (!(condition)) throw std::runtime_error( \
@@ -396,6 +398,291 @@ void drive_402_model_validation() {
     bad = external; bad["objects"].erase(14); CHECK(rejects(bad));
     bad = external; bad["objects"][13]["local_write"] = false; CHECK(rejects(bad));
     bad = external; bad["drive_402"]["feedback_timeout_us"] = 0; CHECK(rejects(bad));
+}
+
+xco::Json adapted_drive_model(const char* profile = "kinco_fd") {
+    auto model = external_drive_402_model();
+    model["drive_402"]["device_adapter"] = {{"unit_profile", profile}, {"counts_per_revolution", 10000},
+        {"direction", -1}, {"zero_counts", 100},
+        {"fault_mapping", {{{"class", 2}, {"detail", 7}, {"device_code", "0x2310"}}}}};
+    for (uint16_t index : {0x606b, 0x606c, 0x60fc})
+        model["objects"].push_back({{"index", index}, {"type", "INTEGER32"}, {"value", 0},
+            {"access", "ro"}, {"local_write", false}});
+    model["objects"][7]["value"] = 546133;
+    model["objects"][8]["value"] = 100000;
+    model["objects"][9]["value"] = 100000;
+    return model;
+}
+
+void drive_unit_adapter() {
+    auto json = adapted_drive_model();
+    xco::Model model; model.load(json);
+    auto& adapter = *model.drive_adapter;
+    CHECK(adapter.read(xco::DriveQuantity::profile_velocity) == 33333);
+    CHECK(adapter.read(xco::DriveQuantity::profile_acceleration) == 6103516);
+    CHECK(adapter.read(xco::DriveQuantity::quick_stop_deceleration) == 1000000);
+    CHECK(adapter.raw(xco::DriveQuantity::actual_velocity, 30000) == 491520);
+    CHECK(adapter.raw(xco::DriveQuantity::actual_velocity, -30000) == -491520);
+    constexpr double tau = 6.2831853071795864769;
+    CHECK(std::abs(adapter.position_rad(2600) + tau / 4) < 1e-12);
+    CHECK(adapter.position_counts(-tau / 4) == 2600);
+    CHECK(adapter.velocity_counts(-3 * tau) == 30000);
+    auto report = adapter.report();
+    CHECK(report["converted"].size() == 4 && report["unchanged"].size() == 5);
+    CHECK(report["assumed_identity"].size() == 4 && report["unbound"].empty());
+    CHECK(report["assumed_identity"][0]["role"] == "quick_stop_deceleration");
+    CHECK(report["assumed_identity"][0]["confirmed"] == false);
+    CHECK(adapter.fault_code(2, 7) == 0x2310);
+
+    const auto rejects = [](const xco::Json& candidate) {
+        try { xco::Model loaded; loaded.load(candidate); }
+        catch (const std::exception&) { return true; }
+        return false;
+    };
+    auto bad = json; bad["drive_402"]["device_adapter"]["counts_per_revolution"] = 0; CHECK(rejects(bad));
+    bad = json; bad["drive_402"]["device_adapter"]["direction"] = 0; CHECK(rejects(bad));
+    bad = json; bad["drive_402"]["device_adapter"]["unit_profile"] = "guessed"; CHECK(rejects(bad));
+    bad = json; bad["drive_402"]["device_adapter"]["scales"]["unknown"] = {{"numerator", 1}, {"denominator", 1}};
+    CHECK(rejects(bad));
+    bad = json; bad["drive_402"]["device_adapter"]["scales"]["profile_velocity"] = {{"numerator", 0}, {"denominator", 1}};
+    CHECK(rejects(bad));
+    bad = json; bad["drive_402"]["device_adapter"]["scales"]["profile_velocity"] = {{"numerator", 1}, {"denominator", UINT32_MAX}};
+    CHECK(rejects(bad));
+    bad = json; bad["objects"][8]["value"] = UINT32_MAX; CHECK(rejects(bad)); // Conversion, not raw OD, overflows.
+    bad = json; bad["objects"].back()["local_write"] = true; CHECK(rejects(bad));
+    bad = json; bad["drive_402"]["device_adapter"]["fault_mapping"].push_back(
+        bad["drive_402"]["device_adapter"]["fault_mapping"][0]); CHECK(rejects(bad));
+
+    auto override = json;
+    override["drive_402"]["device_adapter"]["scales"]["quick_stop_deceleration"] = {{"numerator", 15625}, {"denominator", 256}};
+    override["drive_402"]["device_adapter"]["scales"]["target_position"] = {{"numerator", 1}, {"denominator", 2}};
+    xco::Model configured; configured.load(override);
+    auto& explicit_adapter = *configured.drive_adapter;
+    int32_t count = -1; std::memcpy(configured.value(0x607a, 0).data(), &count, sizeof(count));
+    CHECK(explicit_adapter.read(xco::DriveQuantity::target_position) == -1);
+    count = 1; std::memcpy(configured.value(0x607a, 0).data(), &count, sizeof(count));
+    CHECK(explicit_adapter.read(xco::DriveQuantity::target_position) == 1);
+    CHECK(explicit_adapter.report()["assumed_identity"].size() == 3);
+    CHECK(explicit_adapter.report()["converted"].size() == 6);
+    xco::Model counts; counts.load(adapted_drive_model("counts"));
+    CHECK(counts.drive_adapter->read(xco::DriveQuantity::profile_velocity) == 546133);
+    CHECK(counts.drive_adapter->report()["converted"].empty());
+    CHECK(counts.drive_adapter->report()["assumed_identity"].empty());
+    xco::Model identity; identity.load(adapted_drive_model("identity"));
+    CHECK(identity.drive_adapter->read(xco::DriveQuantity::profile_velocity) == 546133);
+    CHECK(identity.drive_adapter->report()["assumed_identity"].size() == 9);
+    auto internal = json; internal["drive_402"]["model"] = "internal";
+    for (const char* key : {"startup_timeout_us", "heartbeat_timeout_us", "feedback_timeout_us",
+                           "action_timeout_us", "command_max_age_us"}) internal["drive_402"].erase(key);
+    xco::Model internal_model; internal_model.load(internal);
+    CHECK(internal_model.drive_adapter && internal_model.drive_adapter->read(xco::DriveQuantity::profile_velocity) == 33333);
+}
+
+void motor_drive_si_exchange() {
+    Fixture fixture;
+    fixture.model(adapted_drive_model());
+    CHECK(fixture.initialize() == XNET_CO_OK);
+    motor_drive_endpoint_handle endpoint = nullptr;
+    CHECK(xnet_canopen_get_motor_drive_endpoint(fixture.device, &endpoint) == XNET_CO_OK);
+    motor_drive_port_handle port = nullptr, duplicate = nullptr;
+    CHECK(motor_drive_open_v1(endpoint, &port) == MOTOR_DRIVE_OK);
+    std::unique_ptr<motor_drive_port, decltype(&motor_drive_close_v1)> owned(port, motor_drive_close_v1);
+    CHECK(motor_drive_open_v1(endpoint, &duplicate) == MOTOR_DRIVE_BUSY && duplicate == nullptr);
+    const auto tick = [&] {
+        std::lock_guard<std::recursive_mutex> lock(fixture.device->mutex);
+        fixture.device->process_drive_402(0);
+    };
+    const auto scalar = [&](uint16_t index) {
+        int32_t value; uint32_t size = 0;
+        CHECK(xnet_canopen_read_od(fixture.device, index, 0, reinterpret_cast<uint8_t*>(&value),
+            sizeof(value), &size) == XNET_CO_OK);
+        return value;
+    };
+    uint32_t report_size = 0;
+    CHECK(xnet_canopen_get_drive_unit_report(fixture.device, nullptr, 0, &report_size) == XNET_CO_BUFFER_TOO_SMALL);
+    std::vector<char> report_bytes(report_size);
+    CHECK(xnet_canopen_get_drive_unit_report(fixture.device, report_bytes.data(), report_size - 1, &report_size)
+        == XNET_CO_BUFFER_TOO_SMALL);
+    CHECK(xnet_canopen_get_drive_unit_report(fixture.device, report_bytes.data(), report_bytes.size(), &report_size) == XNET_CO_OK);
+    const auto report = xco::Json::parse(report_bytes.data());
+    CHECK(report["converted"].size() == 4 && report["assumed_identity"].size() == 4);
+    CHECK(diagnostic(fixture.device).find("motor endpoint already has a writer") != std::string::npos);
+
+    motor_drive_read_request_v1 request{};
+    request.abi_version = MOTOR_DRIVE_ABI_VERSION; request.struct_size = sizeof(request); request.flags = MOTOR_DRIVE_READ_ASYNC;
+    motor_drive_view_v1 view{};
+    view.mode = 123;
+    CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_NO_DATA && view.mode == 123);
+    tick();
+    CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK);
+    constexpr double tau = 6.2831853071795864769;
+    CHECK(std::abs(view.demand_position_rad - tau / 100) < 1e-12);
+    CHECK(view.source_cycle.flags == 0 && view.publish_time.flags == MOTOR_DRIVE_TIME_VALID);
+    CHECK(std::abs(view.safety_deceleration_rad_s2 - 6103516 * tau / 10000) < 1e-10);
+    auto scheduled = request; scheduled.flags = MOTOR_DRIVE_READ_SCHEDULED;
+    CHECK(motor_drive_read_v1(port, &scheduled, &view, sizeof(view)) == MOTOR_DRIVE_UNSUPPORTED);
+    CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view) - 1) == MOTOR_DRIVE_BUFFER_TOO_SMALL);
+
+    motor_drive_feedback_v1 feedback{};
+    feedback.abi_version = MOTOR_DRIVE_ABI_VERSION; feedback.struct_size = sizeof(feedback);
+    feedback.source = view.token;
+    feedback.executed_step = {(uint64_t{1} << 53) + 17, 100, 1, 1.0, 0.002, {}};
+    feedback.feedback_seq = 1; feedback.flags = 0x17;
+    feedback.actual_position_rad = -tau / 4; feedback.actual_velocity_rad_s = -3 * tau;
+    feedback.limit_flags = 1;
+    CHECK(motor_drive_heartbeat_v1(port, &feedback.source, &feedback.executed_step, 1) == MOTOR_DRIVE_OK);
+    const auto heartbeat_time = fixture.device->drive_heartbeat_changed;
+    CHECK(motor_drive_heartbeat_v1(port, &feedback.source, &feedback.executed_step, 1) == MOTOR_DRIVE_OK);
+    CHECK(fixture.device->drive_heartbeat_changed == heartbeat_time);
+    CHECK(motor_drive_heartbeat_v1(port, &feedback.source, &feedback.executed_step, 2) == MOTOR_DRIVE_STALE);
+    CHECK(motor_drive_submit_v1(port, &feedback, sizeof(feedback)) == MOTOR_DRIVE_OK);
+    const auto staged_time = fixture.device->drive_pending_submitted_at;
+    CHECK(motor_drive_submit_v1(port, &feedback, sizeof(feedback)) == MOTOR_DRIVE_OK);
+    CHECK(fixture.device->drive_pending_submitted_at == staged_time);
+    auto changed = feedback; changed.actual_position_rad += 1e-10; // Even a change below one OD count is not an identical retry.
+    CHECK(motor_drive_submit_v1(port, &changed, sizeof(changed)) == MOTOR_DRIVE_INVALID_FEEDBACK);
+    changed = feedback; changed.feedback_seq = 2; ++changed.executed_step.pcl_tick; ++changed.executed_step.model_step_seq;
+    changed.executed_step.model_time_s += 0.002;
+    CHECK(motor_drive_submit_v1(port, &changed, sizeof(changed)) == MOTOR_DRIVE_BUSY);
+    uint32_t alive = 99;
+    CHECK(xnet_canopen_write_od(fixture.device, 0x2f01, 0, reinterpret_cast<uint8_t*>(&alive), sizeof(alive)) == XNET_CO_ACCESS_ERROR);
+    tick();
+    CHECK(scalar(0x6064) == 2600 && scalar(0x606c) == 491520);
+    CHECK((fixture.device->drive_402->status().statusword & 0x0800) != 0);
+    CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK);
+    CHECK(view.processed_feedback_seq == 1 && view.processed_result == MOTOR_DRIVE_PROCESSED_ACCEPTED);
+    CHECK(scalar(0x6081) == 546133 && scalar(0x6083) == 100000 && scalar(0x607a) == 0);
+    const auto accepted_time = fixture.device->drive_feedback_accepted_at;
+    CHECK(motor_drive_submit_v1(port, &feedback, sizeof(feedback)) == MOTOR_DRIVE_OK);
+    CHECK(fixture.device->drive_feedback_accepted_at == accepted_time && !fixture.device->drive_feedback_pending);
+    CHECK(motor_drive_submit_v1(port, &changed, sizeof(changed)) == MOTOR_DRIVE_OK);
+    tick();
+    CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK);
+    auto invalid = changed; invalid.source = view.token; invalid.feedback_seq = 3;
+    ++invalid.executed_step.pcl_tick; ++invalid.executed_step.model_step_seq; invalid.executed_step.model_time_s += 0.002;
+    invalid.actual_position_rad = std::numeric_limits<double>::quiet_NaN();
+    CHECK(motor_drive_submit_v1(port, &invalid, sizeof(invalid)) == MOTOR_DRIVE_INVALID_FEEDBACK);
+    invalid.actual_position_rad = 1e100;
+    CHECK(motor_drive_submit_v1(port, &invalid, sizeof(invalid)) == MOTOR_DRIVE_INVALID_FEEDBACK);
+    CHECK(scalar(0x6064) == 2600 && !fixture.device->drive_feedback_pending);
+    invalid = changed; invalid.feedback_seq = 3; invalid.source = view.token;
+    CHECK(motor_drive_submit_v1(port, &invalid, sizeof(invalid)) == MOTOR_DRIVE_STALE);
+    invalid = changed; invalid.feedback_seq = 3; invalid.source = view.token; invalid.limit_flags = 0;
+    ++invalid.executed_step.pcl_tick; ++invalid.executed_step.model_step_seq; invalid.executed_step.model_time_s += 0.002;
+    invalid.fault_class = 2; invalid.fault_detail = 7;
+    CHECK(motor_drive_submit_v1(port, &invalid, sizeof(invalid)) == MOTOR_DRIVE_OK);
+    tick();
+    CHECK(scalar(0x2f00) == 0x2310 && fixture.device->drive_402->status().model_fault);
+    CHECK((fixture.device->drive_402->status().statusword & 0x0800) == 0);
+    CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK);
+    invalid.source = view.token; ++invalid.feedback_seq;
+    ++invalid.executed_step.pcl_tick; ++invalid.executed_step.model_step_seq; invalid.executed_step.model_time_s += 0.002;
+    invalid.fault_class = 99;
+    CHECK(motor_drive_submit_v1(port, &invalid, sizeof(invalid)) == MOTOR_DRIVE_INVALID_FEEDBACK);
+    CHECK(fixture.device->drive_adapter_fault && diagnostic(fixture.device).find("unmapped motor fault") != std::string::npos);
+    CHECK(!fixture.device->drive_feedback_pending && scalar(0x6064) == 2600);
+
+    const auto old_token = view.token;
+    {
+        std::lock_guard<std::recursive_mutex> lock(fixture.device->mutex);
+        fixture.device->drive_402->reset(); fixture.device->start_drive_epoch();
+    }
+    tick();
+    CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK && view.token.epoch > old_token.epoch);
+    CHECK(motor_drive_heartbeat_v1(port, &old_token, &feedback.executed_step, 1) == MOTOR_DRIVE_STALE);
+    CHECK(motor_drive_submit_v1(port, &feedback, sizeof(feedback)) == MOTOR_DRIVE_STALE);
+    CHECK(motor_drive_heartbeat_v1(port, &view.token, &feedback.executed_step, 1) == MOTOR_DRIVE_OK);
+    CHECK(fixture.device->drive_has_heartbeat); // Authenticated new epoch can reuse the wire heartbeat baseline.
+    auto unmapped = feedback; unmapped.source = view.token; unmapped.fault_class = 99;
+    CHECK(motor_drive_submit_v1(port, &unmapped, sizeof(unmapped)) == MOTOR_DRIVE_INVALID_FEEDBACK);
+    tick();
+    CHECK(fixture.device->drive_402->status().model_fault && scalar(0x2f00) == CO_EMC_GENERIC);
+    CHECK(scalar(0x603f) == CO_EMC_GENERIC && CO_isError(fixture.device->co->em, CO_EM_GENERIC_ERROR));
+    CHECK(xnet_canopen_uninitialize(fixture.device) == XNET_CO_OK);
+    CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_INVALID_STATE);
+    CHECK(fixture.initialize() == XNET_CO_OK);
+    motor_drive_endpoint_handle fresh = nullptr;
+    CHECK(xnet_canopen_get_motor_drive_endpoint(fixture.device, &fresh) == XNET_CO_OK && fresh != endpoint);
+    CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_INVALID_STATE);
+    CHECK(motor_drive_close_v1(port) == MOTOR_DRIVE_OK);
+    owned.release();
+    CHECK(motor_drive_open_v1(fresh, &port) == MOTOR_DRIVE_OK);
+    owned.reset(port);
+    CHECK(motor_drive_close_v1(port) == MOTOR_DRIVE_OK);
+    owned.release();
+}
+
+void motor_drive_worker_stop() {
+    Fixture fixture;
+    fixture.model(adapted_drive_model());
+    CHECK(fixture.initialize() == XNET_CO_OK);
+    motor_drive_endpoint_handle endpoint = nullptr;
+    motor_drive_port_handle port = nullptr;
+    CHECK(xnet_canopen_get_motor_drive_endpoint(fixture.device, &endpoint) == XNET_CO_OK);
+    CHECK(motor_drive_open_v1(endpoint, &port) == MOTOR_DRIVE_OK);
+    std::unique_ptr<motor_drive_port, decltype(&motor_drive_close_v1)> owned(port, motor_drive_close_v1);
+    fixture.start();
+    std::atomic<bool> running{true};
+    std::atomic<int32_t> failure{0};
+    std::thread model([&] {
+        motor_drive_read_request_v1 request{};
+        request.abi_version = 1; request.struct_size = sizeof(request); request.flags = MOTOR_DRIVE_READ_ASYNC;
+        uint64_t epoch = 0, step = 0;
+        uint32_t seq = 0, waiting = 0;
+        double position = 6.2831853071795864769 / 100;
+        while (running) {
+            motor_drive_view_v1 view{};
+            auto result = motor_drive_read_v1(port, &request, &view, sizeof(view));
+            if (result == MOTOR_DRIVE_NO_DATA) { std::this_thread::sleep_for(1ms); continue; }
+            if (result != MOTOR_DRIVE_OK) { failure = result; break; }
+            if (epoch != view.token.epoch) { epoch = view.token.epoch; seq = 0; waiting = 0; }
+            ++step;
+            motor_drive_model_step_v1 progress{9, step, step, step * 0.002, 0.002, {}};
+            result = motor_drive_heartbeat_v1(port, &view.token, &progress, static_cast<uint32_t>(step));
+            if (result != MOTOR_DRIVE_OK && result != MOTOR_DRIVE_STALE) { failure = result; break; }
+            if (waiting && view.processed_feedback_seq == waiting) waiting = 0;
+            if (!waiting) {
+                if (view.flags & MOTOR_DRIVE_OUTPUT_ALLOWED) position = view.demand_position_rad;
+                motor_drive_feedback_v1 feedback{};
+                feedback.abi_version = 1; feedback.struct_size = sizeof(feedback);
+                feedback.source = view.token; feedback.executed_step = progress; feedback.feedback_seq = ++seq;
+                feedback.flags = 0x17; feedback.actual_position_rad = position;
+                feedback.actual_velocity_rad_s = (view.flags & MOTOR_DRIVE_OUTPUT_ALLOWED) ? view.demand_velocity_rad_s : 0;
+                feedback.action_result = view.action == MOTOR_DRIVE_ACTION_NONE ? MOTOR_DRIVE_RESULT_NONE : MOTOR_DRIVE_RESULT_DONE;
+                result = motor_drive_submit_v1(port, &feedback, sizeof(feedback));
+                if (result == MOTOR_DRIVE_OK) waiting = seq;
+                else if (result != MOTOR_DRIVE_STALE) { failure = result; break; }
+            }
+            std::this_thread::sleep_for(2ms);
+        }
+    });
+    const auto cleanup = [&] { running = false; model.join(); };
+    try {
+        const auto drive_status = [&] {
+            std::lock_guard<std::recursive_mutex> lock(fixture.device->mutex);
+            return fixture.device->drive_402->status();
+        };
+        wait_for([&] { return drive_status().model_ready; });
+        operational(fixture);
+        CHECK(sdo_download(0x6040, 0, 6, 2).Payload[0] == 0x60);
+        wait_for([&] { return drive_status().pds == xco::d402::Pds::ready_to_switch_on; });
+        CHECK(sdo_download(0x6040, 0, 7, 2).Payload[0] == 0x60);
+        wait_for([&] { return drive_status().pds == xco::d402::Pds::switched_on; });
+        CHECK(sdo_download(0x6040, 0, 15, 2).Payload[0] == 0x60);
+        wait_for([&] { return drive_status().output_allowed; });
+        CHECK(sdo_download(0x607a, 0, 1000, 4).Payload[0] == 0x60);
+        CHECK(sdo_download(0x6040, 0, 31, 2).Payload[0] == 0x60);
+        wait_for([&] { return drive_status().actual_position == 1000; });
+        CHECK(sdo_upload(0x6081) == 546133 && sdo_upload(0x607a) == 1000);
+        CHECK(xnet_canopen_stop(fixture.device) == XNET_CO_OK); // Model remains alive to answer the new-epoch safety command.
+        CHECK(fixture.status().runtime_state == XNET_CO_RUNTIME_STOPPED);
+        CHECK(!drive_status().reaction_unconfirmed && !drive_status().output_allowed);
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+    cleanup();
+    CHECK(failure == 0);
 }
 
 void drive_402_external_exchange() {
@@ -2179,6 +2466,8 @@ int main(int argc, char** argv) {
     if (!xnet_canopen_c_header_test()) return 1;
     const std::vector<std::pair<const char*, std::function<void()>>> tests = {
         {"model validation", model_validation}, {"DS402 model validation", drive_402_model_validation},
+        {"drive unit adapter", drive_unit_adapter}, {"motor drive SI exchange", motor_drive_si_exchange},
+        {"motor drive worker stop", motor_drive_worker_stop},
         {"DS402 SDO only", drive_402_sdo_only},
         {"DS402 PP integration", drive_402_integration},
         {"DS402 external exchange", drive_402_external_exchange},

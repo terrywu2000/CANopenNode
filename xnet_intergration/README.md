@@ -341,6 +341,11 @@ are submitted by the host through the local OD API; the integration worker
 validates and consumes them, publishes standard DS402 values, and waits for
 matching action acknowledgements.
 
+With an explicit `device_adapter`, the host can instead use the SI interface in
+[`include/motor_drive.h`](include/motor_drive.h). Both paths share the same
+pending/worker acceptance logic; opening a motor port excludes legacy local
+heartbeat/feedback writes, not ordinary ECU target/profile writes.
+
 ```json
 "drive_402": {
   "profile": "PP",
@@ -416,6 +421,103 @@ The checked-in `examples/kinco_FD124.json` is not currently PP-compatible:
 local writes. Its TPDO maps `0x6063`, not `0x6064`; actual position is therefore
 available via SDO, not that TPDO. Check the target device/EDS and correct the
 configuration before enabling `drive_402`.
+
+#### Device units and motor_drive_ SI port
+
+Add the following inside an otherwise valid `drive_402` configuration:
+
+```json
+"device_adapter": {
+  "unit_profile": "kinco_fd",
+  "counts_per_revolution": 10000,
+  "direction": 1,
+  "zero_counts": 0,
+  "fault_mapping": [
+    {"class": 2, "detail": 7, "device_code": "0x2310"}
+  ]
+}
+```
+
+The resolution above is an example, not a device default. Supply the effective
+counts/revolution explicitly. `direction` is +1/-1 and `zero_counts` is an I32
+coordinate origin; they are fixed initialization settings. They do not
+automatically read/apply `0x607E`, `0x607C`, pulse gearing or encoder-type rules.
+Configure the agreed viewing direction once. Change coordinates/scales by
+uninitializing/reinitializing, invalidating old ports/results. Window/limit
+objects `0x6067/0x6068/0x607D` are not automatically bound by this adapter.
+
+The adapter binds existing OD fields; it creates no OD objects. It reads target
+and profile raw values, converts to core counts units, and publishes actual and
+optional demand telemetry in device units. ECU target/profile values are never
+round-tripped or overwritten. Optional `0x60FC`, `0x606B`, `0x606C` must be scalar
+read-only I32 outputs; if absent they are listed as unbound, not synthesized.
+Legacy v1 frames stay 56/36 bytes and counts-based. Without `device_adapter`,
+existing configurations retain their previous behavior and have no SI endpoint.
+
+`unit_profile` is `counts` (explicitly declared counts units), `identity`
+(all raw/core scales unconfirmed and assumed 1:1), or `kinco_fd` (manual rules
+below, unknown fields explicitly assumed 1:1). Invalid/overflowing conversions
+fail; unknown rules do not silently become confirmed. Optional `scales` overrides
+use a positive U32 `numerator`/`denominator`: core = raw × numerator/denominator.
+For example, only after device confirmation:
+
+```json
+"scales": {
+  "quick_stop_deceleration": {"numerator": 15625, "denominator": 256}
+}
+```
+
+| Role / OD | Kinco raw → core | Default audit classification |
+| --- | --- | --- |
+| profile_velocity / 0x6081, actual_velocity / 0x606C | ×125/2048 | converted, manual rule |
+| profile_acceleration / 0x6083, profile_deceleration / 0x6084 | ×15625/256 | converted, manual rule |
+| target_position / 0x607A | ×1 | unchanged, position increment |
+| actual_position / 0x6064, demand_position / 0x60FC | ×1 | unchanged, **assumed**, coordinate equivalence needs review |
+| demand_velocity / 0x606B, quick_stop_deceleration / 0x6085 | ×1 | unchanged, **assumed**, unit rule needs review |
+
+Exact integer rational scaling rounds to nearest, ties away from zero, then
+checks I32/U32 bounds; positive configured rates quantizing to zero fail.
+SI uses `theta = direction × (counts-zero_counts) × 2π/E`,
+`omega = direction × counts_per_second × 2π/E`; magnitude deceleration is
+nonnegative. Nonfinite SI inputs and out-of-range conversions are rejected.
+The raw/core identity assumptions do not remove the core/SI physical conversion.
+
+Initialization logs the conversion report and warns on unconfirmed rules.
+`xnet_canopen_get_drive_unit_report(handle, buffer, capacity, &required_size)`
+returns JSON lists `converted`, `unchanged`, `assumed_identity`, `unbound`,
+including role/index, rational scale and basis. Query with NULL/0 first;
+`required_size` includes NUL. A short buffer returns `XNET_CO_BUFFER_TOO_SMALL`
+without a partial report. Retain this report for device-unit review.
+
+For external PP, call `xnet_canopen_get_motor_drive_endpoint()` in the backend,
+then `motor_drive_open_v1()` once. The model-facing header has no OD/XNET types.
+Set ABI version/struct_size, select `MOTOR_DRIVE_READ_ASYNC`, and leave
+request target_step/source_cutoff zero. Read copies one SI command plus its
+token/processed result. Submit a full SI feedback with the exact source token
+and actual `pcl_epoch/pcl_tick/model_step_seq`, model time and positive fixed
+step duration. Poll processed_*: OK means staging/idempotent retry, not worker
+acceptance or action DONE. There is at most one unacknowledged feedback.
+
+Forward actual model progress through `motor_drive_heartbeat_v1()`; new sequence
+numbers without advancing model steps are stale. Exact retries refresh neither
+heartbeat nor feedback age. PCL-epoch changes require a node/session restart;
+old node tokens and old ports after reinitialize are rejected. Fault class/detail
+must map exactly to a nonzero device code; unmapped faults reject the feedback,
+diagnose the error and fail closed with a generic adapter fault. Limit reasons
+are reduced to the current valid Statusword bit 11.
+
+Keep model exchange alive during bounded stop; only close the port after stop,
+then uninitialize/destroy. Do not block the PCL waiting for feedback it must
+produce. Existing C ABI/status layouts are unchanged; new structures are
+time=16, cycle=64, model_step=56, request=88, view=208, feedback=184 bytes.
+Check sizes before LabVIEW deployment; the binary VIs are not regenerated here.
+
+This release implements **asynchronous SI exchange**, not the SYNC/PCL pipeline:
+`MOTOR_DRIVE_READ_SCHEDULED` returns `MOTOR_DRIVE_UNSUPPORTED`, cycle/target-step
+metadata is zero, and hardware RX timestamps are not fabricated. publish_time
+uses clock domain 1, seconds on the process's native steady clock; caller model
+timestamps are not mapped to that clock. Shared-interface multi-node transport
+and VeriStand signal/FIFO scheduling remain separate implementation work.
 
 `value_offset: "NODE_ID"` supports signed/unsigned integer VARs, record members
 other than subindex 0, and a common offset on every ARRAY element. The stored
@@ -1148,8 +1250,16 @@ is an ordinary 11-bit ID, not evidence that extended frames are necessary.
 ### Application channel selection
 
 Directions here are relative to the external model. This is a selection guide,
-not a mandatory complete OD. Read commands through batch reads and write
+not a mandatory complete OD. The tables below describe device-specific modeling
+without `drive_402`; in that case, read commands through batch reads and write
 feedback through batches with appropriate `local_write` permissions.
+
+With `drive_402` enabled, the library owns PDS, profile planning, Statusword and
+mode display. Its external model uses the counts compatibility frames or the
+`motor_drive_` SI port, not these direct OD input/output tables. The device
+adapter owns raw-unit/fault conversion. The current PP binding uses `0x6064`,
+does not alias it to `0x6063`, and does not implement the additional modes or
+telemetry listed below; verify the selected-device position semantics separately.
 
 | Model inputs | OD addresses / representation | Maintenance considerations |
 | --- | --- | --- |

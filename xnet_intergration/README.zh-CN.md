@@ -419,7 +419,8 @@ python -m unittest discover -s .\tests -p test_eds_to_json.py
 
 显式启用单轴 external PP 的配置与 v1 帧布局见
 [英文配置说明](README.md#ds402-pp-configuration) 和
-[模型模拟从站](tests/modsim_app/README.md)。公共 C ABI 与帧版本未改变。
+[模型模拟从站](tests/modsim_app/README.md)。既有 C ABI 布局与帧版本未改变，
+新增 SI 端口见下节；旧模型仍可使用兼容帧。
 
 适配层使用完整反馈消费时刻的单调时间戳统一判断新鲜度，在核心步进之前分类启动、
 心跳、反馈和动作超时；不会再由核心另外累加运动步长而抢先产生通用故障。
@@ -438,6 +439,68 @@ python -m unittest discover -s .\tests -p test_eds_to_json.py
 反应状态下提前发出的边沿不会排队。stop/reset 使用两次动作超时加两次 worker 周期
 的单调等待预算，反应超时按终态失败处理；未能在预算内到达终态会明确报告错误。
 这些是软件功能约束，不构成硬实时或硬件安全保证。
+
+### 设备单位适配与 motor_drive_ SI 接口
+
+在合法 `drive_402` 中显式添加：
+
+```json
+"device_adapter": {
+  "unit_profile": "kinco_fd",
+  "counts_per_revolution": 10000,
+  "direction": 1,
+  "zero_counts": 0,
+  "fault_mapping": [{"class": 2, "detail": 7, "device_code": "0x2310"}]
+}
+```
+
+10000 仅为示例，必须提供实际有效 counts/rev；不能推断极对数或盲目将编码器参数乘 4。
+direction 为 +1/-1，zero_counts 为 I32，均为初始化坐标配置，不自动读取/重复应用
+0x607E、0x607C 或脉冲齿轮比。改变这些参数须重新初始化；0x6067/0x6068/0x607D
+窗口与限位暂不自动绑定。
+
+适配层用已有 OD 绑定处理：设备原始单位 ↔ 核心 counts ↔ 外部 SI（rad、rad/s、
+rad/s²）。不生成 OD、不覆盖 ECU 的 target/profile。可选 0x60FC/0x606B/0x606C
+存在时须为不可本地/RPDO 写入的只读 I32 输出；缺失则报告未绑定。v1 帧仍为
+56/36 字节和 counts 单位；未配置 device_adapter 的旧配置行为不变。
+
+unit_profile 支持 `counts`（明确声明原始 counts 单位）、`identity`（全部按未确认
+同单位直通）、`kinco_fd`（已知手册公式＋未知规则直通）。默认 Kinco 清单：
+
+| 分类 | OD / 字段 | raw → core |
+| --- | --- | --- |
+| 已换算 | 0x6081 profile_velocity、0x606C actual_velocity | ×125/2048 |
+| 已换算 | 0x6083 profile_acceleration、0x6084 profile_deceleration | ×15625/256 |
+| 已确认无需换算 | 0x607A target_position | ×1 |
+| 暂按相同单位、待检查 | 0x6064 actual_position、0x60FC demand_position | ×1 |
+| 暂按相同单位、待检查 | 0x606B demand_velocity、0x6085 quick_stop_deceleration | ×1 |
+
+可用 `scales` 按角色覆盖 `{ "numerator": 正U32, "denominator": 正U32 }`；
+core = raw × numerator/denominator。整数使用精确有理数运算、最近舍入/半值远离零，
+舍入后检查范围；正 profile 参数量化为 0 拒绝。SI 非有限值与溢出拒绝。
+原始单位的直通假设不取消 counts ↔ SI 的物理换算。
+
+初始化输出报告并对未确认规则告警。调用
+`xnet_canopen_get_drive_unit_report(handle, buffer, capacity, &required_size)` 获取 JSON：
+`converted`、`unchanged`、`assumed_identity`、`unbound`，包括角色/OD、比例和依据；
+NULL/0 查询所需大小（含 NUL），短缓冲返回 BUFFER_TOO_SMALL，不输出半份报告。
+
+external 后端通过 `xnet_canopen_get_motor_drive_endpoint` 获取 endpoint，再打开唯一
+`motor_drive_` 端口。模型端头文件 [motor_drive.h](include/motor_drive.h) 不暴露 XNET/OD；
+读请求填版本/大小与 READ_ASYNC，target_step/source_cutoff 为 0。完整反馈回显源 token，
+报告实际 PCL/model 步及固定步长；提交成功只表示暂存，必须读取 processed_* 确认。
+打开端口时禁止兼容心跳/反馈本地写，普通 ECU 命令写不受影响。
+
+heartbeat 只转发模型实际执行进展；重复或只改 heartbeat 序号不刷新新鲜度。
+fault_class/detail 须有明确设备故障码映射；无映射拒绝并失败关闭。模型 limit_flags
+合成有效反馈的 Statusword bit11。停止握手期间模型须可交互，stop 后 close，再释放后端；
+PCL 不应阻塞等待自己下一步才能产生的反馈。
+
+本轮未实现共享总线、硬件时间映射或 VeriStand signal/FIFO 调度：
+READ_SCHEDULED 明确返回 UNSUPPORTED，不将 worker 次数伪装成 SYNC。cycle/target_step
+为 0；publish_time 为进程 steady clock 的秒（域 1），不等同硬件/PCL 时间。
+既有 ABI 不变，新结构大小依次为 time 16、cycle 64、step 56、request 88、view 208、
+feedback 184 字节；部署前核对 LabVIEW 布局，本轮未重新生成二进制 VI。
 
 ### PDO
 
@@ -929,8 +992,14 @@ PDO 示例的 `0x43F` 是普通的 11 位 ID，并不说明需要扩展帧。
 
 ### 应用通道选择
 
-此处的方向是相对于外部模型而言的。这是一份选择指南，而不是强制的完整 OD。通过批量
-读取读取命令，通过具有相应 `local_write` 权限的批次写入反馈。
+此处的方向是相对于外部模型而言的。这是一份选择指南，而不是强制的完整 OD。下表描述
+未启用 `drive_402` 时的设备专用建模；此时通过批量读取命令，通过具有相应 `local_write`
+权限的批次写入反馈。
+
+启用 `drive_402` 后，PDS、轮廓规划、状态字和模式显示由库负责；外部模型使用 counts
+兼容帧或 `motor_drive_` SI 接口，不直接使用下表的 OD 输入/输出。设备适配层负责原始
+单位和故障转换。当前 PP 绑定使用 `0x6064`，不将其别名为 `0x6063`，也未实现下表的
+其他模式或遥测；目标设备的位置语义仍需单独核对。
 
 | 模型输入 | OD 地址 / 表示 | 维护注意事项 |
 | --- | --- | --- |

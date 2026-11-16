@@ -19,6 +19,7 @@ constexpr uint16_t cw_halt = 0x100;
 
 constexpr uint16_t sw_remote = 0x0200;
 constexpr uint16_t sw_target_reached = 0x0400;
+constexpr uint16_t sw_internal_limit = 0x0800;
 constexpr uint16_t sw_setpoint_ack_or_speed = 0x1000;
 
 bool shutdown_request(uint16_t cw) { return (cw & 0x87) == 0x06; }
@@ -424,6 +425,7 @@ Status Drive::status() const {
 
     uint16_t sw = base_statusword(pds_) | sw_remote;
     if (target_reached_) sw |= sw_target_reached;
+    if (s.feedback_fresh && feedback_.limited) sw |= sw_internal_limit;
     if (mode_display_ == mode_profile_position && pp_setpoint_ack_) sw |= sw_setpoint_ack_or_speed;
     s.statusword = sw;
     return s;

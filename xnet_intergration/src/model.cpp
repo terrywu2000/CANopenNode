@@ -49,7 +49,7 @@ uint64_t unsigned_number(const Json& j, uint64_t maximum, const std::string& whe
     return value;
 }
 
-static void keys(const Json& j, std::initializer_list<const char*> allowed, const std::string& where) {
+void keys(const Json& j, std::initializer_list<const char*> allowed, const std::string& where) {
     // Reject misspelled options instead of silently accepting a different setup.
     require(j.is_object(), XNET_CO_MODEL_ERROR, where + ": expected object");
     for (auto it = j.begin(); it != j.end(); ++it) {
@@ -214,7 +214,12 @@ void Model::load(const Json& root) {
         const auto& drive = root.at("drive_402");
         keys(drive, {"profile", "model", "position_tolerance_counts", "target_reached_time_us",
                      "startup_timeout_us", "heartbeat_timeout_us", "feedback_timeout_us",
-                     "action_timeout_us", "command_max_age_us"}, "drive_402");
+                     "action_timeout_us", "command_max_age_us", "device_adapter"}, "drive_402");
+        drive_adapter.reset();
+        if (drive.contains("device_adapter")) {
+            drive_adapter.emplace();
+            drive_adapter->load(drive.at("device_adapter"));
+        }
         require(drive.at("profile").is_string() && drive.at("profile") == "PP",
                 XNET_CO_MODEL_ERROR, "drive_402.profile must be PP in this release");
         require(drive.at("model").is_string()
@@ -249,6 +254,7 @@ void Model::load(const Json& root) {
             }
         }
     } else {
+        drive_adapter.reset();
         drive_402_external = false;
         drive_has_error_code = false;
         drive_has_quick_stop_deceleration = false;
@@ -534,6 +540,7 @@ void Model::load(const Json& root) {
                         XNET_CO_MODEL_ERROR, where.str() + ": invalid local_write permission");
             }
         }
+        if (drive_adapter) drive_adapter->bind(*this);
     }
     // OD_find uses binary search. Publish pointers only after all owning storage is finalized.
     std::sort(objects.begin(), objects.end(), [](const auto& a, const auto& b) { return a->index < b->index; });

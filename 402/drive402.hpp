@@ -33,6 +33,7 @@ struct Feedback {
     int32_t position = 0; /**< Actual position in counts. */
     int32_t velocity = 0; /**< Actual velocity in counts/s. */
     bool fault = false; /**< Model-reported fault; forces the drive into fault reaction. */
+    bool limited = false; /**< Model limit condition used for Statusword bit 11. */
 };
 
 /** Motor model boundary. Implementations are driven under the device runtime mutex. */
