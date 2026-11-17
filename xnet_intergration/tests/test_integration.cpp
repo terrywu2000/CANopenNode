@@ -340,20 +340,8 @@ xco::Json external_drive_402_model() {
     j["drive_402"]["feedback_timeout_us"] = 1000000;
     j["drive_402"]["action_timeout_us"] = 1000000;
     j["drive_402"]["command_max_age_us"] = 100000;
-    auto octets = [](uint16_t index, uint32_t size, bool local_write) {
-        return xco::Json{{"index", index}, {"type", "OCTET_STRING"}, {"size", size},
-            {"value", xco::Json::array()}, {"access", "ro"}, {"local_write", local_write}};
-    };
-    auto add_scalar = [&](uint16_t index, const char* type, bool local_write) {
-        j["objects"].push_back({{"index", index}, {"type", type}, {"value", 0},
-            {"access", "ro"}, {"local_write", local_write}});
-    };
-    add_scalar(0x2f00, "UNSIGNED16", false);
-    add_scalar(0x2f01, "UNSIGNED32", true);
-    j["objects"].push_back(octets(0x2f02, CO_402_COMMAND_FRAME_SIZE, false));
-    j["objects"].push_back(octets(0x2f03, CO_402_FEEDBACK_FRAME_SIZE, true));
-    add_scalar(0x2f04, "UNSIGNED32", false);
-    add_scalar(0x2f05, "UNSIGNED16", false);
+    j["drive_402"]["device_adapter"] = {{"unit_profile", "counts"}, {"counts_per_revolution", 10000},
+        {"fault_mapping", {{{"class", 2}, {"detail", 7}, {"device_code", "0x2310"}}}}};
     return j;
 }
 
@@ -395,8 +383,9 @@ void drive_402_model_validation() {
     auto external = external_drive_402_model();
     xco::Model external_model; external_model.load(external);
     CHECK(external_model.drive_402_external);
-    bad = external; bad["objects"].erase(14); CHECK(rejects(bad));
-    bad = external; bad["objects"][13]["local_write"] = false; CHECK(rejects(bad));
+    for (uint16_t index = 0x2f00; index <= 0x2f05; ++index)
+        CHECK(OD_find(&external_model.od, index) == nullptr);
+    bad = external; bad["drive_402"].erase("device_adapter"); CHECK(rejects(bad));
     bad = external; bad["drive_402"]["feedback_timeout_us"] = 0; CHECK(rejects(bad));
 }
 
@@ -545,13 +534,26 @@ void motor_drive_si_exchange() {
     changed.executed_step.model_time_s += 0.002;
     CHECK(motor_drive_submit_v1(port, &changed, sizeof(changed)) == MOTOR_DRIVE_BUSY);
     uint32_t alive = 99;
-    CHECK(xnet_canopen_write_od(fixture.device, 0x2f01, 0, reinterpret_cast<uint8_t*>(&alive), sizeof(alive)) == XNET_CO_ACCESS_ERROR);
+    CHECK(xnet_canopen_write_od(fixture.device, 0x2f01, 0, reinterpret_cast<uint8_t*>(&alive), sizeof(alive)) == XNET_CO_NOT_FOUND);
     tick();
     CHECK(scalar(0x6064) == 2600 && scalar(0x606c) == 491520);
     CHECK((fixture.device->drive_402->status().statusword & 0x0800) != 0);
     CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK);
     CHECK(view.processed_feedback_seq == 1 && view.processed_result == MOTOR_DRIVE_PROCESSED_ACCEPTED);
     CHECK(scalar(0x6081) == 546133 && scalar(0x6083) == 100000 && scalar(0x607a) == 0);
+    uint16_t index = 0x6041;
+    uint8_t subindex = 0;
+    uint32_t type = 0, size = 0, total = 0, batch = 0;
+    CHECK(xnet_canopen_bind_batch(fixture.device, &index, &subindex, 1, &type, &size, &total, &batch) == XNET_CO_OK);
+    fixture.device->shutdown_joining = true;
+    uint8_t status_bytes[2]{};
+    int32_t entry_status = 0;
+    const auto od_during_stop = xnet_canopen_read_od(fixture.device, index, 0, status_bytes, sizeof(status_bytes), &size);
+    const auto batch_during_stop = xnet_canopen_read_batch(fixture.device, batch, status_bytes, sizeof(status_bytes), &entry_status, 1);
+    const auto port_during_stop = motor_drive_read_v1(port, &request, &view, sizeof(view));
+    fixture.device->shutdown_joining = false;
+    CHECK(od_during_stop == XNET_CO_INVALID_STATE && batch_during_stop == XNET_CO_INVALID_STATE);
+    CHECK(port_during_stop == MOTOR_DRIVE_OK);
     const auto accepted_time = fixture.device->drive_feedback_accepted_at;
     CHECK(motor_drive_submit_v1(port, &feedback, sizeof(feedback)) == MOTOR_DRIVE_OK);
     CHECK(fixture.device->drive_feedback_accepted_at == accepted_time && !fixture.device->drive_feedback_pending);
@@ -572,7 +574,7 @@ void motor_drive_si_exchange() {
     invalid.fault_class = 2; invalid.fault_detail = 7;
     CHECK(motor_drive_submit_v1(port, &invalid, sizeof(invalid)) == MOTOR_DRIVE_OK);
     tick();
-    CHECK(scalar(0x2f00) == 0x2310 && fixture.device->drive_402->status().model_fault);
+    CHECK(scalar(0x603f) == 0x2310 && fixture.device->drive_402->status().model_fault);
     CHECK((fixture.device->drive_402->status().statusword & 0x0800) == 0);
     CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK);
     invalid.source = view.token; ++invalid.feedback_seq;
@@ -589,14 +591,16 @@ void motor_drive_si_exchange() {
     }
     tick();
     CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK && view.token.epoch > old_token.epoch);
+    CHECK(view.processed_feedback_seq == 0 && view.processed_result == MOTOR_DRIVE_PROCESSED_NONE);
+    CHECK(!fixture.device->drive_has_heartbeat);
     CHECK(motor_drive_heartbeat_v1(port, &old_token, &feedback.executed_step, 1) == MOTOR_DRIVE_STALE);
     CHECK(motor_drive_submit_v1(port, &feedback, sizeof(feedback)) == MOTOR_DRIVE_STALE);
     CHECK(motor_drive_heartbeat_v1(port, &view.token, &feedback.executed_step, 1) == MOTOR_DRIVE_OK);
-    CHECK(fixture.device->drive_has_heartbeat); // Authenticated new epoch can reuse the wire heartbeat baseline.
+    CHECK(fixture.device->drive_has_heartbeat);
     auto unmapped = feedback; unmapped.source = view.token; unmapped.fault_class = 99;
     CHECK(motor_drive_submit_v1(port, &unmapped, sizeof(unmapped)) == MOTOR_DRIVE_INVALID_FEEDBACK);
     tick();
-    CHECK(fixture.device->drive_402->status().model_fault && scalar(0x2f00) == CO_EMC_GENERIC);
+    CHECK(fixture.device->drive_402->status().model_fault);
     CHECK(scalar(0x603f) == CO_EMC_GENERIC && CO_isError(fixture.device->co->em, CO_EM_GENERIC_ERROR));
     CHECK(xnet_canopen_uninitialize(fixture.device) == XNET_CO_OK);
     CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_INVALID_STATE);
@@ -689,213 +693,41 @@ void drive_402_external_exchange() {
     Fixture f;
     auto external = external_drive_402_model();
     external["objects"].erase(0);
+    for (uint16_t index = 0x2f00; index <= 0x2f05; ++index)
+        external["objects"].push_back({{"index", index}, {"type", "UNSIGNED32"},
+            {"value", 42}, {"access", "rw"}, {"local_write", true}});
     f.model(external);
     CHECK(f.initialize() == XNET_CO_OK);
-    f.start();
-
-    std::array<uint8_t, CO_402_COMMAND_FRAME_SIZE> command_bytes{};
-    CO_402_command_frame_t command{};
-    wait_for([&] {
-        uint32_t size = 0;
-        if (xnet_canopen_read_od(f.device, 0x2f02, 0, command_bytes.data(),
-                command_bytes.size(), &size) != XNET_CO_OK || size != command_bytes.size()) return false;
-        return CO_402_command_unpack(&command, command_bytes.data(), command_bytes.size());
-    });
-    CHECK(command.epoch != 0 && command.command_seq != 0);
-
-    const uint32_t heartbeat = 1;
-    std::array<uint8_t, sizeof(heartbeat)> heartbeat_bytes{};
-    for (size_t i = 0; i < heartbeat_bytes.size(); ++i)
-        heartbeat_bytes[i] = static_cast<uint8_t>(heartbeat >> (8 * i));
-    CHECK(xnet_canopen_write_od(f.device, 0x2f01, 0, heartbeat_bytes.data(), heartbeat_bytes.size()) == XNET_CO_OK);
-
-    CO_402_feedback_frame_t feedback{};
-    feedback.epoch = command.epoch;
-    feedback.feedback_seq = 1;
-    feedback.command_seq = command.command_seq;
-    feedback.action_seq = command.action_seq;
-    feedback.actual_position = 12;
-    feedback.actual_velocity = 0;
-    feedback.flags = 0x15; // position valid, PP ready, reset permitted
-    std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> feedback_bytes{};
-    CHECK(CO_402_feedback_pack(&feedback, feedback_bytes.data(), feedback_bytes.size()));
-    CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, feedback_bytes.data(), feedback_bytes.size()) == XNET_CO_OK);
-    wait_for([&] {
-        uint32_t size = 0;
-        std::array<uint8_t, 4> processed{};
-        if (xnet_canopen_read_od(f.device, 0x2f04, 0, processed.data(), processed.size(), &size) != XNET_CO_OK)
-            return false;
-        uint32_t seq = 0;
-        std::memcpy(&seq, processed.data(), sizeof(seq));
-        return seq == feedback.feedback_seq;
-    });
-    std::array<uint8_t, 2> result_bytes{};
-    uint32_t result_size = 0;
-    CHECK(xnet_canopen_read_od(f.device, 0x2f05, 0, result_bytes.data(), result_bytes.size(), &result_size) == XNET_CO_OK);
-    uint16_t result = 0;
-    std::memcpy(&result, result_bytes.data(), sizeof(result));
-    CHECK(result_size == result_bytes.size() && result == 1);
-    CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, feedback_bytes.data(), feedback_bytes.size()) == XNET_CO_OK);
-
-    feedback.feedback_seq = 2;
-    feedback.flags |= 0x20; // reserved bit
-    CHECK(!CO_402_feedback_pack(&feedback, feedback_bytes.data(), feedback_bytes.size()));
-    feedback.flags &= ~0x20;
-    feedback.feedback_seq = 1; // reused sequence with different contents
-    feedback.actual_position = 13;
-    CHECK(CO_402_feedback_pack(&feedback, feedback_bytes.data(), feedback_bytes.size()));
-    CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, feedback_bytes.data(), feedback_bytes.size()) == XNET_CO_ACCESS_ERROR);
-    feedback.feedback_seq = 2;
-    feedback.epoch = command.epoch + 1;
-    CHECK(CO_402_feedback_pack(&feedback, feedback_bytes.data(), feedback_bytes.size()));
-    CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, feedback_bytes.data(), feedback_bytes.size()) == XNET_CO_OK);
-    wait_for([&] {
-        std::array<uint8_t, 4> processed{};
-        std::array<uint8_t, 2> result{};
-        uint32_t size = 0;
-        if (xnet_canopen_read_od(f.device, 0x2f04, 0, processed.data(), processed.size(), &size) != XNET_CO_OK
-            || size != processed.size()) return false;
-        uint32_t seq = 0;
-        std::memcpy(&seq, processed.data(), sizeof(seq));
-        if (seq != feedback.feedback_seq) return false;
-        if (xnet_canopen_read_od(f.device, 0x2f05, 0, result.data(), result.size(), &size) != XNET_CO_OK
-            || size != result.size()) return false;
-        uint16_t code = 0;
-        std::memcpy(&code, result.data(), sizeof(code));
-        return code == 3;
-    });
-    std::array<uint8_t, 4> actual_position_bytes{};
-    uint32_t actual_position_size = 0;
-    CHECK(xnet_canopen_read_od(f.device, 0x6064, 0, actual_position_bytes.data(),
-        actual_position_bytes.size(), &actual_position_size) == XNET_CO_OK);
-    int32_t actual_position = 0;
-    std::memcpy(&actual_position, actual_position_bytes.data(), sizeof(actual_position));
-    CHECK(actual_position_size == actual_position_bytes.size() && actual_position == 12);
-
-    std::atomic<bool> model_running{true};
-    std::atomic<bool> model_failed{false};
-    std::thread model_thread([&] {
-        uint32_t heartbeat_count = 1;
-        uint32_t feedback_seq = 2;
-        uint32_t pending_seq = 0;
-        std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> pending_bytes{};
-        bool pending = false;
-        while (model_running) {
-            std::array<uint8_t, CO_402_COMMAND_FRAME_SIZE> latest_bytes{};
-            CO_402_command_frame_t latest{};
-            uint32_t size = 0;
-            if (xnet_canopen_read_od(f.device, 0x2f02, 0, latest_bytes.data(), latest_bytes.size(), &size) != XNET_CO_OK
-                || size != latest_bytes.size() || !CO_402_command_unpack(&latest, latest_bytes.data(), latest_bytes.size())) {
-                model_failed = true;
-                break;
-            }
-            ++heartbeat_count;
-            std::array<uint8_t, 4> heartbeat_value{};
-            for (size_t i = 0; i < heartbeat_value.size(); ++i)
-                heartbeat_value[i] = static_cast<uint8_t>(heartbeat_count >> (8 * i));
-            if (xnet_canopen_write_od(f.device, 0x2f01, 0, heartbeat_value.data(), heartbeat_value.size()) != XNET_CO_OK) {
-                model_failed = true;
-                break;
-            }
-            if (pending) {
-                std::array<uint8_t, 4> processed_bytes{};
-                uint32_t processed_size = 0, processed = 0;
-                if (xnet_canopen_read_od(f.device, 0x2f04, 0, processed_bytes.data(),
-                        processed_bytes.size(), &processed_size) != XNET_CO_OK || processed_size != processed_bytes.size()) {
-                    model_failed = true;
-                    break;
-                }
-                std::memcpy(&processed, processed_bytes.data(), sizeof(processed));
-                if (processed == pending_seq) pending = false;
-            }
-            if (!pending) {
-                ++feedback_seq;
-                if (feedback_seq == 0) ++feedback_seq;
-                feedback.epoch = latest.epoch;
-                feedback.feedback_seq = feedback_seq;
-                feedback.command_seq = latest.command_seq;
-                feedback.action_seq = latest.action_seq;
-                feedback.actual_position = latest.demand_position;
-                feedback.actual_velocity = latest.demand_velocity;
-                feedback.action_result = latest.action == CO_402_ACTION_NONE
-                    ? CO_402_ACTION_RESULT_NONE : CO_402_ACTION_RESULT_DONE;
-                feedback.flags = 0x17;
-                if (!CO_402_feedback_pack(&feedback, pending_bytes.data(), pending_bytes.size())) {
-                    model_failed = true;
-                    break;
-                }
-                pending_seq = feedback_seq;
-                pending = true;
-            }
-            const auto write_result = xnet_canopen_write_od(f.device, 0x2f03, 0,
-                pending_bytes.data(), pending_bytes.size());
-            if (write_result != XNET_CO_OK && write_result != XNET_CO_ACCESS_ERROR) {
-                model_failed = true;
-                break;
-            }
-            std::this_thread::sleep_for(1ms);
-        }
-    });
-
-    operational(f);
-    CHECK(sdo_download(0x6040, 0, 0x06, 2).Payload[0] == 0x60);
-    CHECK(sdo_download(0x6040, 0, 0x07, 2).Payload[0] == 0x60);
-    CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
-    wait_for([&] { return (sdo_upload(0x6041) & 0x006f) == 0x0027; });
-    CHECK(sdo_download(0x607a, 0, 1000, 4).Payload[0] == 0x60);
-    CHECK(sdo_download(0x6040, 0, 0x1f, 2).Payload[0] == 0x60);
-    CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
-    wait_for([&] { return sdo_upload(0x6064) == 1000; });
-
-    uint32_t resets_before = f.status().reset_communication_count;
-    CO_402_command_frame_t before_reset{};
-    uint32_t command_size = 0;
-    CHECK(xnet_canopen_read_od(f.device, 0x2f02, 0, command_bytes.data(),
-        command_bytes.size(), &command_size) == XNET_CO_OK);
-    CHECK(command_size == command_bytes.size());
-    CHECK(CO_402_command_unpack(&before_reset, command_bytes.data(), command_bytes.size()));
-    exchange(0, {0x82, static_cast<uint8_t>(f.status().active_node_id)}, 0x70a, 0);
-    wait_for([&] { return f.status().reset_communication_count == resets_before + 1; });
-    wait_for([&] {
-        uint32_t size = 0;
-        if (xnet_canopen_read_od(f.device, 0x2f02, 0, command_bytes.data(),
-                command_bytes.size(), &size) != XNET_CO_OK || size != command_bytes.size()) return false;
-        CO_402_command_frame_t after_reset{};
-        return CO_402_command_unpack(&after_reset, command_bytes.data(), command_bytes.size())
-            && after_reset.epoch > before_reset.epoch;
-    });
-    operational(f);
-    CHECK(sdo_download(0x6040, 0, 0x06, 2).Payload[0] == 0x60);
-    CHECK(sdo_download(0x6040, 0, 0x07, 2).Payload[0] == 0x60);
-    CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
-    wait_for([&] { return (sdo_upload(0x6041) & 0x006f) == 0x0027; });
-    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
-    model_running = false;
-    model_thread.join();
-    CHECK(!model_failed);
-    if (f.status().runtime_state != XNET_CO_RUNTIME_STOPPED) {
-        const auto drive_status = f.device->drive_402->status();
-        uint16_t processed_result = 0;
-        uint32_t processed_seq = 0;
-        std::memcpy(&processed_result, f.device->model->value(0x2f05, 0).data(), sizeof(processed_result));
-        std::memcpy(&processed_seq, f.device->model->value(0x2f04, 0).data(), sizeof(processed_seq));
-        std::array<uint8_t, CO_402_COMMAND_FRAME_SIZE> command_frame_bytes{};
-        CO_402_command_frame_t command_frame{};
-        std::memcpy(command_frame_bytes.data(), f.device->model->value(0x2f02, 0).data(), command_frame_bytes.size());
-        CO_402_command_unpack(&command_frame, command_frame_bytes.data(), command_frame_bytes.size());
-        throw std::runtime_error("external stop did not reach STOPPED: " + diagnostic(f.device)
-            + ", pds=" + std::to_string(static_cast<unsigned>(drive_status.pds))
-            + ", action=" + std::to_string(drive_status.action)
-            + ", action_seq=" + std::to_string(drive_status.action_seq)
-            + ", pending=" + std::to_string(drive_status.action_pending)
-            + ", feedback_fresh=" + std::to_string(drive_status.feedback_fresh)
-            + ", submitted_seq=" + std::to_string(f.device->drive_last_submitted_seq)
-            + ", processed_seq=" + std::to_string(processed_seq)
-            + ", result=" + std::to_string(processed_result)
-            + ", cmd_action=" + std::to_string(command_frame.action)
-            + ", cmd_action_seq=" + std::to_string(command_frame.action_seq)
-            + ", fault=" + std::to_string(f.device->drive_current_fault));
+    motor_drive_endpoint_handle endpoint = nullptr;
+    motor_drive_port_handle port = nullptr;
+    CHECK(xnet_canopen_get_motor_drive_endpoint(f.device, &endpoint) == XNET_CO_OK);
+    CHECK(motor_drive_open_v1(endpoint, &port) == MOTOR_DRIVE_OK);
+    std::unique_ptr<motor_drive_port, decltype(&motor_drive_close_v1)> owned(port, motor_drive_close_v1);
+    f.device->process_drive_402(0);
+    motor_drive_read_request_v1 request{};
+    request.abi_version = 1; request.struct_size = sizeof(request); request.flags = MOTOR_DRIVE_READ_ASYNC;
+    motor_drive_view_v1 view{};
+    CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK);
+    motor_drive_feedback_v1 feedback{};
+    feedback.abi_version = 1; feedback.struct_size = sizeof(feedback);
+    feedback.source = view.token; feedback.executed_step = {1, 1, 1, 0.002, 0.002, {}};
+    feedback.feedback_seq = 1; feedback.flags = 0x17;
+    feedback.actual_position_rad = 12 * 6.2831853071795864769 / 10000;
+    CHECK(motor_drive_heartbeat_v1(port, &feedback.source, &feedback.executed_step, 1) == MOTOR_DRIVE_OK);
+    CHECK(motor_drive_submit_v1(port, &feedback, sizeof(feedback)) == MOTOR_DRIVE_OK);
+    f.device->process_drive_402(0);
+    CHECK(f.device->drive_402->status().actual_position == 12);
+    CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK);
+    CHECK(view.processed_feedback_seq == 1 && view.processed_result == MOTOR_DRIVE_PROCESSED_ACCEPTED);
+    for (uint16_t index = 0x2f00; index <= 0x2f05; ++index) {
+        uint32_t value = 0, size = 0;
+        CHECK(xnet_canopen_read_od(f.device, index, 0, reinterpret_cast<uint8_t*>(&value), sizeof(value), &size) == XNET_CO_OK);
+        CHECK(value == 42);
+        value = 43;
+        CHECK(xnet_canopen_write_od(f.device, index, 0, reinterpret_cast<uint8_t*>(&value), sizeof(value)) == XNET_CO_OK);
     }
+    f.start();
+    CHECK(sdo_upload(0x2f03) == 43); // These indices belong to the device again, not the model transport.
 }
 
 void drive_402_watchdog_deadlines() {
@@ -905,17 +737,21 @@ void drive_402_watchdog_deadlines() {
     external["drive_402"]["action_timeout_us"] = 50000;
     f.model(external);
     CHECK(f.initialize() == XNET_CO_OK);
+    motor_drive_endpoint_handle endpoint = nullptr;
+    motor_drive_port_handle port = nullptr;
+    CHECK(xnet_canopen_get_motor_drive_endpoint(f.device, &endpoint) == XNET_CO_OK);
+    CHECK(motor_drive_open_v1(endpoint, &port) == MOTOR_DRIVE_OK);
+    std::unique_ptr<motor_drive_port, decltype(&motor_drive_close_v1)> owned(port, motor_drive_close_v1);
     const auto tick = [&](uint32_t dt = 0) {
         std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
         f.device->process_drive_402(dt);
     };
     const auto command = [&] {
-        std::array<uint8_t, CO_402_COMMAND_FRAME_SIZE> bytes{};
-        uint32_t size = 0;
-        CHECK(xnet_canopen_read_od(f.device, 0x2f02, 0, bytes.data(), bytes.size(), &size) == XNET_CO_OK);
-        CO_402_command_frame_t frame{};
-        CHECK(CO_402_command_unpack(&frame, bytes.data(), size));
-        return frame;
+        motor_drive_read_request_v1 request{};
+        request.abi_version = 1; request.struct_size = sizeof(request); request.flags = MOTOR_DRIVE_READ_ASYNC;
+        motor_drive_view_v1 view{};
+        CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK);
+        return view;
     };
     const auto scalar = [&](uint16_t index) {
         std::array<uint8_t, 4> bytes{};
@@ -925,24 +761,25 @@ void drive_402_watchdog_deadlines() {
         return value;
     };
     uint32_t seq = 0, heartbeat = 0;
-    std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> last_submission{};
-    const auto submit = [&](CO_402_command_frame_t source, uint8_t result = CO_402_ACTION_RESULT_NONE,
-                            uint16_t fault = 0, int32_t position = 123, bool consume = true) {
-        std::array<uint8_t, 4> alive{};
+    motor_drive_feedback_v1 last_submission{};
+    const auto submit = [&](motor_drive_view_v1 source, uint8_t result = CO_402_ACTION_RESULT_NONE,
+                            uint16_t fault = 0, int32_t position = 123, bool consume = true,
+                            int32_t expected = MOTOR_DRIVE_OK) {
         ++heartbeat;
-        for (size_t i = 0; i < alive.size(); ++i) alive[i] = static_cast<uint8_t>(heartbeat >> (8 * i));
-        CHECK(xnet_canopen_write_od(f.device, 0x2f01, 0, alive.data(), alive.size()) == XNET_CO_OK);
-        CO_402_feedback_frame_t frame{};
-        frame.epoch = source.epoch;
+        motor_drive_model_step_v1 progress{1, heartbeat, heartbeat, heartbeat * 0.002, 0.002, {}};
+        CHECK(motor_drive_heartbeat_v1(port, &source.token, &progress, heartbeat) == MOTOR_DRIVE_OK);
+        motor_drive_feedback_v1 frame{};
+        frame.abi_version = 1; frame.struct_size = sizeof(frame);
+        frame.source = source.token;
+        frame.executed_step = progress;
         frame.feedback_seq = ++seq;
-        frame.command_seq = source.command_seq;
-        frame.action_seq = source.action_seq;
-        frame.actual_position = position;
+        frame.actual_position_rad = position * 6.2831853071795864769 / 10000;
         frame.flags = 0x17;
-        frame.fault_code = fault;
+        frame.fault_class = fault ? 2 : 0;
+        frame.fault_detail = fault ? 7 : 0;
         frame.action_result = result;
-        CHECK(CO_402_feedback_pack(&frame, last_submission.data(), last_submission.size()));
-        CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, last_submission.data(), last_submission.size()) == XNET_CO_OK);
+        last_submission = frame;
+        CHECK(motor_drive_submit_v1(port, &last_submission, sizeof(last_submission)) == expected);
         if (consume) tick();
     };
     const auto expire_feedback = [&](bool retry = false) {
@@ -951,7 +788,7 @@ void drive_402_watchdog_deadlines() {
             f.device->drive_feedback_accepted_at = xco::Clock::now() - 20ms;
         }
         if (retry)
-            CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, last_submission.data(), last_submission.size()) == XNET_CO_OK);
+            CHECK(motor_drive_submit_v1(port, &last_submission, sizeof(last_submission)) == MOTOR_DRIVE_OK);
         tick();
     };
     const auto expire_action = [&] {
@@ -980,9 +817,9 @@ void drive_402_watchdog_deadlines() {
     expire_action();
     auto status = f.device->drive_402->status();
     CHECK(status.pds == xco::d402::Pds::fault && status.reaction_unconfirmed && !status.action_pending);
-    CHECK(command().action_seq != reaction.action_seq && scalar(0x6064) == 123);
-    submit(reaction, CO_402_ACTION_RESULT_DONE, 0, 999);
-    CHECK(scalar(0x2f05) == 3 && scalar(0x6064) == 123);
+    CHECK(command().token.action_seq != reaction.token.action_seq && scalar(0x6064) == 123);
+    submit(reaction, CO_402_ACTION_RESULT_DONE, 0, 999, true, MOTOR_DRIVE_STALE);
+    CHECK(scalar(0x6064) == 123);
     CHECK(!f.device->drive_402->status().feedback_fresh && scalar(0x603f) == 0x8130);
 
     submit(command());
@@ -1020,7 +857,7 @@ void drive_402_watchdog_deadlines() {
         f.device->drive_pending_submitted_at = f.device->drive_action_started + 49999us;
     }
     tick(); // Completion received before the deadline remains valid if worker consumption is late.
-    CHECK(scalar(0x2f05) == 1 && scalar(0x603f) == 0);
+    CHECK(command().processed_result == MOTOR_DRIVE_PROCESSED_ACCEPTED && scalar(0x603f) == 0);
     CHECK(f.device->drive_402->status().pds == xco::d402::Pds::ready_to_switch_on);
     controlword(0);
     tick();
@@ -1038,7 +875,7 @@ void drive_402_watchdog_deadlines() {
                 + 50ms + std::chrono::microseconds(lateness_us);
         }
         tick();
-        CHECK(scalar(0x2f05) == 3);
+        CHECK(command().processed_result == MOTOR_DRIVE_PROCESSED_INVALID);
         CHECK(command().action == CO_402_ACTION_FAULT_REACTION && scalar(0x603f) == 0x8130);
         expire_action();
         submit(command());

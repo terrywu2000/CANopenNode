@@ -17,9 +17,12 @@
 
 namespace modsim {
 struct ExchangeApi {
-    decltype(&xnet_canopen_bind_batch) bind;
-    decltype(&xnet_canopen_read_batch) read;
-    decltype(&xnet_canopen_write_batch) write;
+    decltype(&xnet_canopen_get_motor_drive_endpoint) endpoint;
+    decltype(&motor_drive_open_v1) open;
+    decltype(&motor_drive_read_v1) read;
+    decltype(&motor_drive_submit_v1) submit;
+    decltype(&motor_drive_heartbeat_v1) heartbeat;
+    decltype(&motor_drive_close_v1) close;
     decltype(&xnet_canopen_stop) stop;
     decltype(&xnet_canopen_get_last_error) error;
 };
@@ -35,32 +38,28 @@ inline uint32_t little_endian(const uint8_t* bytes, unsigned size) {
 }
 
 struct Snapshot {
-    CO_402_command_frame_t command{};
-    CO_402_feedback_frame_t feedback{};
+    motor_drive_view_v1 command{};
+    motor_drive_feedback_v1 feedback{};
     uint64_t accepted = 0, rejected = 0, overruns = 0, epochs = 0;
     uint32_t pending_seq = 0;
     uint16_t processed_result = 0;
+    uint32_t heartbeat_seq = 0;
 };
 
 class Simulator {
 public:
     Simulator(ExchangeApi api, xnet_canopen_handle handle, Parameters parameters)
         : api_(api), handle_(handle), parameters_(parameters), motor_(parameters) {
-        const std::array<uint16_t, 3> indices{0x2f02, 0x2f04, 0x2f05};
-        const std::array<uint8_t, 3> subs{};
-        std::array<uint32_t, 3> types{}, sizes{};
-        uint32_t total = 0;
-        check(api_.bind(handle_, indices.data(), subs.data(), 3, types.data(), sizes.data(), &total, &command_id_),
-              "bind command_view");
-        if (types != std::array<uint32_t, 3>{XNET_CO_TYPE_OCTET_STRING, XNET_CO_TYPE_UNSIGNED32, XNET_CO_TYPE_UNSIGNED16}
-            || sizes != std::array<uint32_t, 3>{56, 4, 2} || total != command_size)
-            throw std::runtime_error("command_view binding does not match protocol v1");
-        feedback_id_ = bind_one(0x2f03, XNET_CO_TYPE_OCTET_STRING, CO_402_FEEDBACK_FRAME_SIZE);
-        heartbeat_id_ = bind_one(0x2f01, XNET_CO_TYPE_UNSIGNED32, 4);
+        motor_drive_endpoint_handle endpoint = nullptr;
+        check(api_.endpoint(handle_, &endpoint), "get motor endpoint");
+        check(api_.open(endpoint, &port_), "open motor port");
     }
     Simulator(const Simulator&) = delete;
     Simulator& operator=(const Simulator&) = delete;
-    ~Simulator() { stop(); }
+    ~Simulator() {
+        stop();
+        if (api_.close(port_) != MOTOR_DRIVE_OK) std::cerr << "Cannot close motor port\n";
+    }
 
     void start() {
         if (thread_.joinable()) throw std::runtime_error("model thread already started");
@@ -95,7 +94,6 @@ public:
 
 private:
     using Clock = std::chrono::steady_clock;
-    static constexpr uint32_t command_size = CO_402_COMMAND_FRAME_SIZE + 6;
     std::string diagnostic(const char* operation, int32_t result) const {
         int32_t code = 0;
         uint32_t required = 0;
@@ -107,53 +105,35 @@ private:
     void check(int32_t result, const char* operation) const {
         if (result != XNET_CO_OK) throw std::runtime_error(diagnostic(operation, result));
     }
-    uint32_t bind_one(uint16_t index, uint32_t expected_type, uint32_t expected_size) {
-        uint8_t sub = 0;
-        uint32_t type = 0, size = 0, total = 0, id = 0;
-        check(api_.bind(handle_, &index, &sub, 1, &type, &size, &total, &id), "bind model output");
-        if (type != expected_type || size != expected_size || total != expected_size)
-            throw std::runtime_error("model output binding does not match protocol v1");
-        return id;
-    }
-    template<size_t N>
-    int32_t write(uint32_t id, const std::array<uint8_t, N>& bytes, const char* operation, bool recoverable = false) {
-        int32_t entry = XNET_CO_INTERNAL_ERROR;
-        const auto result = api_.write(handle_, id, bytes.data(), N, &entry, 1);
-        if (result == XNET_CO_OK && entry == XNET_CO_OK) return XNET_CO_OK;
-        if (recoverable && result == XNET_CO_PARTIAL_FAILURE && entry == XNET_CO_ACCESS_ERROR) {
-            std::cerr << diagnostic(operation, entry) << "; will retry from a fresh command\n";
-            return entry;
-        }
-        check(result, operation);
-        check(entry, operation);
-        return XNET_CO_OK;
-    }
-    CO_402_command_frame_t read_view(std::array<uint8_t, command_size>& bytes) const {
-        std::array<int32_t, 3> entries{};
-        check(api_.read(handle_, command_id_, bytes.data(), bytes.size(), entries.data(), entries.size()), "read command_view");
-        for (auto entry : entries) check(entry, "read command_view entry");
-        CO_402_command_frame_t command{};
-        if (!CO_402_command_unpack(&command, bytes.data(), CO_402_COMMAND_FRAME_SIZE))
-            throw std::runtime_error("invalid command frame (requires an enabled external PP model)");
-        return command;
+    int32_t read_view(motor_drive_view_v1& view) const {
+        motor_drive_read_request_v1 request{};
+        request.abi_version = MOTOR_DRIVE_ABI_VERSION;
+        request.struct_size = sizeof(request);
+        request.flags = MOTOR_DRIVE_READ_ASYNC;
+        const auto result = api_.read(port_, &request, &view, sizeof(view));
+        if (result != MOTOR_DRIVE_NO_DATA) check(result, "read motor view");
+        return result;
     }
     void loop() {
         const auto begin = Clock::now();
         const auto period = std::chrono::microseconds(parameters_.period_us);
         auto next = begin;
-        uint64_t epoch = 0;
+        uint64_t epoch = 0, step = 0;
         uint32_t feedback_seq = 0, pending_seq = 0;
         Snapshot state{};
         while (running_) {
-            std::array<uint8_t, command_size> bytes{};
-            auto command = read_view(bytes);
-            if (epoch != command.epoch) {
-                epoch = command.epoch;
+            motor_drive_view_v1 command{};
+            if (read_view(command) == MOTOR_DRIVE_NO_DATA) {
+                std::this_thread::sleep_for(period);
+                continue;
+            }
+            if (epoch != command.token.epoch) {
+                epoch = command.token.epoch;
                 pending_seq = feedback_seq = 0;
                 ++state.epochs;
             }
-            state.processed_result = static_cast<uint16_t>(little_endian(bytes.data() + 60, 2));
-            if (pending_seq && little_endian(bytes.data() + 56, 4) == pending_seq) {
+            state.processed_result = static_cast<uint16_t>(command.processed_result);
+            if (pending_seq && command.processed_feedback_seq == pending_seq) {
                 if (state.processed_result == 1) ++state.accepted;
                 else if (state.processed_result == 2 || state.processed_result == 3) {
                     ++state.rejected;
@@ -164,11 +144,13 @@ private:
             const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - begin).count();
             auto candidate = motor_;
             auto feedback = candidate.step(command, static_cast<uint64_t>(elapsed));
-            const auto latest = read_view(bytes);
-            if (latest.epoch != command.epoch || latest.action_seq != command.action_seq
+            motor_drive_view_v1 latest{};
+            const auto latest_result = read_view(latest);
+            if (latest_result == MOTOR_DRIVE_NO_DATA) continue;
+            if (latest.token.epoch != command.token.epoch || latest.token.action_seq != command.token.action_seq
                 || latest.flags != command.flags || latest.mode != command.mode || latest.action != command.action) {
-                if (epoch != latest.epoch) {
-                    epoch = latest.epoch;
+                if (epoch != latest.token.epoch) {
+                    epoch = latest.token.epoch;
                     pending_seq = feedback_seq = 0;
                     ++state.epochs;
                 }
@@ -178,20 +160,24 @@ private:
             }
             // Revoke a superseded calculation before changing the simulated plant.
             motor_ = candidate;
+            ++step;
+            feedback.executed_step = {1, step, step, step * parameters_.period_us / 1e6,
+                parameters_.period_us / 1e6, {}};
             if (motor_.heartbeat_enabled(elapsed)) {
                 heartbeat_ = next_sequence(heartbeat_);
-                std::array<uint8_t, 4> alive{};
-                for (unsigned i = 0; i < alive.size(); ++i) alive[i] = static_cast<uint8_t>(heartbeat_ >> (8 * i));
-                write(heartbeat_id_, alive, "write model_alive");
+                const auto result = api_.heartbeat(port_, &command.token, &feedback.executed_step, heartbeat_);
+                if (result != MOTOR_DRIVE_STALE) check(result, "motor heartbeat");
+                state.heartbeat_seq = heartbeat_;
             }
             if (!pending_seq && motor_.feedback_enabled(elapsed)) {
                 feedback.feedback_seq = feedback_seq = next_sequence(feedback_seq);
-                std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> submission{};
-                if (!CO_402_feedback_pack(&feedback, submission.data(), submission.size()))
-                    throw std::runtime_error("cannot encode model feedback");
-                if (write(feedback_id_, submission, "write feedback_submit", true) == XNET_CO_OK)
+                const auto result = api_.submit(port_, &feedback, sizeof(feedback));
+                if (result == MOTOR_DRIVE_OK)
                     pending_seq = feedback.feedback_seq;
-                else ++state.rejected;
+                else if (result == MOTOR_DRIVE_STALE) {
+                    ++state.rejected;
+                    std::cerr << diagnostic("motor submit", result) << "; will retry from a fresh command\n";
+                } else check(result, "motor submit");
             }
             state.command = command;
             state.feedback = feedback;
@@ -213,7 +199,7 @@ private:
     xnet_canopen_handle handle_;
     Parameters parameters_;
     Motor motor_;
-    uint32_t command_id_ = 0, feedback_id_ = 0, heartbeat_id_ = 0;
+    motor_drive_port_handle port_ = nullptr;
     uint32_t heartbeat_ = 0;
     std::atomic<bool> running_{false}, failed_{false};
     std::thread thread_;

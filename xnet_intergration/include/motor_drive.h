@@ -148,7 +148,9 @@ typedef struct {
 } motor_drive_feedback_v1;
 
 /** Backend owns the endpoint; one port is the exclusive model writer.
+ * Exchange uses backend-private mailboxes, never local OD/batch channels.
  * Do not overlap close/destroy with calls. Close does not stop the drive.
+ * Keep an existing port exchanging during stop; close after the model joins.
  * Existing ports remain closable but cannot exchange after backend uninitialize.
  */
 MOTOR_DRIVE_API int32_t motor_drive_open_v1(

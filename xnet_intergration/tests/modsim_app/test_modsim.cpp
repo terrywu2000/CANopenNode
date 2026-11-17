@@ -11,6 +11,7 @@
 
 namespace {
 using namespace std::chrono_literals;
+constexpr double radians_per_count = 6.2831853071795864769 / 10000;
 void wait_until(const std::function<bool()>& predicate, unsigned line) {
     const auto deadline = std::chrono::steady_clock::now() + 3s;
     while (!predicate()) {
@@ -24,52 +25,53 @@ void wait_until(const std::function<bool()>& predicate, unsigned line) {
 void plant() {
     modsim::Parameters parameters;
     modsim::Motor motor(parameters);
-    CO_402_command_frame_t command{};
-    command.epoch = command.command_seq = command.action_seq = 1;
+    motor_drive_view_v1 command{};
+    command.token.epoch = command.token.command_seq = command.token.action_seq = 1;
     command.mode = 1;
     command.flags = 1;
-    command.target_position = 900000;
-    command.demand_position = 1000;
+    command.demand_position_rad = 1000 * radians_per_count;
     auto feedback = motor.step(command, 0);
-    CHECK(feedback.actual_position > 0 && feedback.actual_position < command.demand_position);
+    CHECK(feedback.actual_position_rad > 0 && feedback.actual_position_rad < command.demand_position_rad);
     for (int i = 0; i < 1000; ++i) feedback = motor.step(command, i * parameters.period_us);
-    CHECK(std::abs(feedback.actual_position - 1000) <= 1);
-    command.demand_position = -1000;
+    CHECK(std::abs(feedback.actual_position_rad / radians_per_count - 1000) <= 1);
+    command.demand_position_rad = -1000 * radians_per_count;
     for (int i = 0; i < 1000; ++i) feedback = motor.step(command, i * parameters.period_us);
-    CHECK(std::abs(feedback.actual_position + 1000) <= 1);
-    command.demand_position = INT32_MAX;
+    CHECK(std::abs(feedback.actual_position_rad / radians_per_count + 1000) <= 1);
+    command.demand_position_rad = INT32_MAX * radians_per_count;
     for (int i = 0; i < 3000; ++i) feedback = motor.step(command, i * parameters.period_us);
-    CHECK(feedback.actual_position == parameters.max_position && (feedback.flags & 8));
-    command.epoch = 2;
+    CHECK(feedback.actual_position_rad == parameters.max_position && feedback.limit_flags);
+    command.token.epoch = 2;
     command.flags = 0;
-    command.action = CO_402_ACTION_ENABLE_OPERATION;
+    command.action = MOTOR_DRIVE_ACTION_ENABLE_OPERATION;
     feedback = motor.step(command, 0);
-    CHECK(feedback.action_result == CO_402_ACTION_RESULT_BUSY);
-    command.action = CO_402_ACTION_DISABLE_VOLTAGE;
-    ++command.action_seq;
+    CHECK(feedback.action_result == MOTOR_DRIVE_RESULT_BUSY);
+    command.action = MOTOR_DRIVE_ACTION_DISABLE_VOLTAGE;
+    ++command.token.action_seq;
     feedback = motor.step(command, 0);
-    CHECK(feedback.action_result == CO_402_ACTION_RESULT_BUSY);
-    CHECK(feedback.actual_position == parameters.max_position);
+    CHECK(feedback.action_result == MOTOR_DRIVE_RESULT_BUSY);
+    CHECK(feedback.actual_position_rad == parameters.max_position);
     for (int i = 0; i < 10; ++i) feedback = motor.step(command, 0);
-    CHECK(feedback.action_result == CO_402_ACTION_RESULT_DONE);
+    CHECK(feedback.action_result == MOTOR_DRIVE_RESULT_DONE);
 
-    parameters.initial_position = INT32_MIN;
-    parameters.min_position = INT32_MIN;
-    parameters.max_position = INT32_MAX;
-    parameters.fault_code = 0x2310;
+    parameters.initial_position = INT32_MIN * radians_per_count;
+    parameters.min_position = parameters.initial_position;
+    parameters.max_position = INT32_MAX * radians_per_count;
+    parameters.fault_class = MOTOR_DRIVE_FAULT_OVERCURRENT;
+    parameters.fault_detail = 7;
     parameters.fault_after_us = 20000;
     parameters.fault_duration_us = 20000;
     parameters.freeze_feedback_after_us = 10000;
-    parameters.error_action = CO_402_ACTION_SWITCH_ON;
+    parameters.error_action = MOTOR_DRIVE_ACTION_SWITCH_ON;
     modsim::Motor faulty(parameters);
-    command.action = CO_402_ACTION_NONE;
+    command.action = MOTOR_DRIVE_ACTION_NONE;
     feedback = faulty.step(command, 20000);
-    CHECK(feedback.actual_position == INT32_MIN && feedback.fault_code == 0x2310 && !(feedback.flags & 0x10));
+    CHECK(feedback.actual_position_rad == parameters.initial_position
+        && feedback.fault_class == MOTOR_DRIVE_FAULT_OVERCURRENT && !(feedback.flags & 0x10));
     feedback = faulty.step(command, 40000);
-    CHECK(feedback.fault_code == 0 && (feedback.flags & 0x10));
-    command.action = CO_402_ACTION_SWITCH_ON;
+    CHECK(feedback.fault_class == 0 && (feedback.flags & 0x10));
+    command.action = MOTOR_DRIVE_ACTION_SWITCH_ON;
     feedback = faulty.step(command, 40000);
-    CHECK(feedback.action_result == CO_402_ACTION_RESULT_ERROR);
+    CHECK(feedback.action_result == MOTOR_DRIVE_RESULT_ERROR);
     CHECK(!faulty.feedback_enabled(10000) && faulty.heartbeat_enabled(10000));
     CHECK(modsim::next_sequence(UINT32_MAX) == 1);
 }
@@ -101,7 +103,8 @@ struct Device {
     }
 };
 modsim::ExchangeApi api() {
-    return {xnet_canopen_bind_batch, xnet_canopen_read_batch, xnet_canopen_write_batch,
+    return {xnet_canopen_get_motor_drive_endpoint, motor_drive_open_v1, motor_drive_read_v1,
+            motor_drive_submit_v1, motor_drive_heartbeat_v1, motor_drive_close_v1,
             xnet_canopen_stop, xnet_canopen_get_last_error};
 }
 void rpdo(uint16_t controlword, int32_t target = 0) {
@@ -142,20 +145,20 @@ void motion_and_reset() {
         return false;
     });
     rpdo(0x1f, 10000);
-    wait_for([&] { return simulator.snapshot().feedback.actual_velocity > 100; });
+    wait_for([&] { return simulator.snapshot().feedback.actual_velocity_rad_s > 100 * radians_per_count; });
     rpdo(0x0b, 10000);
     wait_for([&] { return (device.read(0x6041, 2) & 0x6f) == 0x40; });
-    CHECK(std::abs(simulator.snapshot().feedback.actual_velocity) <= 1);
-    const auto epoch = simulator.snapshot().command.epoch;
+    CHECK(std::abs(simulator.snapshot().feedback.actual_velocity_rad_s) <= radians_per_count);
+    const auto epoch = simulator.snapshot().command.token.epoch;
     const auto accepted = simulator.snapshot().accepted;
     const auto position = device.read(0x6064, 4);
     fake::inject(0, {0x82, 10});
-    wait_for([&] { return simulator.snapshot().command.epoch > epoch && simulator.snapshot().accepted > accepted + 2; });
+    wait_for([&] { return simulator.snapshot().command.token.epoch > epoch && simulator.snapshot().accepted > accepted + 2; });
     CHECK(device.read(0x607a, 4) == 10000);
     CHECK(device.read(0x6064, 4) == position);
     enable(device);
     rpdo(0x1f, 20000);
-    wait_for([&] { return simulator.snapshot().feedback.actual_velocity > 100; });
+    wait_for([&] { return simulator.snapshot().feedback.actual_velocity_rad_s > 100 * radians_per_count; });
     CHECK(simulator.stop());
     CHECK(!simulator.failed());
     xnet_canopen_status_t status{};
@@ -163,14 +166,14 @@ void motion_and_reset() {
     CHECK(status.runtime_state == XNET_CO_RUNTIME_STOPPED);
     CHECK(fake::sessions() > 0);
     const auto stopped_position = device.read(0x6064, 4);
-    const auto heartbeat = device.read(0x2f01, 4);
+    const auto heartbeat = simulator.snapshot().heartbeat_seq;
     CHECK(xnet_canopen_start(device.handle) == XNET_CO_OK);
     simulator.start();
-    wait_for([&] { return simulator.snapshot().accepted > 2 && device.read(0x2f01, 4) > heartbeat; });
+    wait_for([&] { return simulator.snapshot().accepted > 2 && simulator.snapshot().heartbeat_seq > heartbeat; });
     CHECK(device.read(0x6064, 4) == stopped_position);
-    const auto restarted_epoch = simulator.snapshot().command.epoch;
+    const auto restarted_epoch = simulator.snapshot().command.token.epoch;
     fake::inject(0, {0x81, 10});
-    wait_for([&] { return simulator.snapshot().command.epoch > restarted_epoch; });
+    wait_for([&] { return simulator.snapshot().command.token.epoch > restarted_epoch; });
     CHECK(device.read(0x607a, 4) == 0);
     CHECK(simulator.stop());
 }
@@ -182,7 +185,8 @@ void faults(unsigned scenario) {
     if (scenario == 1) parameters.freeze_feedback_after_us = 150000;
     else if (scenario == 2) parameters.freeze_heartbeat_after_us = 150000;
     else {
-        parameters.fault_code = 0x2310;
+        parameters.fault_class = MOTOR_DRIVE_FAULT_OVERCURRENT;
+        parameters.fault_detail = 7;
         parameters.fault_after_us = 150000;
         parameters.fault_duration_us = 250000;
     }
@@ -193,25 +197,25 @@ void faults(unsigned scenario) {
     if (scenario == 1) {
         enable(device);
         rpdo(0x1f, 10000);
-        wait_for([&] { return simulator.snapshot().feedback.actual_velocity > 100; });
+        wait_for([&] { return simulator.snapshot().feedback.actual_velocity_rad_s > 100 * radians_per_count; });
     } else fake::inject(0, {1, 10});
     if (scenario == 1) {
         try {
             wait_for([&] {
                 const auto state = simulator.snapshot();
                 return device.read(0x603f, 2) == 0x8130
-                    && state.command.action == CO_402_ACTION_FAULT_REACTION && !(state.command.flags & 1);
+                    && state.command.action == MOTOR_DRIVE_ACTION_FAULT_REACTION && !(state.command.flags & 1);
             });
         } catch (const std::exception&) {
             const auto state = simulator.snapshot();
             std::cerr << "Timeout snapshot: action=" << unsigned(state.command.action)
-                      << " pds=" << unsigned(state.command.pds) << " flags=" << unsigned(state.command.flags)
-                      << " accepted=" << state.accepted << " heartbeat=" << device.read(0x2f01, 4)
-                      << " current_fault=" << device.read(0x2f00, 2) << " error=" << device.read(0x603f, 2) << '\n';
+                      << " flags=" << state.command.flags
+                      << " accepted=" << state.accepted << " heartbeat=" << state.heartbeat_seq
+                      << " fault_class=" << state.feedback.fault_class << " error=" << device.read(0x603f, 2) << '\n';
             throw;
         }
         const auto state = simulator.snapshot();
-        CHECK(state.command.action == CO_402_ACTION_FAULT_REACTION && !(state.command.flags & 1));
+        CHECK(state.command.action == MOTOR_DRIVE_ACTION_FAULT_REACTION && !(state.command.flags & 1));
         CHECK((device.read(0x6041, 2) & 0x6f) == 0x0f);
         const auto last_position = device.read(0x6064, 4);
         wait_for([&] { return (device.read(0x6041, 2) & 0x6f) == 8; });
@@ -223,10 +227,15 @@ void faults(unsigned scenario) {
     if (!timeout) CHECK(device.read(0x603f, 2) == 0x2310);
     if (scenario == 2) CHECK(device.read(0x603f, 2) == 0x8130);
     if (timeout) {
-        CHECK(simulator.snapshot().feedback.fault_code == 0);
-        CHECK(device.read(0x2f01, 4) > 0);
+        CHECK(simulator.snapshot().feedback.fault_class == 0);
+        CHECK(simulator.snapshot().heartbeat_seq > 0);
     } else {
-        wait_for([&] { return device.read(0x2f00, 2) == 0; });
+        wait_for([&] {
+            const auto state = simulator.snapshot();
+            return state.feedback.fault_class == 0 && state.accepted > 2;
+        });
+        const auto cleared = simulator.snapshot().accepted;
+        wait_for([&] { return simulator.snapshot().accepted > cleared; });
         CHECK(device.read(0x603f, 2) == 0x2310);
         rpdo(0x80);
         wait_for([&] { return (device.read(0x6041, 2) & 0x6f) == 0x40; });
@@ -246,7 +255,7 @@ void missing_feedback_during_teardown(bool reset) {
     wait_for([&] { return simulator.snapshot().accepted > 2; });
     enable(device);
     rpdo(0x1f, 10000);
-    wait_for([&] { return simulator.snapshot().feedback.actual_velocity > 100; });
+    wait_for([&] { return simulator.snapshot().feedback.actual_velocity_rad_s > 100 * radians_per_count; });
     std::this_thread::sleep_until(begin + 350ms);
     const auto accepted = simulator.snapshot().accepted;
     std::this_thread::sleep_for(20ms);

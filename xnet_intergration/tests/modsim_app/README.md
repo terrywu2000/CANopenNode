@@ -38,15 +38,17 @@ SIGINT/SIGTERM or the optional positive duration request orderly shutdown.
 ## Model exchange and scheduling
 
 The example [device.json](device.json) explicitly selects external, single-axis PP.
-It provides all required OD and local exchange objects; ordinary/internal models
-are rejected, never silently substituted. The three bound groups are:
+It provides the required standard OD objects, five timeouts and a counts-to-SI
+`device_adapter` with an explicit 10000 counts/revolution example resolution.
+Ordinary/internal models are rejected, never silently substituted.
+The model uses only the dedicated [motor_drive_ interface](../../include/motor_drive.h):
 
-- command view: `0x2F02`, processing sequence `0x2F04`, result `0x2F05`;
-- complete feedback: a single 36-byte write to `0x2F03`;
-- independent heartbeat: `0x2F01`.
+- read: SI demand/action/token and processed feedback sequence/result;
+- submit: complete SI feedback, actual executed model step and generic fault;
+- heartbeat: independent actual model progress.
 
-All binding types/sizes, API results and per-entry results are checked. Frames
-use the shared v1 pack/unpack functions. At most one submission is unconfirmed;
+No local exchange OD or batch binding is used. API results and processing
+results are checked. At most one submission is unconfirmed;
 the model continues stepping and sending heartbeat while awaiting consumption.
 Rejected submissions are diagnosed and recalculated from fresh snapshots.
 Epoch changes discard pending feedback and action timers, **not physical
@@ -59,12 +61,13 @@ Commands are sampled at each model step and rechecked before committing plant
 state; changed epoch/action/output permission discards the old calculation.
 This bounds simulated response but cannot guarantee synchronous physical
 preemption across threads. Stop keeps the model thread available
-for the library's new-epoch safety handshake, then joins it before uninitialize,
+for the library's new-epoch safety handshake, then joins it and closes the port before uninitialize,
 destroy or library unload. Actual motion is not forced to zero on reset/fault.
 
 Status is printed approximately every 500 ms: native runtime/NMT and CAN fields,
-plus PDS, Statusword, action/sequence, target/demand/actual/velocity, current model
-fault, accepted/rejected counts and overruns. These are sampled diagnostics, not
+plus model epoch/action/sequence, SI demand/actual/velocity, current model
+fault class, accepted/rejected counts and overruns. Standard drive diagnostics
+can be read separately, not as model execution inputs. These are sampled diagnostics, not
 a lossless bus or transition trace. Protocol/model/API errors and cleanup
 failures return nonzero; injected PDS faults themselves are reported, not treated
 as application crashes.
@@ -80,21 +83,28 @@ smaller than one step are rejected.
 | `period_us`, `action_delay_us` | Fixed model step and minimum BUSY duration for each action |
 | `position_gain` | Position tracking gain, 1/s |
 | `velocity_time_constant_s` | Velocity response time constant, seconds |
-| `max_velocity`, `max_acceleration` | Plant limits, counts/s and counts/s² |
-| `stop_deceleration` | No-output braking, counts/s²; Quick Stop uses the command deceleration capped by the plant acceleration limit |
-| `min_position`, `max_position`, `initial_position` | INTEGER32 counts, positive direction matches the OD |
-| `fault_code`, `fault_after_us`, `fault_duration_us` | Persistent model condition from elapsed start time; zero duration holds indefinitely, zero code disables injection |
+| `max_velocity`, `max_acceleration` | Plant limits, rad/s and rad/s² |
+| `stop_deceleration` | No-output braking, rad/s²; Quick Stop uses valid command deceleration capped by the plant acceleration limit |
+| `min_position`, `max_position`, `initial_position` | Finite motor-axis positions in rad; backend owns direction/origin conversion |
+| `fault_class`, `fault_detail`, `fault_after_us`, `fault_duration_us` | Generic model condition from elapsed start time; zero duration holds indefinitely, zero class disables injection |
 | `freeze_feedback_after_us` | Stop submitting feedback after this elapsed time; heartbeat/stepping continue; zero disables |
 | `freeze_heartbeat_after_us` | Freeze heartbeat only; zero disables |
 | `error_action` | Return ERROR for action enum 1–8; zero disables |
 
-For example, `fault_code: 8976`, `fault_after_us: 2000000`,
-`fault_duration_us: 3000000` reports `0x2310` from second 2 through second 5.
+For example, `fault_class: 2`, `fault_detail: 7`, `fault_after_us: 2000000`,
+`fault_duration_us: 3000000` reports overcurrent/detail 7 from second 2 through
+second 5. The example device adapter maps that pair to `0x2310`; the plant
+does not know device fault codes.
 Clearing the condition does not clear the core's latched `0x603F`: a master must
 send a new Fault Reset bit-7 edge after health/reset permission is restored.
 Action delays longer than `action_timeout_us` test the core's action watchdog.
 Setting `freeze_feedback_after_us: 2000000` independently exercises feedback
 timeout while heartbeat continues. No fault is injected with `set_fault`.
+
+Older motor parameter files used counts and `fault_code`. Convert their motion
+values to SI using the configured resolution, replace fault codes with mapped
+class/detail, and remove old exchange OD extensions/bindings from the device/host.
+The supplied SI defaults preserve the former plant scale at 10000 counts/rev.
 
 ## Master-side verification
 

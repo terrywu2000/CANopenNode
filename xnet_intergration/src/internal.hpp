@@ -151,7 +151,7 @@ struct Model {
     uint16_t rpdo_count = 0, tpdo_count = 0; /**< Configured receive/transmit PDO counts, respectively. */
     uint32_t worker_period_us = 1000; /**< Worker wait interval in microseconds; not a hard real-time guarantee. */
     bool drive_402_enabled = false; /**< True only when the JSON explicitly enables the PP profile. */
-    bool drive_402_external = false; /**< Selects the validated 0x2F00..0x2F05 model exchange. */
+    bool drive_402_external = false; /**< Selects the motor_drive_ private model mailbox. */
     std::optional<DriveAdapter> drive_adapter;
     bool drive_has_error_code = false; /**< Optional 0x603F fault-code output. */
     bool drive_has_quick_stop_deceleration = false; /**< Optional 0x6085; defaults to PP profile deceleration. */
@@ -282,11 +282,6 @@ struct xnet_canopen_device {
         OD_IO_t original{};
         OD_extension_t extension{};
     } drive_mode_od; /**< SDO mode-write guard; refreshed after each stack rebuild. */
-    struct DriveFeedbackOD {
-        xnet_canopen_device* device = nullptr;
-        OD_IO_t original{};
-        OD_extension_t extension{};
-    } drive_feedback_od; /**< Atomic local feedback-frame submitter; refreshed after stack rebuilds. */
     std::unique_ptr<xco::d402::Drive> drive_402; /**< Present only when enabled by JSON. */
     std::shared_ptr<motor_drive_endpoint> drive_endpoint;
     uint64_t sync_observation_epoch = 0;
@@ -295,6 +290,9 @@ struct xnet_canopen_device {
     bool drive_adapter_fault = false;
     uint64_t drive_epoch = 0;
     uint32_t drive_command_seq = 0, drive_action_seq = 1, drive_last_feedback_seq = 0;
+    CO_402_command_frame_t drive_command{};
+    uint32_t drive_processed_feedback_seq = 0;
+    uint16_t drive_processed_result = 0;
     uint32_t drive_last_submitted_seq = 0;
     struct DriveCommandRecord {
         uint32_t seq = 0;
@@ -311,7 +309,6 @@ struct xnet_canopen_device {
     xco::Clock::time_point drive_pending_submitted_at{}, drive_feedback_accepted_at{};
     bool drive_has_last_submitted = false;
     uint32_t drive_last_heartbeat = 0;
-    uint32_t drive_heartbeat_baseline = 0;
     bool drive_has_heartbeat = false;
     xco::Clock::time_point drive_heartbeat_changed{};
     xco::Clock::time_point drive_started_at{};
@@ -382,8 +379,6 @@ struct xnet_canopen_device {
     static ODR_t write_communication(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
     static ODR_t read_drive_mode(OD_stream_t*, void*, OD_size_t, OD_size_t*);
     static ODR_t write_drive_mode(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
-    static ODR_t read_drive_feedback(OD_stream_t*, void*, OD_size_t, OD_size_t*);
-    static ODR_t write_drive_feedback(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
     ODR_t stage_drive_feedback(const CO_402_feedback_frame_t& frame, const uint8_t* bytes);
     void process_drive_402(uint32_t dt_us, bool force_non_operational = false);
     void drain_drive_402();

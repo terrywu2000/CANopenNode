@@ -417,10 +417,16 @@ python -m unittest discover -s .\tests -p test_eds_to_json.py
 
 ### DS402 外部模型故障与超时
 
-显式启用单轴 external PP 的配置与 v1 帧布局见
+显式启用单轴 external PP 的配置与专用 SI 接口见
 [英文配置说明](README.md#ds402-pp-configuration) 和
-[模型模拟从站](tests/modsim_app/README.md)。既有 C ABI 布局与帧版本未改变，
-新增 SI 端口见下节；旧模型仍可使用兼容帧。
+[模型模拟从站](tests/modsim_app/README.md)。既有 C ABI 布局未改变，
+但模型交换已改为 `motor_drive_` 私有邮箱，不再经由 OD/batch。
+external 必须显式配置 `device_adapter`（含有效 `counts_per_revolution`）及五个超时。
+
+**迁移要求**：从模型 JSON 删除原 `0x2F00..0x2F05` 交换扩展，从宿主删除对应
+batch/OD 访问，改用 open/read/submit/heartbeat/close。命令、pending 反馈、处理确认
+及心跳时间保存在设备私有存储中，不要求或自动创建交换 OD。这些厂商索引不再保留或
+特殊处理；显式声明的同址对象只是普通设备存储，写成功不代表模型收到反馈。
 
 适配层使用完整反馈消费时刻的单调时间戳统一判断新鲜度，在核心步进之前分类启动、
 心跳、反馈和动作超时；不会再由核心另外累加运动步长而抢先产生通用故障。
@@ -461,8 +467,9 @@ direction 为 +1/-1，zero_counts 为 I32，均为初始化坐标配置，不自
 
 适配层用已有 OD 绑定处理：设备原始单位 ↔ 核心 counts ↔ 外部 SI（rad、rad/s、
 rad/s²）。不生成 OD、不覆盖 ECU 的 target/profile。可选 0x60FC/0x606B/0x606C
-存在时须为不可本地/RPDO 写入的只读 I32 输出；缺失则报告未绑定。v1 帧仍为
-56/36 字节和 counts 单位；未配置 device_adapter 的旧配置行为不变。
+存在时须为不可本地/RPDO 写入的只读 I32 输出；缺失则报告未绑定。私有 v1 类型/反馈
+编码仍保持 counts 单位和原布局，但不再作为外部 OD 传输。internal 可不配置
+device_adapter；external 缺失适配配置时初始化明确失败。
 
 unit_profile 支持 `counts`（明确声明原始 counts 单位）、`identity`（全部按未确认
 同单位直通）、`kinco_fd`（已知手册公式＋未知规则直通）。默认 Kinco 清单：
@@ -489,11 +496,12 @@ external 后端通过 `xnet_canopen_get_motor_drive_endpoint` 获取 endpoint，
 `motor_drive_` 端口。模型端头文件 [motor_drive.h](include/motor_drive.h) 不暴露 XNET/OD；
 读请求填版本/大小与 READ_ASYNC，target_step/source_cutoff 为 0。完整反馈回显源 token，
 报告实际 PCL/model 步及固定步长；提交成功只表示暂存，必须读取 processed_* 确认。
-打开端口时禁止兼容心跳/反馈本地写，普通 ECU 命令写不受影响。
+端口是唯一反馈/心跳写入通道，普通 ECU 命令写不受影响。
 
 heartbeat 只转发模型实际执行进展；重复或只改 heartbeat 序号不刷新新鲜度。
 fault_class/detail 须有明确设备故障码映射；无映射拒绝并失败关闭。模型 limit_flags
-合成有效反馈的 Statusword bit11。停止握手期间模型须可交互，stop 后 close，再释放后端；
+合成有效反馈的 Statusword bit11。停止握手期间已有端口须可交互，通用 OD/batch 不再有
+停机豁免；stop 后先让独立模型线程退出/join，再 close，最后释放后端；
 PCL 不应阻塞等待自己下一步才能产生的反馈。
 
 `xnet_canopen_read_sync_event` 提供每端口的 SYNC 接收观察：保留最近 64 条局部
@@ -1004,7 +1012,7 @@ PDO 示例的 `0x43F` 是普通的 11 位 ID，并不说明需要扩展帧。
 权限的批次写入反馈。
 
 启用 `drive_402` 后，PDS、轮廓规划、状态字和模式显示由库负责；外部模型使用 counts
-兼容帧或 `motor_drive_` SI 接口，不直接使用下表的 OD 输入/输出。设备适配层负责原始
+`motor_drive_` SI 接口，不直接使用下表的 OD 输入/输出。设备适配层负责原始
 单位和故障转换。当前 PP 绑定使用 `0x6064`，不将其别名为 `0x6063`，也未实现下表的
 其他模式或遥测；目标设备的位置语义仍需单独核对。
 

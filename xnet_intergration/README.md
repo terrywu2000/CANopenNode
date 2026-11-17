@@ -335,16 +335,15 @@ and arbitrary vendor-specific communication objects are explicitly unsupported.
 
 The optional `drive_402` member enables the integrated single-axis Profile
 Position (PP) state machine. `internal` follows the profile demand directly;
-`external` uses the frozen v1 command/feedback exchange in
-[`402/CO_402_protocol.h`](../402/CO_402_protocol.h). External model responses
-are submitted by the host through the local OD API; the integration worker
+`external` uses the SI interface in
+[`include/motor_drive.h`](include/motor_drive.h) and backend-private mailboxes.
+External model responses are submitted through `motor_drive_submit_v1`; the integration worker
 validates and consumes them, publishes standard DS402 values, and waits for
 matching action acknowledgements.
 
-With an explicit `device_adapter`, the host can instead use the SI interface in
-[`include/motor_drive.h`](include/motor_drive.h). Both paths share the same
-pending/worker acceptance logic; opening a motor port excludes legacy local
-heartbeat/feedback writes, not ordinary ECU target/profile writes.
+External mode requires an explicit `device_adapter`, including a valid
+`counts_per_revolution`. One motor port owns feedback/heartbeat writes;
+ordinary ECU target/profile writes are unaffected.
 
 ```json
 "drive_402": {
@@ -358,13 +357,17 @@ heartbeat/feedback writes, not ordinary ECU target/profile writes.
 For `model: "external"`, also provide all five positive timeouts (microseconds,
 each greater than `worker_period_us`): `startup_timeout_us`,
 `heartbeat_timeout_us`, `feedback_timeout_us`, `action_timeout_us`, and
-`command_max_age_us`. The JSON must also define scalar, SDO-read-only,
-unmapped objects `0x2F00..0x2F05` with exact v1 types/sizes. Only `0x2F01`
-(UNSIGNED32 heartbeat) and `0x2F03` (36-byte OCTET_STRING feedback) use
-`local_write: true`; `0x2F02` is a 56-byte OCTET_STRING command snapshot.
-`0x2F00`, `0x2F04`, and `0x2F05` are core-published status values. No exchange
-object is synthesized. See the protocol header for frame byte layouts and
-`DS402_requirements_and_dev_guide.md` §7.5 for validation and lifecycle rules.
+`command_max_age_us`. No model exchange OD objects are required or synthesized.
+Commands, pending feedback, processed sequence/result and heartbeat age live
+in private device storage. See the SI port section below for configuration.
+
+**Migration:** remove the former `0x2F00..0x2F05` exchange extensions and their
+batch bindings from model configurations/hosts. Use open/read/submit/heartbeat/close
+instead. Those indices are no longer reserved or intercepted: if explicitly
+declared, they are ordinary device objects and writes do not reach the model.
+The internal counts v1 types/feedback codec are retained unchanged, but their
+56/36-byte layouts are not an external OD transport anymore. Generic OD/batch
+and motor_drive_ C ABI layouts remain unchanged.
 
 Enabling the profile requires the JSON-provided scalar OD objects `0x6040`,
 `0x6041`, `0x6060`, `0x6061`, `0x6064`, `0x607A`, `0x6081`, `0x6083`,
@@ -384,8 +387,9 @@ RPDO and before TPDO.
 External feedback must refer to a retained command and the current epoch/action
 sequence. Exact retries are idempotent and do not refresh feedback age; stale,
 invalid, missing, or timed-out model traffic never falls back to the internal
-model. Stop and CANopen reset allow only external model exchange OD traffic
-while draining safety actions to a terminal drive state, then invalidate the epoch.
+model. Stop and CANopen reset keep existing motor ports exchanging while
+draining safety actions to a terminal drive state, then invalidate the epoch.
+Generic OD/batch calls have no shutdown exception.
 The adapter owns feedback age using monotonic timestamps of accepted frames;
 the core does not independently add motion-step time to that age. Startup,
 heartbeat, feedback and action deadlines are classified before each drive step.
@@ -451,8 +455,8 @@ and profile raw values, converts to core counts units, and publishes actual and
 optional demand telemetry in device units. ECU target/profile values are never
 round-tripped or overwritten. Optional `0x60FC`, `0x606B`, `0x606C` must be scalar
 read-only I32 outputs; if absent they are listed as unbound, not synthesized.
-Legacy v1 frames stay 56/36 bytes and counts-based. Without `device_adapter`,
-existing configurations retain their previous behavior and have no SI endpoint.
+Internal v1 counts types/feedback encoding remain unchanged. Internal models may
+omit `device_adapter`; external models must configure it for SI conversion.
 
 `unit_profile` is `counts` (explicitly declared counts units), `identity`
 (all raw/core scales unconfirmed and assumed 1:1), or `kinco_fd` (manual rules
@@ -506,8 +510,8 @@ must map exactly to a nonzero device code; unmapped faults reject the feedback,
 diagnose the error and fail closed with a generic adapter fault. Limit reasons
 are reduced to the current valid Statusword bit 11.
 
-Keep model exchange alive during bounded stop; only close the port after stop,
-then uninitialize/destroy. Do not block the PCL waiting for feedback it must
+Keep model exchange alive during bounded stop; stop, join the independent model
+thread, close the port, then uninitialize/destroy. Do not block the PCL waiting for feedback it must
 produce. Existing C ABI/status layouts are unchanged; new structures are
 time=16, cycle=64, model_step=56, request=88, view=208, feedback=184 bytes.
 Check sizes before LabVIEW deployment; the binary VIs are not regenerated here.
@@ -1266,8 +1270,8 @@ without `drive_402`; in that case, read commands through batch reads and write
 feedback through batches with appropriate `local_write` permissions.
 
 With `drive_402` enabled, the library owns PDS, profile planning, Statusword and
-mode display. Its external model uses the counts compatibility frames or the
-`motor_drive_` SI port, not these direct OD input/output tables. The device
+mode display. Its external model uses only the `motor_drive_` SI port,
+not these direct OD input/output tables. The device
 adapter owns raw-unit/fault conversion. The current PP binding uses `0x6064`,
 does not alias it to `0x6063`, and does not implement the additional modes or
 telemetry listed below; verify the selected-device position semantics separately.

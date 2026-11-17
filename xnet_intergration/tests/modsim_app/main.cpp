@@ -36,9 +36,12 @@ int main(int argc, char** argv) {
         Library library(options.library);
         const Api api(library);
         const modsim::ExchangeApi exchange{
-            library.resolve<decltype(&xnet_canopen_bind_batch)>("xnet_canopen_bind_batch"),
-            library.resolve<decltype(&xnet_canopen_read_batch)>("xnet_canopen_read_batch"),
-            library.resolve<decltype(&xnet_canopen_write_batch)>("xnet_canopen_write_batch"),
+            library.resolve<decltype(&xnet_canopen_get_motor_drive_endpoint)>("xnet_canopen_get_motor_drive_endpoint"),
+            library.resolve<decltype(&motor_drive_open_v1)>("motor_drive_open_v1"),
+            library.resolve<decltype(&motor_drive_read_v1)>("motor_drive_read_v1"),
+            library.resolve<decltype(&motor_drive_submit_v1)>("motor_drive_submit_v1"),
+            library.resolve<decltype(&motor_drive_heartbeat_v1)>("motor_drive_heartbeat_v1"),
+            library.resolve<decltype(&motor_drive_close_v1)>("motor_drive_close_v1"),
             api.stop, api.get_last_error};
         Device device(api, library);
         bool ok = false;
@@ -70,12 +73,12 @@ int main(int argc, char** argv) {
                         throw std::runtime_error("native runtime is no longer running");
                     print_status(status);
                     const auto state = simulator.snapshot();
-                    std::cout << "modsim epoch=" << state.command.epoch << " pds=" << unsigned(state.command.pds)
-                              << " statusword=0x" << std::hex << state.command.statusword << std::dec
-                              << " action=" << unsigned(state.command.action) << " action_seq=" << state.command.action_seq
-                              << " target=" << state.command.target_position << " demand=" << state.command.demand_position
-                              << " actual=" << state.feedback.actual_position << " velocity=" << state.feedback.actual_velocity
-                              << " fault=" << state.feedback.fault_code << " accepted=" << state.accepted
+                    std::cout << "modsim epoch=" << state.command.token.epoch
+                              << " action=" << state.command.action << " action_seq=" << state.command.token.action_seq
+                              << " demand_rad=" << state.command.demand_position_rad
+                              << " actual_rad=" << state.feedback.actual_position_rad
+                              << " velocity_rad_s=" << state.feedback.actual_velocity_rad_s
+                              << " fault_class=" << state.feedback.fault_class << " accepted=" << state.accepted
                               << " rejected=" << state.rejected << " overruns=" << state.overruns << std::endl;
                     if (!std::cout) throw std::runtime_error("cannot write model status");
                     next = Clock::now() + std::chrono::milliseconds(500);

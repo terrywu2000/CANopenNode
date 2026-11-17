@@ -3,8 +3,8 @@
 > 适用范围：当前仓库 CANopenNode 核心，以及 `xnet_intergration/` NI-XNET CANopen 从站集成。
 > 参考资料：`reference/canopennode-rtt`（Pure-C CiA 402 Device 核心 + RT-Thread 适配）、`reference/EtherCAT_Slave`（EtherCAT 侧 CiA 402 示例应用）。
 > 本文是后续开发的需求基线。首期范围已确定为 PP 位置控制；仅将仍需负责人决策的事项标注为 **[待确认]**。
-> 实现进度：单轴 PP 的 internal 路径及 external v1 帧交换已接入 CANopenNode worker；JSON 启动校验、反馈提交、epoch/序号/超时与异步动作确认已有实现和 fake-XNET 覆盖。本文其余硬件语义、诊断覆盖和实物验收仍需逐项验证；功能验证不构成硬实时或安全认证。
-> 后续系统基线：机器人 ECU 是唯一 CANopen Master/SYNC Producer；每个异步 CD/slave 独占一个 NI-XNET CAN 端口，各端口连接同一物理总线，每节点对应一个 PCL 固定步长模型。已实现可选设备适配、`motor_drive_` 异步 SI 接口及逐帧 SYNC 接收观察；SYNC 控制流水线和 VeriStand signal 桥接仍待实现。既有 counts v1 帧不自动具备新增同步语义。
+> 实现进度：单轴 PP 的 internal 路径及 external motor_drive_ 私有邮箱已接入 CANopenNode worker；原本地交换 OD 已移除。JSON 启动校验、反馈提交、epoch/序号/超时与异步动作确认已有实现和 fake-XNET 覆盖。本文其余硬件语义、诊断覆盖和实物验收仍需逐项验证；功能验证不构成硬实时或安全认证。
+> 后续系统基线：机器人 ECU 是唯一 CANopen Master/SYNC Producer；每个异步 CD/slave 独占一个 NI-XNET CAN 端口，各端口连接同一物理总线，每节点对应一个 PCL 固定步长模型。已实现设备适配、`motor_drive_` 异步 SI 接口及逐帧 SYNC 接收观察；SYNC 控制流水线和 VeriStand signal 桥接仍待实现。私有 counts v1 类型不自动具备新增同步语义。
 
 ---
 
@@ -16,7 +16,7 @@
 - `xnet_intergration/` 把 CANopen 从站通过 NI-XNET 暴露给 VeriStand 模型。当前已增加显式 JSON 启用的单轴 PP internal/external 路径；普通配置仍只做通信与 OD 存储。NMT 状态、CANopen 状态、DS402 驱动状态仍是三个独立概念。
   - `include/xnet_canopen.h` 说明库可按 JSON 显式启用 DS402 PP；未新增公共 ABI。
   - `src/model.cpp` 对启用配置校验必需对象、权限、类型和已启用 PDO 映射；不自动补建对象。
-  - external 帧交换通过本地 OD API 接入；模型仍由宿主应用运行，不由库隐式创建线程或模型实例。
+  - external 通过 motor_drive_ SI 接口与私有邮箱接入，不经过本地 OD API；模型仍由宿主应用运行，不由库隐式创建线程或模型实例。
   - `xnet_intergration/tests/app/README.md:113` 说明测试应用不实现 CiA 402。
 - 设备 OD 由 JSON 配置描述；JSON 由工具从目标真实驱动设备的 EDS 转换生成。普通 CANopen 设备配置可以不包含 CiA 402 对象，电机驱动设备配置则包含其实际提供的 402 对象与 PDO 配置。
 - 仓库已有 Kinco FD124 的 EDS（`xnet_intergration/eds/Kinco_FD_20250417_V1.2.eds`）与 JSON 配置样例（`examples/kinco_FD124.json`、`tests/app/kinco_FD124.config.json`）。
@@ -100,7 +100,7 @@ CANopen NMT 是底层通信层状态机，DS402 PDS 是上层电机控制状态�
 | FR-OD-04 | 对象访问须经过 OD 锁（与 xnet 的批量 API 锁序一致，见 §8.2） | 通过 SDO 写 0x6040 与批量写 API 并发时无数据竞争 |
 | FR-OD-05 | 主站独占写入 target 与 profile 参数，核心独占决定 demand、状态和已接受实际值；设备适配层执行 OD 读写，模型通过 motor_drive_ 接口提交 SI 反馈 | 覆盖命令、反馈的网络/本地权限及单位转换；模型不得直接写标准实际值或状态，核心与适配层不得覆盖 0x607A 或 PP profile 参数 |
 
-JSON 是 OD 与 PDO 配置的唯一运行时来源，初始化阶段不根据 `drive_402` 自动补建对象，也不在运行时动态添加 PDO 映射。普通设备 JSON 未声明 `drive_402` 时按普通 CANopen 设备初始化，不执行 402 对象校验或状态机；声明启用时，若 EDS 转换得到的 JSON 缺少当前 PP 实现必需的对象或其他必要配置，必须作为配置错误拒绝初始化，不得静默降级为普通设备或自动补默认对象。0x603F 不存在时不发布该对象，但 external 故障仍通过状态机和 EMCY 处理。若使用 external 模型，所需本地交换对象必须作为本设备 JSON 的本地扩展项提供并通过同一初始化校验；不得由运行时绕过 JSON 创建。
+JSON 是 OD 与 PDO 配置的唯一运行时来源，初始化阶段不根据 `drive_402` 自动补建对象，也不在运行时动态添加 PDO 映射。普通设备 JSON 未声明 `drive_402` 时按普通 CANopen 设备初始化，不执行 402 对象校验或状态机；声明启用时，若 EDS 转换得到的 JSON 缺少当前 PP 实现必需的对象或其他必要配置，必须作为配置错误拒绝初始化，不得静默降级为普通设备或自动补默认对象。0x603F 不存在时不发布该对象，但 external 故障仍通过状态机和 EMCY 处理。external 模型必须显式提供 device_adapter（含有效 counts_per_revolution），通过 motor_drive_ 私有邮箱交换；邮箱不是 OD，不要求或自动创建本地交换对象。
 
 **实现说明**：`canopennode-rtt` 的 OD 扩展通过 `CO_402_device_bindOD()` 绑定，并在 Communication Reset 时重新绑定（见 `docs/en/cia402-device-rtt.md`）。xnet 中对应的是 `Model` 的 `resolve_node` / `configure` 流程（`xnet_intergration/src/model.cpp:427`、`:494`），绑定点应放在同一流程里。
 
@@ -227,7 +227,7 @@ Statusword 的状态位由 PDS 当前状态决定，PP 相关位由核心根据�
                  402/ 独立逻辑核心
                         │ 动作、模式、demand / 已提交反馈
         xnet_intergration/src/ 模型交换适配层
-                        │ motor_drive_ SI 接口（兼容后端使用批量 C API）
+                        │ motor_drive_ SI 接口（设备私有邮箱）
         异步 VeriStand CD（时间标识、缓冲、signal 桥接）
                         │ VeriStand signal
         每节点独立驱动模型（VeriStand PCL 固定步长）
@@ -265,7 +265,7 @@ Statusword 的状态位由 PDS 当前状态决定，PP 相关位由核心根据�
 
 **结论：外部模型业务接口采用 `motor_drive_` 前缀、SI 物理单位和不透明句柄，不暴露 XNET 类型、OD 地址、batch ID 或设备原始单位。** 设备适配层负责单位转换及设备端 OD 读取/发布；PDS 状态机与 Statusword 每节点只有一份，已有模型若包含 PDS，应拆出或关闭该部分。C 接口由异步 CD 调用，VeriStand 模型通过 signal 收发对应字段，计算只由 PCL 负责。
 
-当前已实现的传输仍是 `bind_batch` / `read_batch` / `write_batch` 和下文 v1 帧。后续先在适配层内封装此兼容后端，不改变已发布 xnet ABI；专用邮箱后端另行实现和评审，不能绕过现有 ABI 决策。业务接口与兼容帧是不同契约，不能将后者的 counts 字段改称 SI 而不转换。
+当前异步传输已采用 motor_drive_ 专用接口与设备私有邮箱，不经过 OD/batch，不改变已发布 xnet ABI。设备适配层在 SI 与核心 counts 之间转换。内部继续复用 CO_402_protocol 的类型与反馈校验编码，但这不是网络 OD 或外部模型的传输契约；SYNC/PCL 定时邮箱仍待实现。
 
 #### 7.5.1 职责分工
 
@@ -274,7 +274,7 @@ Statusword 的状态位由 PDS 当前状态决定，PP 相关位由核心根据�
 | 机器人 ECU | 运动命令、0x6040、0x6060（仅 PP）、0x607A/profile 参数与 SYNC | 唯一 Master/SYNC Producer，SDO/RPDO 按设备配置开放 |
 | 402 核心 | PDS、Statusword、模式显示、锁存故障；PP profile demand 与实际值验收 | worker 内决定逻辑输出，不访问模型，不覆盖主站 target |
 | 设备适配层 | OD index/subindex 绑定、手册单位与 SI/核心单位转换、设备故障映射；读取主站输入，发布核心输出及已接受实际值 | 设备端 OD 锁内读写；只执行映射与转换，不自行推进 PDS 或决定到位/故障复位 |
-| 异步 CD / 模型交换适配层 | 每节点 motor_drive_ 端口、signal 映射、SYNC/PCL 身份与时间映射、有界缓冲和完整提交 | CD 调用 C 接口，signal 连接独立模型；batch/帧仅作兼容传输，不阻塞 PCL 或执行模型计算 |
+| 异步 CD / 模型交换适配层 | 每节点 motor_drive_ 端口、signal 映射、SYNC/PCL 身份与时间映射、有界缓冲和完整提交 | CD 调用专用邮箱 C 接口，signal 连接独立模型；不依赖 OD/batch，不阻塞 PCL 或执行模型计算 |
 | VeriStand Engine / PCL | 模型调度、固定步长、signal 映射阶段及模型步身份 | 与 CAN 域异步运行，不由 SYNC 回调强行重入 |
 | VeriStand 模型 | SI 实际值、动作结果、PP 就绪、限幅、通用当前故障条件与复位许可 | 每节点一个模型，通过 signal 回传完整步快照，不直接访问 OD/XNET 或生成 Statusword |
 
@@ -294,9 +294,9 @@ Statusword 的状态位由 PDS 当前状态决定，PP 相关位由核心根据�
 
 首期 PP 是旋转电机轴端口，命令/反馈使用 rad 与 rad/s，安全减速度幅值使用 rad/s²。直线量、电流、力矩等表项是未来字段的单位规则，不表示首期新增这些遥测量或运行模式。未来直线轴须使用独立的 m/m/s 字段，不能将同一 _rad 字段重新解释为米；负载线速度与电机角速度之间的转换需要明确的机械传动参数。
 
-SI 字段采用 `double`，字段名称携带单位，所有有效数值必须有限；NaN、Inf、非法负幅值及不可表示的 OD/核心转换值均明确拒绝。epoch、序号、枚举和位掩码不属于物理量，仍使用固定宽度整数；既有配置名中的 _us 与兼容帧的 counts 单位保持不变。
+SI 字段采用 `double`，字段名称携带单位，所有有效数值必须有限；NaN、Inf、非法负幅值及不可表示的 OD/核心转换值均明确拒绝。epoch、序号、枚举和位掩码不属于物理量，仍使用固定宽度整数；既有配置名中的 _us 与私有核心类型的 counts 单位保持不变。
 
-以下接口已发布于 [motor_drive.h](../xnet_intergration/include/motor_drive.h)。动作编号复用 §7.5.2 的 0..8，结果为 NONE/BUSY/DONE/ERROR；ABI 不直接存 C enum/bool。v1 大小已冻结：time=16、cycle=64、model_step=56、request=88、view=208、feedback=184 字节，C 测试检查布局；既有 xnet 状态与 56/36 字节帧不变。
+以下接口已发布于 [motor_drive.h](../xnet_intergration/include/motor_drive.h)。动作编号为 0 none、1 shutdown、2 switchOn、3 enableOperation、4 disableOperation、5 quickStop、6 faultReaction、7 faultReset、8 disableVoltage，结果为 NONE/BUSY/DONE/ERROR；ABI 不直接存 C enum/bool。v1 大小已冻结：time=16、cycle=64、model_step=56、request=88、view=208、feedback=184 字节，C 测试检查布局；既有 xnet 状态与私有 counts 类型/反馈编码不变。
 
 **当前实现边界**：READ_ASYNC/BOOTSTRAP/SAFETY 已实现，目标步/截止时间必须为 0；READ_SCHEDULED 明确返回 UNSUPPORTED，不执行下述未来定时选样。SYNC cycle/target_step 返回 0；publish_time 为进程 steady clock 秒、clock_domain_id=1，模型采样时间不自动映射至该域。反馈报告真实模型步、心跳验证执行进展；CD/signal 尚未实现。backend 用 xnet_canopen_get_motor_drive_endpoint 创建绑定，模型端头文件无 XNET/OD 类型。
 
@@ -401,14 +401,14 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 - read 的 flags 显式区分定时正常快照、启动握手和优先安全快照。定时读取按 source_cutoff 从有界历史选取已完整发布的命令，返回同节点 epoch 的命令/确认和目标步；截止窗口未闭合、无候选或映射无效返回明确结果，不偷偷选择更新命令。启动/安全读取可无有效 SYNC 来源，但不得用于普通运动；安全快照在下一模型步生效，不等待失效的时间映射恢复。
 - submit 全量校验/暂存，成功仅表示入邮箱或同内容幂等重试，最终接受/拒绝由 worker 发布到 processed_result（0 无结果、1 接受、2 命令过期、3 内容/周期无效）。每端口最多一个未确认反馈；确认属于 view.token.epoch，不跨代次复用。安全响应仍需当前 epoch/匹配 action_seq、真实模型步和本机提交期限，不因 SYNC 时间失效而无限等待。
 - 业务 API 返回独立的 MOTOR_DRIVE_ 操作结果，区分无可用命令、未初始化/失效端口、邮箱占用、旧代次、非法反馈和后端错误；不直接暴露 XNET_CO_*。返回失败时输出快照不可使用，提交不得部分成功，后端异常须保留诊断。实现前冻结操作结果值、flags/limit_flags、故障类别、结构大小/对齐与生命周期契约，并为 C/LabVIEW 提供对应布局。
-- open 建立唯一 signal 反馈写入者，兼容 batch 与业务 API 不得形成两个独立写入者；heartbeat 只转发模型实际执行的 progress，旧节点/PCL 代次或重复模型步不得刷新存活时间，CD 自身循环不代表模型存活。端口在后端 uninitialize 后失效；节点 Reset/stop/start 更新节点 epoch，Engine 重部署更新 pcl_epoch，总线时基重建更新 sync_domain_epoch。各类代次独立，单节点复位不重置其他节点的模型状态。
+- open 建立唯一 signal 反馈写入者，通用 OD/batch 不再提供模型写入通道；heartbeat 只转发模型实际执行的 progress，旧节点/PCL 代次或重复模型步不得刷新存活时间，CD 自身循环不代表模型存活。端口在后端 uninitialize 后失效；节点 Reset/stop/start 更新节点 epoch，Engine 重部署更新 pcl_epoch，总线时基重建更新 sync_domain_epoch。各类代次独立，单节点复位不重置其他节点的模型状态。
 - 停止握手时可用的 PCL/signal 交换必须保持到本节点停止完成；异步 CD 不在 PCL 内阻塞调用 stop。Engine 已停止模型执行时，使用有界失败关闭路径并报告停止未确认，不能等待下一 PCL 无限阻塞或伪造 DONE。独立线程 demo 仍按 stop → 模型退出/join → close/uninitialize 顺序处理；VeriStand 模型生命周期由 Engine 管理，不由库 join。
 
 **设备适配层的 OD 读写与转换**
 
 1. 绑定表关联通用角色与 OD，复用 EDS/JSON 类型/权限，补充单位、比例和坐标条件。缺少必需 OD、有效 counts/rev、非法比例或溢出拒绝；按本轮确认政策，未知单位先用 raw/core 1:1，告警并列入 assumed_identity，不能标为已验证，不在运行时补建对象。
-2. 通信执行者在正常 SYNC 的 RPDO 边界读取设备 OD 原始命令/参数，适配层转换为核心单位；核心生成 profile demand，再转换为 SI 快照。既有核心及兼容帧保留 counts 单位，不能把 Kinco 原始速度/加速度数值原样转发。
-3. CD 转发 SI 反馈，适配层在暂存前校验可转换性；通信执行者再校验代次、年龄、动作与完整性。当前兼容路径验收后直接发布实际值；新增流水线路径先保留已接受反馈历史，按 §7.5.11 截止选样，再按手册单位在同一 OD 锁内发布完整实际值集合。核心状态/安全处理仍由通信执行者决定，拒绝帧不污染值，API 提交本身不触发 TPDO 或推进 PDS。
+2. 通信执行者在正常 SYNC 的 RPDO 边界读取设备 OD 原始命令/参数，适配层转换为核心单位；核心生成 profile demand，再转换为 SI 快照。既有核心及私有类型保留 counts 单位，不能把 Kinco 原始速度/加速度数值原样转发。
+3. CD 转发 SI 反馈，适配层在暂存前校验可转换性；通信执行者再校验代次、年龄、动作与完整性。当前异步路径验收后直接发布实际值；新增流水线路径先保留已接受反馈历史，按 §7.5.11 截止选样，再按手册单位在同一 OD 锁内发布完整实际值集合。核心状态/安全处理仍由通信执行者决定，拒绝帧不污染值，API 提交本身不触发 TPDO 或推进 PDS。
 4. 主站独占 target/profile；适配层不回写有损往返值。已绑定 demand/遥测可按已确认比例或已报告的 1:1 假设发布；未知缩放不擅自套用同名对象公式，也不能将直通假设说成单位已确认。批量读写、锁序与 Reset 后重绑遵守 §8。
 5. 单位、编码器分辨率、方向、零点与机械换算在一次交换中必须一致；允许更换这些配置的后端须同时撤销旧 epoch 并重新握手，禁止把旧坐标下的计算结果按新比例发布。位置增量/相对命令不重复加零点，同一方向变换只应用一次。
 
@@ -416,79 +416,31 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 
 **转换检查清单**：初始化日志与 xnet_canopen_get_drive_unit_report JSON 输出 converted、unchanged、assumed_identity、unbound，包括角色、OD、比例和依据。kinco_fd 已换算 6081/606C（×125/2048）、6083/6084（×15625/256）；607A 增量无需换算；6064/60FC 坐标、606B 速度、6085 减速度默认直通并待核对。缺失可选 OD 列为未绑定；原始单位直通不取消 counts↔SI 物理换算。配置/调用示例见 [英文说明](../xnet_intergration/README.md#device-units-and-motor_drive_-si-port) 与 [中文说明](../xnet_intergration/README.zh-CN.md#设备单位适配与-motor_drive_-si-接口)。
 
-#### 7.5.2 本地交换对象（兼容后端，厂商自定义区 0x2000–0x5FFF）
+#### 7.5.2 专用模型邮箱（移除本地交换 OD）
 
-本节为已实现的内部兼容帧契约，不是 motor_drive_ 公共业务字段。后续须将索引、编码、batch 绑定与 SI/counts 转换封装在后端适配层，使外部模型不直接读写本表。保留这些对象及 JSON 校验以兼容当前实现，不能把模型端口本身当作设备 EDS 对象。
+**评估结论：当前异步单轴 PP 的功能已经由 motor_drive_ 接口覆盖，可以移除 0x2F00–0x2F05 本地交换对象。** 异步交换不依赖 SYNC/PCL 确定流水线；后者尚未实现，`READ_SCHEDULED` 返回 `MOTOR_DRIVE_UNSUPPORTED`，不伪造时钟或周期元数据。保留厂商 OD 并不能补齐这些能力。
 
-现有 56/36 字节帧不包含 SYNC/PCL/采样时间字段，不能独立承载新增流水线契约。兼容后端需保存与 epoch/command_seq/feedback_seq 精确关联的时间侧车记录并贯穿验收；这些信息必须在通信/模型采样入口捕获，不能事后从普通 OD 读取恢复。若需扩展传输布局，另建新版本，不改变 CO_402_PROTOCOL_VERSION=1 的字节或单位。
+| 原交换用途 | 当前替代机制 | 所有者 |
+|---|---|---|
+| 当前模型故障（原 0x2F00） | 反馈 fault_class/detail 经适配映射，worker 私有当前条件；首次故障仍锁存到可选标准 0x603F，并发送 EMCY | worker |
+| 独立心跳（原 0x2F01） | motor_drive_heartbeat_v1 校验节点/PCL 代次及真实步进，记录本机单调时间 | 唯一模型端口 |
+| 命令快照（原 0x2F02） | motor_drive_read_v1 返回 SI demand、动作、token 和处理确认 | worker 发布，端口读取 |
+| 完整反馈（原 0x2F03） | motor_drive_submit_v1 全量校验/转换后一次暂存，worker 再验收 | 端口暂存，worker 消费 |
+| 处理确认/结果（原 0x2F04/05） | view.processed_feedback_seq / processed_result，与 view.token.epoch 同锁读取 | worker |
 
-| 索引 | 名称 | 类型 | 写入方 | 语义 |
-|---|---|---|---|---|
-| 0x2F00 | 当前模型故障 | UNSIGNED16 | 核心发布 | 当前已接受模型故障或适配/交换故障；缺失故障映射为 0x1000，交换看门狗为 0x8130；0 表示当前条件已消失，不是锁存记录 |
-| 0x2F01 | 模型心跳 | UNSIGNED32 | 模型 | 独立于反馈提交；模型存活时持续递增 |
-| 0x2F02 | 命令快照 | OCTET_STRING，56 字节 | 核心 | 版本 1 命令帧；字段布局见下表 |
-| 0x2F03 | 完整反馈提交 | OCTET_STRING，36 字节 | 模型 | 版本 1 反馈帧；字段布局见下表 |
-| 0x2F04 | 处理确认 | UNSIGNED32 | 核心 | 最后被 worker 完成处理的 feedback_seq，0 表示本代次尚无结果；须同时检查 0x2F05 |
-| 0x2F05 | 处理结果 | UNSIGNED16 | 核心 | 0=无结果、1=已接受、2=命令过期、3=内容无效；epoch 失效通过新命令快照通知 |
-
-- 当前单轴配置中，上述交换对象各表示唯一实例，不使用每轴 ARRAY 或轴 subindex 寻址；数据类型、长度与访问属性须由设备 JSON 的本地扩展描述。
-- command_view 中的标准 402 对象使用设备 JSON/EDS 中的实际索引；不应用 `0x6000 + n * 0x0800` 轴偏移，也不允许一个模型帧被解释为多个轴。
-- 0x2F01、0x2F03 为 SDO 只读、`local_write: true`，禁止 RPDO 写入；其余为核心只读发布、`local_write: false`。启动时验证权限及索引冲突。
-- 旧草案中的模型直接写 0x2F00、标准实际值以及“心跳最后写”方案被本协议替代；不改变现有通用批量 API 的逐条尝试语义。
-- 快照和反馈帧采用显式小端字段编码、固定长度、无隐式填充，不直接 memcpy 编译器结构体。实现前在接口头文件冻结版本 1 的逐字节偏移、长度、枚举、保留位和有效掩码；未知版本、错误长度、非法枚举/保留位须返回错误并诊断，不得截断或默认成功。
-- **协议 v1 已冻结**（`402/CO_402_protocol.h`）：所有整数均为小端，二补数 I32；固定长度，不允许尾随字节。版本为 1，长度字段必须精确匹配；保留位必须为 0。
-
-命令帧（0x2F02，56 字节）：
-
-| 偏移 | 宽度 | 字段 | 约束 |
-|---:|---:|---|---|
-| 0 | U8 | version | 必须为 1 |
-| 1 | U8 | length | 必须为 56 |
-| 2 | U8 | action | 0 none、1 shutdown、2 switchOn、3 enableOperation、4 disableOperation、5 quickStop、6 faultReaction、7 faultReset、8 disableVoltage |
-| 3 | U8 | flags | bit0 output_allowed、bit1 pp_ready；bit2..7 保留 |
-| 4 | U64 | epoch | 非零 |
-| 12 | U32 | command_seq | 非零 |
-| 16 | U32 | action_seq | 非零；无动作时仍为当前代次动作序号 |
-| 20 | U16 | controlword | 最近接受的原始主站值，仅供诊断/模型上下文，不授权模型重解析 |
-| 22 | U16 | statusword | 核心当前值 |
-| 24 | U8 | pds | 枚举 0..7，顺序同 `CO_402_PDS_*` |
-| 25 | I8 | mode | 0 未显示、1 PP；其他值非法 |
-| 26 | U16 | reserved | 必须为 0 |
-| 28 | I32 | demand_position | PP 核心 profile 输出，counts |
-| 32 | I32 | target_position | 最近接受的主站目标，counts |
-| 36 | U32 | profile_velocity | counts/s |
-| 40 | U32 | profile_acceleration | counts/s² |
-| 44 | U32 | profile_deceleration | counts/s² |
-| 48 | U32 | quick_stop_deceleration | counts/s² |
-| 52 | I32 | demand_velocity | counts/s |
-
-反馈帧（0x2F03，36 字节）：
-
-| 偏移 | 宽度 | 字段 | 约束 |
-|---:|---:|---|---|
-| 0 | U8 | version | 必须为 1 |
-| 1 | U8 | length | 必须为 36 |
-| 2 | U8 | action_result | 0 none、1 BUSY、2 DONE、3 ERROR |
-| 3 | U8 | flags | bit0 position_valid（必需）、bit1 velocity_valid、bit2 pp_ready、bit3 limited、bit4 reset_permitted；bit5..7 保留 |
-| 4 | U64 | epoch | 必须等于当前 epoch 且非零 |
-| 12 | U32 | feedback_seq | 非零、模序递增 |
-| 16 | U32 | command_seq | 必须引用保留历史内且未超 `command_max_age_us` 的核心命令 |
-| 20 | U32 | action_seq | 必须匹配当前动作序号 |
-| 24 | I32 | actual_position | 当 position_valid 时有效，counts |
-| 28 | I32 | actual_velocity | 仅 velocity_valid 时有效，counts/s |
-| 32 | U16 | fault_code | 0 无当前故障，非零为设备故障表代码 |
-| 34 | U16 | reserved | 必须为 0 |
-
-序号 0 保留为无值；U32 比较使用模序且有效窗口小于 2³¹。相同 `feedback_seq` 的完全相同重试可幂等应答但不刷新新鲜度；同序号不同内容、旧序号、未知命令或不匹配 action_seq 均拒绝。0x2F03 一次写入必须正好 36 字节；pending 未消费时只允许同帧重试，否则返回设备状态错误。0x2F04/0x2F05 分别发布被消费的 feedback_seq 和结果（0 none、1 accepted、2 stale、3 invalid）。
-- 位置为 I32 counts；U16 故障码原样对应设备故障表。PP 的位置比例、正方向、速度/加速度/减速度单位、限幅、target-reached 容差及持续时间由 JSON 明确，初始化时拒绝缺失或不一致配置。模型内部可用浮点，适配层负责有界转换，溢出不得静默回绕。
-- 首期 PP 必须具备有效位置反馈及 profile 参数；速度、力矩对象和 PT/CST 能力仅在未来模式扩展时纳入要求。
-- 模型故障经完整反馈进入核心，不使用 `xnet_canopen_set_fault` 代替 PDS 故障路径。心跳计数仅指示更新，超时使用 worker 本机单调时钟，不依赖模型墙钟。
+- 命令、pending 反馈、命令历史、处理确认和心跳时间保存在设备私有存储中；现有 runtime 锁保护短时复制/验收。每节点只有一个模型写入端口、一个未确认反馈，不创建 OD 或 batch 绑定。
+- 保留 epoch、command_seq、action_seq、反馈模序、幂等重试、命令年龄、启动/心跳/反馈/动作超时与安全停止握手。失败提交不污染标准实际值，成功暂存不代表动作完成。
+- 标准 402 OD 仍只按设备 EDS/JSON 的实际索引绑定，不做轴偏移；主站独占 target/profile，核心独占 PDS/Statusword，模型只消费 SI demand 和动作并提供反馈。
+- external 配置必须含 device_adapter 和五个超时；从模型 JSON 删除原交换扩展，从宿主删除对应 batch/OD 访问，改用 open/read/submit/heartbeat/close。保留通用 xnet OD/batch ABI 及其逐条尝试、无回滚语义。
+- 这些厂商索引不再由模型传输保留或特殊处理；真实设备若有同址对象，按普通 EDS/JSON 对象使用，不得被交换代码读写。旧配置若仍声明这些对象，它们也只是普通存储，不再驱动模型；旧宿主必须迁移，不能据 OD 写成功推断模型已收到反馈。
+- CO_402_protocol v1 的 counts 类型与反馈编码校验仅作为私有实现复用，字节布局不变；外部宿主无需打包 56/36 字节帧。新增确定流水线须按 §7.5.11 记录真实入口时间/周期和完整目标步，不能从普通 OD 或 worker 次数推断。
+- 模型故障经完整反馈进入核心，不使用 xnet_canopen_set_fault 代替 PDS 故障路径；单位、方向、坐标与溢出校验仍由设备适配层统一负责。
 
 ##### 7.5.2.1 Kinco FD 设备单位与转换边界
 
 依据：[Kinco 低压伺服驱动器手册，2022-06](../reference/202206_english_1716367640937755.pdf)。下文同时列出印刷页码与 PDF 页序。手册覆盖 FD 系列，EDS 为 2025-04-17 版本；已实现明确的运动速度/加减速换算，未确认项仍待核对，不能套用于其他厂商。本轮按用户确认允许未知 raw/core 单位 1:1 直通，但须输出报告/告警，不能将其标为手册已确认。
 
-**三层单位必须分开**：设备 OD 保存 Kinco 原始整数；402 核心与兼容 v1 帧使用 counts、counts/s、counts/s²；motor_drive_ 外部接口必须使用 §7.5.1.1 的 SI 单位。设备适配层统一负责三层之间的转换及设备端 OD 读写，Kinco 缩放常数不进入通用模型或 PDS 规则。不得直接把设备速度/加速度原始整数当作同数值的帧字段，也不得改变兼容 v1 字段的单位或字节布局。
+**三层单位必须分开**：设备 OD 保存 Kinco 原始整数；402 核心与私有 v1 类型使用 counts、counts/s、counts/s²；motor_drive_ 外部接口必须使用 §7.5.1.1 的 SI 单位。设备适配层统一负责三层之间的转换及设备端 OD 读写，Kinco 缩放常数不进入通用模型或 PDS 规则。不得直接把设备速度/加速度原始整数当作同数值的核心字段，也不得改变私有 v1 字段的单位或字节布局。
 
 设 `E` 为电机轴每转的有效编码器计数（counts/rev），`D_v`、`D_a` 为设备速度、加减速度原始整数：
 
@@ -522,17 +474,17 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 - 原始加减速度 100000 对应 `6103515.625 counts/s²`，在 `E = 10000` 下为 `610.3515625 rev/s²`，与手册约 610.352 rps/s 一致；帧舍入为 6103516。该例用于检验换算，不是要求所有设备使用此默认值。
 - T-MODEL-UNITS 覆盖样例、有符号速度、E/零点/方向、半值舍入和边界溢出。606B、6085、位置坐标的直通假设须列入报告并允许配置明确比例；6068 当前未绑定，到位窗口仍用现有 JSON 唯一来源，不伪称已确认时间单位。
 
-#### 7.5.3 批量分组（兼容后端适配层绑定，启动时完成）
+#### 7.5.3 端口建立与交换操作
 
-当前示例由模型侧交换代码绑定；后续迁入后端适配层，在 setup 阶段为唯一轴实例一次性绑定分组。motor_drive_ 模型不接触分组、batch ID 或编码。兼容命令/反馈帧仅承载 PP 所需的动作、位置 demand、位置反馈与诊断字段；通过版本与有效掩码为未来模式扩展保留空间。
+后端在初始化时绑定标准设备 OD 和单位，提供 endpoint；宿主在启动模型前打开唯一端口，不绑定模型交换 batch。当前独立线程 demo 直接使用同一 SI 端口，VeriStand signal/CD 桥接仍待实现。
 
-| 分组 | 方向 | 内容 | 状态 |
+| 操作 | 方向 | 内容 | 状态 |
 |---|---|---|---|
-| `command_view` | 读 | 本轴 0x2F02、0x6040、0x6041、0x6061、0x603F、0x2F04、0x2F05 | 首期 |
-| `feedback_submit` | 写 | 本轴 0x2F03，单一条目、完整帧 | 首期 |
-| `model_alive` | 写 | 本轴 0x2F01，独立条目 | 首期 |
+| `motor_drive_read_v1` | 读 | SI demand、动作、代次/序号、处理确认 | 已实现异步/启动/安全读取 |
+| `motor_drive_submit_v1` | 写 | 完整 SI 反馈、实际执行步、故障类别 | 已实现暂存/worker 验收 |
+| `motor_drive_heartbeat_v1` | 写 | 真实模型步和心跳序号 | 已实现，独立于反馈 |
 
-- 后端每次检查批量返回值及每条状态，只在全部成功且转换有效时返回业务快照。绑定类型/长度须与帧契约一致；CD 检查 motor_drive_ 返回值与处理确认，并经 signal 转发本节点结果，模型不解释 batch/API 后端状态。
+- 宿主检查 motor_drive_ 返回值与处理确认；失败时不得使用输出快照。模型不解释 batch/API 后端状态，诊断标准 OD 可另读但不作为执行输入。
 - 首期只接受 PP；其他模式值按 FR-MODE-03 拒绝。模型仍更新健康和实际反馈，但不得施加未接受模式的输出。
 - 未来新增模式须补充核心模式处理、模型能力、OD、参数及测试，不假定只增加模式表一行即可完成。
 
@@ -541,7 +493,7 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 1. 通信域按逐 SYNC 边界读取正常运动命令、推进 profile 并冻结 SI 命令；实际时间安全/协议检测持续执行。当前 worker 每轮处理的实现须按 §7.5.11 扩展，不能把轮次当作 SYNC。
 2. 异步 CD 调用 `motor_drive_read_v1`，按目标 PCL 步和源截止时间选择 SI 命令，并向本节点模型发布完整 signal 快照。模型在自己的 PCL 步锁存合法快照，在待机/FAULT 中也持续积分和报告实际值；无新正常命令时保持最后获准 demand，不能将 SYNC 间隔当作模型 dt。
 3. 模型经 signal 回传 source token/cycle、实际执行步、SI 实际值、动作结果与故障条件；CD 只采集完整步快照并调用 `motor_drive_submit_v1`。成功只表示暂存；未确认时保留提交且继续采集进展。确定模式按预定模型步/decimation 提交，确认须在下一预定提交前完成，否则报违约；有界异步模式可在确认后提交最新合法测量，但不能据此宣称固定选样。拒绝时诊断、重新获取合法命令；事件故障保持至已接受确认。
-4. CD 的 `motor_drive_heartbeat_v1` 只转发实际递增模型步，不由 CD 自增。异步 C 接口已实现并测试，缓存/幂等重试不刷新年龄；signal 桥接/固定计划仍待实现，当前 demo 继续兼容 batch/帧及独立模型线程。
+4. CD 的 `motor_drive_heartbeat_v1` 只转发实际递增模型步，不由 CD 自增。异步 C 接口已实现并测试，缓存/幂等重试不刷新年龄；signal 桥接/固定计划仍待实现，当前 demo 使用 SI 专用端口及独立模型线程。
 
 **动作与 PP 握手**：核心先发布动作请求而不是先提交目标 PDS 状态。`action_seq` 对每个新动作或抢占递增；模型以同 epoch、同 action_seq 返回 BUSY/DONE/ERROR。模型计算只执行有效命令，不自行重解原始 Controlword。PP 就绪通过匹配的动作/反馈确认；匹配动作的旧响应或被抢占动作的延迟 DONE 均不得生效。模式进入/退出握手属于未来模式扩展。
 
@@ -550,9 +502,9 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 #### 7.5.5 所有权与权限
 
 - **Target / profile 参数**：只由主站写，模型与核心只读；demand 使用命令帧中的独立字段。
-- **Statusword、mode_display、0x603F**：只由核心按状态规则发布，包括模型无反馈时的故障路径。**标准实际值、0x2F00**：只由核心从已接受反馈发布；无新反馈时保持并标记年龄。
-- **模型提交**：模型只写本节点 signal，由唯一 CD 端口提交反馈与真实步心跳；兼容后端仅本地写 0x2F01、0x2F03，网络不能写。不得将多个节点反馈拼成必须共同提交的事务。
-- OD 扩展回调只校验/复制完整反馈，不运行状态机、不产生 EMCY、不获取额外锁；状态、故障和 TPDO 由 worker 执行。
+- **Statusword、mode_display、0x603F**：只由核心按状态规则发布，包括模型无反馈时的故障路径。**标准实际值**：只由核心从已接受反馈发布；无新反馈时保持并标记年龄。当前故障条件保存在 worker 私有状态。
+- **模型提交**：模型只写本节点 signal，由唯一 CD 端口提交反馈与真实步心跳；独立线程 demo 直接调用该端口。网络和通用 OD/batch 均无模型邮箱写入路径，不得将多个节点反馈拼成必须共同提交的事务。
+- submit 只校验/转换/复制完整反馈，不运行状态机、不产生 EMCY；状态、故障和 TPDO 由 worker 执行。stop 握手期间保留已有 motor_drive_ 端口交换，通用 OD/batch 不再有停机豁免。
 
 #### 7.5.6 超时与缺省模型
 
@@ -562,33 +514,33 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 - **失联**：已连接 external 模型超时后失败关闭，不自动切到 InternalModel。对外实际值保留最后有效值但标记陈旧，不能当作安全状态或新的 target reached。
 - **InternalModel**：仅显式选择 internal 时启用，理想跟随 demand，并按相同动作/模式契约给出就绪响应；它不模拟真实动态，不需外部心跳。
 
-#### 7.5.7 批量接口的已知约束与应对
+#### 7.5.7 专用接口的完整性与通用批量接口边界
 
 | 约束（来自 `xnet_canopen.h`） | 对本设计的影响 | 应对 |
 |---|---|---|
-| 单次调用内加锁，跨调用不保持锁 | 锁可保证不被 worker 插入，但不能证明数据年龄 | command_view 含 worker 发布的 command_seq 与 epoch；诊断 get_status 不视作同一原子快照 |
-| `write_batch` 逐条尝试、无回滚 | 后面的心跳可能成功，前面的实际值却失败 | 用单条目完整帧扩展，长度/内容全部校验后才提交缓存；旧有效反馈不被失败写入污染 |
-| 批量写不推进状态机、不请求 TPDO | 提交与消费分开 | worker 消费后统一发布实际值与状态 |
-| 绑定不校验后续权限 | 配置错误可能到运行时才暴露 | 启动校验全部权限、类型、大小；调用时检查每条结果，错误显式诊断 |
+| 单次调用内加锁，跨调用不保持锁 | 锁不能证明数据年龄 | 专用 view 同锁返回 token/确认；诊断 get_status 不视作同一原子快照 |
+| `write_batch` 逐条尝试、无回滚 | 不适合作为模型提交事务 | 模型仅用 submit 全量校验/暂存；通用 batch 保持原语义 |
+| API 提交不推进状态机、不请求 TPDO | 提交与消费分开 | worker 消费后统一发布实际值与状态 |
+| OD 权限仅约束设备对象 | 不能代替模型 writer 所有权 | open 排他，submit 校验身份与步进；标准实际值仍禁止本地/RPDO 写 |
 
 **完整帧提交规则**
 
-以下保持当前 v1 兼容后端的单 pending/确认语义。新增时间侧车、有界已接受历史及固定采样计划叠加其上，不改变通用 batch 行为；“已接受”不等于该样本已经用于定时 TPDO，具体使用周期另行诊断。
+以下保持当前私有邮箱的单 pending/确认语义。新增时间侧车、有界已接受历史及固定采样计划叠加其上，不改变通用 batch 行为；“已接受”不等于该样本已经用于定时 TPDO，具体使用周期另行诊断。
 
-1. 单轴模型仅允许一个写入者，最多一个未确认反馈帧。0x2F03 的 OD 写扩展在现有 runtime 锁内先校验整个帧，再一次性复制为 pending；禁止分段提交、禁止先覆盖已接受标准实际值。pending 未处理时拒绝新提交并诊断；模型仍持续本地步进和心跳，收到确认后才提交下一帧，不能累积无界队列。相同序号的重试只允许完全相同的帧，且不得刷新反馈新鲜度。
+1. 单轴模型仅允许一个写入者，最多一个未确认反馈。submit 在现有 runtime 锁内先校验整个 SI 结构与转换结果，再一次性复制为 pending；禁止分段提交、禁止先覆盖已接受标准实际值。pending 未处理时拒绝新提交并诊断；模型仍持续本地步进和心跳，收到确认后才提交下一帧，不能累积无界队列。相同序号的重试只允许完全相同的反馈，且不得刷新反馈新鲜度。
 2. 校验版本、固定长度、当前 epoch、必需有效字段及源命令年龄；动作结果必须关联已发布 action_seq。反馈允许来自有界历史 command_seq，而非强求等于最新 worker 周期；超过 `command_max_age_us` 则拒绝，防止异步模型永远追不上快照。
-3. worker 再校验 epoch、命令年龄和动作相关性，合法时在同一锁内发布完整实际值及模式反馈，更新处理确认及结果；过期帧丢弃并发布拒绝结果，不改变 PDS、故障条件或反馈年龄。旧代次通过更换 epoch 清空确认，使模型放弃等待并重新握手。抢占前帧可保留有效实际测量，但旧动作完成响应不得提交状态。
+3. worker 再校验 epoch、命令年龄和动作相关性，合法时在同一锁内发布完整实际值及模式反馈，更新处理确认及结果；过期帧丢弃并发布拒绝结果，不改变 PDS、故障条件或反馈年龄。旧代次通过更换 epoch 清空确认，使模型放弃等待并重新握手。当前实现整帧拒绝被抢占动作的反馈，旧动作完成响应不得提交状态。
 4. epoch 为句柄内 U64 单调代次，在 initialize、协议复位、stop/start 的模型会话失效点更换，并清除 pending、动作响应及握手状态；Reset Communication 仍保留普通应用 OD，交换会话数据例外。复位/停止开始即撤销旧代次，任何跨越该点的计算结果均拒绝。单次安全停止的完成握手使用新代次；重启需重新握手，不自动恢复 OperationEnabled。
-5. command_seq、action_seq、feedback_seq 为 U32，0 保留为无值，按模序比较且有效窗口小于半范围；回绕行为须测试。epoch 不允许回绕复用，耗尽则拒绝启动并诊断。uninitialize 后批量 ID 失效，销毁前须停止 CD 端口调用；独立线程 demo 另需 join，VeriStand 模型由 Engine 终止，新端口不得接收旧 signal 缓存。
+5. command_seq、action_seq、feedback_seq 为 U32，0 保留为无值，按模序比较且有效窗口小于半范围；回绕行为须测试。epoch 不允许回绕复用，耗尽则拒绝启动并诊断。uninitialize 后已有模型端口失效（仍可 close），销毁前须停止 CD 端口调用；独立线程 demo 另需 join，VeriStand 模型由 Engine 终止，新端口不得接收旧 signal 缓存。
 
 #### 7.5.8 与当前实现的差距（待开发）
 
-当前 v1 交换、异步 SI 端口和设备单位适配已实现；逐帧接收观察已增加，但 VeriStand 流水线仍未完成：
+当前私有邮箱、异步 SI 端口和设备单位适配已实现，本地交换 OD 已移除；逐帧接收观察已增加，但 VeriStand 流水线仍未完成：
 
-1. **已实现** motor_drive_ 端口、版本化 SI 快照/反馈、通用结果/故障映射、模型步心跳；开端口后排除兼容反馈/心跳写入者。新结构及导出独立于既有 ABI。
+1. **已实现** motor_drive_ 端口、版本化 SI 快照/反馈、通用结果/故障映射、模型步心跳与唯一写入者；没有 OD/batch 模型旁路。新结构及导出独立于既有 ABI。
 2. **已实现** 初始化 role→OD 绑定、Kinco 明确比例、显式覆盖与未知 1:1 报告、方向/零点/SI 转换及有界量化；不能将未明坐标/单位称为设备实物已确认。
-3. **已实现** 公共接口和兼容帧共用完整暂存/worker 消费逻辑，不改 v1 帧/通用 batch 布局；专用定时邮箱/时间侧车仍待开发。
-4. **已验证** 软件单位样例/溢出/假设报告、SI 参数/反馈、writer 排他、幂等/旧步拒绝、故障映射、端口跨初始化失效和真实 worker PP/停止握手；旧 counts 模型测试继续通过。
+3. **已实现** 命令、完整反馈、心跳、确认均走专用私有邮箱；内部保留 v1 counts 类型/反馈编码，不改通用 batch 布局。专用定时邮箱/时间侧车仍待开发。
+4. **已验证** 软件单位样例/溢出/假设报告、SI 参数/反馈、writer 排他、幂等/旧步拒绝、故障映射、端口跨初始化失效和真实 worker PP/停止握手；独立模拟器已迁移到 SI 端口，原厂商索引可作为普通设备对象使用。
 5. `xnet_canopen_read_sync_event` 已逐帧记录每端口局部序号、原始 XNET 时间戳和可选 counter，64 项历史覆盖时显式报告；它仅为接收观察，不表示 SYNC 控制已逐边界执行，也不校验 counter 连续性或建立时间映射。仍需有序 RPDO/SYNC 边界处理、必需 RPDO 完整性检测和验证时钟映射；当前每轮至多读取一个 8 KiB 批次，控制路径的 SYNC 布尔标志仍可能合并。
 6. 区分 SYNC 控制推进和实际时间安全/协议检测；当前 `process_drive_402(dt)` 每 worker 轮调用，不能将 worker 次数当作 SYNC 序号。
 7. 按独立端口验证每节点隔离及跨端口 SYNC 关联；本部署不共享 NI-XNET 接口或总线资源所有者。
@@ -600,22 +552,22 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port);
 
 `xnet_canopen.h` 文件头已修订为：普通应用行为由外部模型提供，配置可显式启用库内单轴 PP 核心；NMT 与 DS402 状态仍分层。后续完成 external 接口时继续同步更新中英文说明。
 
-同时补充单次批量调用的锁语义、跨调用不原子及无数据年龄保证；不能把一次 read_batch 宣称为“所有字段必定同一产生周期”。帧协议的版本、布局、提交/消费、权限、代次和错误语义须在接口头文件及 xnet 中英文 README 中同步说明。保留通用 write_batch 无回滚语义，不修改其行为来实现事务。
+同时补充单次批量调用的锁语义、跨调用不原子及无数据年龄保证；不能把一次 read_batch 宣称为“所有字段必定同一产生周期”。专用接口的 ABI、提交/消费、权限、代次、错误语义和旧 OD 宿主迁移要求须在接口头文件及 xnet 中英文 README 中同步说明。保留通用 write_batch 无回滚语义，不修改其行为来实现事务。
 
 motor_drive.h 与中英文 README 已提供字段、结果、资源所有权/确认和配置/转换报告说明；业务接口不暴露 XNET，后端绑定函数单独提供。新函数不破坏已发布 xnet 布局；二进制 LabVIEW VI/CD 工程未自动更新。
 
 #### 7.5.10 外部电机驱动模型的 Slave 侧整合评估
 
-外部电机驱动模型与 xnet 从站位于同一 Slave 侧，后续通过 motor_drive_ SI 接口交互，不经过 CAN 总线；本地 batch/OD 是当前兼容后端。评估结论与待确认项如下：
+外部电机驱动模型与 xnet 从站位于同一 Slave 侧，通过 motor_drive_ SI 接口/私有邮箱交互，不经过 CAN 总线或本地 batch/OD。评估结论与待确认项如下：
 
 | 评估项 | 结论 | 依据 / 处理 |
 |---|---|---|
 | 数据通道 | CD 调用本地 C API，模型通过 VeriStand signal；不产生额外模型 CAN 报文 | CD/FIFO、PCL 映射/步进和返回链路均有延迟，按 §7.5.11 验证，不默认一周期往返 |
 | 故障检测边界 | worker 存活且可取得锁时，能检测模型无锁挂起和无有效反馈 | 同进程崩溃可终止整个服务；持锁挂起可阻止超时检测，不宣称进程级故障隔离 |
 | 锁与抖动 | 短时交换、锁外计算 | 回调只校验/复制固定大小帧，不执行文件 I/O 或模型步进；耗时仅作诊断记录 |
-| 访问与完整性 | 仅心跳、完整帧允许本地模型写 | 网络写交换对象、直接写标准实际值均被拒绝；原子性来自单帧 OD 扩展，不来自 write_batch |
-| 复位与生命周期 | 批量 ID 可保留，模型会话必须失效 | uninitialize 后重新绑定；Reset/stop/start 更新 epoch 并重新握手 |
-| ABI | 保持既有 xnet 布局和 counts 帧；已新增独立 motor_drive_ 头文件及 backend 绑定/报告函数 | 异步 SI 已实现；专用定时邮箱仍待开发，不能宣称已具备 SYNC/PCL 确定能力 |
+| 访问与完整性 | 仅专用端口提交反馈/心跳 | 没有网络交换对象；原子性来自 submit 全量暂存，不来自 write_batch |
+| 复位与生命周期 | 已有端口保留但模型会话必须失效 | uninitialize 后重新取得 endpoint/open；Reset/stop/start 更新 epoch 并重新握手 |
+| ABI | 保持既有 xnet 布局与 motor_drive_ SI ABI；内部 counts 编码不变 | 移除旧 OD 传输，宿主必须迁移；定时邮箱仍待开发，不能宣称已具备 SYNC/PCL 确定能力 |
 | 宿主执行 | 多 CD/slave 实例与每节点一个 PCL 模型，异步桥接 | 不要求模型线程或组级提交；进程隔离/崩溃恢复非本接口的隐含保证 |
 | 驱动响应 | 模型不拥有 PDS，但提供动作完成、PP 就绪和实际位置动态 | 核心保留状态生成权，避免双状态机及“先转换再等待完成”的循环依赖 |
 
@@ -717,15 +669,15 @@ VeriStand HIL 引擎
 | CD / 模型交换适配层 | VeriStand 异步通信侧 | motor_drive_ 端口、时间/身份/缓冲及 signal | 不步进模型、不阻塞 PCL、不建立模型组级事务 |
 | 外部电机驱动模型 | VeriStand PCL | 本节点 signal 的动作、SI demand、来源与目标步 | 不访问 OD/XNET/C 句柄，不生成 PDS/Statusword，不重复 profile；返回 SI 实际值、动作响应、故障及真实模型步 |
 
-- 外部模型与 402 核心没有直接调用；通过 signal/CD/motor_drive_ 端口异步交换，兼容后端内部使用 OD/batch。InternalModel 遵守同一动作/运动语义，不要求经过外部通道。
+- 外部模型与 402 核心没有直接调用；通过 signal/CD/motor_drive_ 端口和私有邮箱异步交换，不使用 OD/batch。InternalModel 遵守同一动作/运动语义，不要求经过外部通道。
 - 402 核心依赖的是纯结构体，因此可以脱离 xnet 做单元测试（§10.1）。
 
 #### 7.7 系统工作流程
 
 **启动阶段**
 
-1. ECU 配置 SYNC 与目标 PDO；VeriStand 为各 CD 配置独立 Node-ID、JSON、模型和 signal 命名空间。校验 OD/PDO/单位、external 兼容对象、各段超时和流水线预算；对象不由运行时补齐，同接口资源冲突必须拒绝。
-2. 初始化总线所有者和逐帧/SYNC 入口、每节点 OD/PDS/epoch 与独立端口，默认禁止输出；兼容 backend 的 batch 与时间侧车均需校验。
+1. ECU 配置 SYNC 与目标 PDO；VeriStand 为各 CD 配置独立 Node-ID、JSON、模型和 signal 命名空间。校验 OD/PDO/单位、external 设备适配配置、各段超时和流水线预算；对象不由运行时补齐，同接口资源冲突必须拒绝。
+2. 初始化总线所有者和逐帧/SYNC 入口、每节点 OD/PDS/epoch 与独立端口，默认禁止输出；后端单位绑定与新增时间侧车均需校验。
 3. Engine 初始化各模型并启动 PCL；取得真实 PCL 进展/时基，建立有效映射与完整 signal 通道。CD 以本节点当前 epoch 的 SI 反馈和真实步心跳完成启动握手；启动期限须覆盖部署启动次序，模型未运行不得由 CD 代报就绪。external 缺失不回退 internal。
 4. SYNC 历史/延迟管线填充完成后才允许普通运动。NMT Operational 不等于 DS402 就绪，仍须 PP 模型就绪及 ECU 使能序列。
 
@@ -770,22 +722,22 @@ ECU                 节点核心/适配           异步 CD             PCL 模�
 
 | 来源 | 触发条件 | 核心动作 | 0x603F 写入值 |
 |---|---|---|---|
-| 持续模型故障 | motor_drive_ 当前 fault_class/detail 经设备适配映射为非零码；兼容后端使用 fault_code 并发布到 0x2F00 | 锁存，执行 FaultReaction，完成或无反馈失败关闭后进入 FAULT | 已接受的设备故障映射码（兼容后端为 0x2F00 的值） |
+| 持续模型故障 | motor_drive_ 当前 fault_class/detail 经设备适配映射为非零码，worker 保存当前条件 | 锁存，执行 FaultReaction，完成或无反馈失败关闭后进入 FAULT | 已接受的设备故障映射码 |
 | 心跳超时 | 运行时心跳实际年龄超限，或启动握手到期 | 同上 | 0x8130，并在诊断载荷区分本地模型超时与网络心跳 |
 | 完整反馈/动作超时 | 心跳可正常但无完整反馈或动作未完成 | 同上 | 按设备故障表配置的非零模型错误码，启动时校验 |
 | 本地故障 | PDS 操作失败、Controlword 读取失败（FR-FLT-01） | 同上 | 核心内部代码 |
 
 - external 从启动握手开始即受超时管理，握手完成后持续监测；InternalModel 不触发外部存活超时。
-- 0x2F00 为当前条件，不是锁存记录；模型只在对应条件真正消失后，在完整帧中报告 0。故障源仍存在时不得因读到 FAULT 就清零；事件型故障须在模型中保持至收到已接受确认（0x2F05=1），拒绝结果不算已报告。
+- fault_class/detail 表示当前条件，不是锁存记录；模型只在对应条件真正消失后，在完整反馈中报告 0。故障源仍存在时不得因读到 FAULT 就清零；事件型故障须在模型中保持至收到同 epoch、匹配 feedback_seq 的 processed_result=ACCEPTED，拒绝结果不算已报告。
 
 **故障处理流程**
 
 ```
- 模型提交完整帧 fault_code = code
+ 模型提交完整 SI 反馈 fault_class/detail
         │
         ▼  下一周期 worker
  ┌──────────────────────────────┐
- │ 发布 0x2F00，首次锁存到 0x603F │
+ │ 映射设备码，首次锁存到 0x603F │
  │ 通过 301 发送 EMCY             │
  │ 状态 → FAULT_REACTION_ACTIVE  │
  │ 调用 faultReaction 回调       │  ← 可抢占 BUSY 动作（FR-DRV-03）
@@ -794,7 +746,7 @@ ECU                 节点核心/适配           异步 CD             PCL 模�
         状态 → FAULT（Statusword bit3=1）
                 │
                 ▼
- 模型持续反馈和心跳；故障条件消失后报告 fault_code=0 与复位许可
+ 模型持续反馈和心跳；故障条件消失后报告 fault_class/detail=0 与复位许可
 ```
 
 - **锁存规则**：同一故障周期首次码保留到成功复位；FAULT 中后续新故障报告 EMCY，不改首次锁存码。相同持续条件不逐周期重复发 EMCY，变化/重新出现时才报告。
@@ -806,7 +758,7 @@ ECU                 节点核心/适配           异步 CD             PCL 模�
 
 - 只能由主站在 FAULT 下以 bit7 上升沿发起；通过 §6.3 健康与许可检查后发布 faultReset，匹配 DONE 后才清除 0x603F 并回到 `SWITCH_ON_DISABLED`。
 - 模型不能复位故障，也不能清除 0x603F。
-- **复位拒绝**：0x2F00 非零、反馈/心跳过期、模型未允许复位或仍有核心故障条件时均拒绝，诊断原因且保留 FAULT 和锁存码。
+- **复位拒绝**：当前模型/适配故障非零、反馈/心跳过期、模型未允许复位或仍有核心故障条件时均拒绝，诊断原因且保留 FAULT 和锁存码。
 - 条件清除不自动复位；主站必须重新产生可被采样的 0→1。参考 Beckhoff 的主站控制器若持续保持 bit7=1，应在主站适配中改成受控脉冲，不改变从站边沿规则。
 
 **安全抢占**
@@ -852,16 +804,16 @@ ECU                 节点核心/适配           异步 CD             PCL 模�
 
 1. **许可证与复用 [待确认]**：确认 canopennode-rtt 的许可证是否允许将其实现移植到本仓库；若不允许，按其公开行为重新实现。
 2. **设备配置与实例范围（已确定/实现前核对）**：每 slave 单轴，多 CD 实例各自独占不同 NI-XNET 端口，独立 OD/模型和唯一 Node-ID，不做单节点轴偏移。核对 EDS 转换 JSON 的 PP 必需项，不满足则报告配置不兼容，不自动补项。
-3. **xnet ABI 与模型业务接口（已确定/实现）**：既有 xnet 结构/通用 batch/v1 帧不变；新增 motor_drive_ 不透明 SI 端口及 backend endpoint/单位报告函数。设备适配层统一转换/OD 读写；writer 排他仅在显式开端口时生效，不影响普通旧配置。
+3. **xnet ABI 与模型业务接口（已确定/实现）**：既有 xnet 结构/通用 batch 与 motor_drive_ SI ABI 不变；模型只通过专用端口交换。删除原本地交换 OD 的校验/特殊处理，外部配置必需 device_adapter；旧 OD 宿主必须迁移，普通未启用 402 的配置不变。
 4. **首期模式（已确定）**：只实现 PP；PV、PT、HM、CSP、CSV、CST 等均为未来扩展。首期不支持运行时模式切换。
 5. **验证目标（已确定）**：CANopen 毫秒级功能验证不宣称硬实时；确定流水线另外配置/验证时钟误差、固定延迟、采纳与发送截止预算，违约显式诊断，不以普通功能通过替代。
 6. **NMT/DS402 边界（已确定）**：NMT 管理底层通信；DS402 查询 NMT 状态并独占决定电机控制动作、PDS 转换及相关 OD 更新。各 NMT 状态下 DS402 的具体命令接受与输出策略须在 DS402 行为表和测试中定义。
 7. **控制权边界（已确定）**：PDS 和 Statusword 归核心；普通转换由主站发起，模型只提供动作结果、PP 就绪、实际值、限幅及故障条件。动作完成影响转换时机，模型不能指定目标 PDS。
-8. **故障与恢复（已确定）**：0x2F00 为完整反馈导出的当前故障条件，不直接由模型写；首次码锁存到 0x603F，后续新条件独立 EMCY。仅故障源消失且健康、复位许可成立时接受主站新边沿，并等待匹配动作完成。
+8. **故障与恢复（已确定）**：当前故障由完整 SI 反馈映射后保存在 worker 私有状态；首次码锁存到 0x603F，后续新条件独立 EMCY。仅故障源消失且健康、复位许可成立时接受主站新边沿，并等待匹配动作完成。
 9. **执行与轨迹所有权（已确定）**：ECU 控制运动并产生 SYNC；通信域负责每节点核心，异步 CD 桥接 signal，PCL 固定步长执行一节点一模型。核心负责 PP profile/斜坡，模型负责跟踪动态/限幅，无第二份 PDS、无组级反馈/等待。
-10. **交换与生命周期（已确定）**：单条目完整帧校验提交，独立心跳，worker 统一消费；代次/序号防旧帧，external 缺失或失联不回退 internal。
-11. **实现前协议冻结（实现前完成）**：按 §7.5 冻结帧版本 1 的逐字节布局、首期动作/反馈枚举、错误码表、JSON schema 和诊断字段，提供编码往返测试；不得边联调边猜测结构体布局。
-12. **实现状态**：协议 v1 已冻结，JSON external 配置校验、帧编解码/提交、心跳与命令新鲜度校验、反馈消费、动作 BUSY/DONE/ERROR、PP readiness/reset permission、故障发布和 reset/stop epoch 更新已接入。仍须持续验证设备 EDS 的实际语义、故障码映射、驱动时序和硬件行为；不得据此宣称硬实时或硬件安全认证。
+10. **交换与生命周期（已确定）**：专用接口完整反馈校验提交，独立心跳，worker 统一消费；代次/序号防旧帧，external 缺失或失联不回退 internal。stop 期间已有端口继续交换，模型退出/join 后 close，再 uninitialize/destroy。
+11. **接口冻结**：按 §7.5 和 motor_drive.h 固定 ABI/大小、动作/反馈枚举、错误码、JSON schema 和生命周期；私有协议 v1 字节布局不变，保留编码往返测试，不再将其定义为本地 OD 布局。
+12. **实现状态**：专用私有邮箱、JSON external 适配配置校验、SI 提交、心跳与命令新鲜度校验、反馈消费、动作 BUSY/DONE/ERROR、PP readiness/reset permission、故障发布和 reset/stop epoch 更新已接入；模拟器也已迁移。仍须持续验证设备 EDS 的实际语义、故障码映射、驱动时序和硬件行为；不得据此宣称硬实时或硬件安全认证。
 13. **跨域流水线（已确定）**：各端口 SYNC 观察与经验证的跨端口关联、硬件 RX 时间/验证映射、独立节点双缓冲与有界历史、闭合截止选样；确定模式需完整目标步 signal 传输与固定反馈采样/提交计划。能力不足时只能显式有界异步模式，不能承诺各轴同一步生效。
 14. **关闭与恢复（已确定）**：PCL/signal 可用时先异步停止；已停止时有界失败关闭并报告未确认。节点、总线、PCL 代次分别失效；单节点故障不阻塞其他节点，多轴整体策略由 ECU/监督层决定。
 
@@ -886,10 +838,10 @@ ECU                 节点核心/适配           异步 CD             PCL 模�
 | T-NMT | NMT 状态改变本身不直接改写 PDS；DS402 按自身策略读取 NMT 状态并更新 PDS/OD |
 | T-AXIS | 单轴 JSON/OD 绑定；不得将其他 OD 项解释成额外的 402 轴 |
 | T-MODEL-ACTION | 模型延迟完成、ERROR、动作超时、安全抢占与迟到 DONE；PP 未就绪时不输出 PP demand |
-| T-MODEL-FRAME | 编解码、长度/版本/枚举/有效位错误、部分写失败、pending 占用、重复提交不刷新年龄、拒绝确认与重算；失败不得污染实际值 |
+| T-MODEL-FRAME | SI ABI/大小/枚举/有效位错误、pending 占用、重复提交不刷新年龄、拒绝确认与重算；私有编解码回归；失败不得污染实际值；无交换 OD 也能工作，同址设备 OD 不被截获 |
 | T-MODEL-LIFE | 启动无反馈、待机/FAULT 心跳、心跳正常但反馈超时、外部失联不回退、单调时钟判断及计数回绕 |
 | T-MODEL-RESET | 计算期间 Reset/stop/start、旧代次/旧动作拒绝、uninitialize 后重绑/CD 调用停用、旧 signal 拒绝及 demo 线程退出；持续故障不允许复位，条件消失后必须新边沿 |
-| T-MODEL-UNITS | motor_drive_ SI ↔ 核心 counts ↔ 手册 OD 原始单位；Target 不被覆盖、PP profile 不重复、正负方向/零点、单位缩放/量化/溢出、NaN/Inf 拒绝、限幅及 target reached 单一参数来源；兼容帧单位不变 |
+| T-MODEL-UNITS | motor_drive_ SI ↔ 核心 counts ↔ 手册 OD 原始单位；Target 不被覆盖、PP profile 不重复、正负方向/零点、单位缩放/量化/溢出、NaN/Inf 拒绝、限幅及 target reached 单一参数来源；私有 counts 类型单位不变 |
 | T-SYNC-PIPE | 同一 RX 批次多个 SYNC 不合并；RPDO 在边界前后归属/缺帧/保持策略；counter 回绕、跳号和不可判定窗口；无 counter 不冒充主站绝对序号 |
 | T-CLOCK-CUTOFF | RX/PCL 时钟映射、误差保护带/失效；截止水位未闭合不选 latest；命令/反馈在截止前、恰好截止及之后的选择；超龄与旧代次拒绝 |
 | T-SIGNAL-SAMPLE | 目标步提前/晚到、固定步长保持、完整 bank/commit、读者占槽、队列溢出；U64 拆分往返含大于 2^53；混步/旧缓存拒绝，CD 存活不能掩盖模型步停止 |
@@ -904,8 +856,8 @@ ECU                 节点核心/适配           异步 CD             PCL 模�
 - 使用一份普通设备 JSON 和一份启用 402 的 EDS 转换 JSON 验证初始化分支；后者缺少 PP 必需 OD 或 PDO 配置不合法时必须启动失败。
 - 通过 SDO / PDO 写 0x6040，检查 0x6041 状态序列。
 - 覆盖 Reset Node、Reset Communication、NMT 切换和 Node Guarding 超时；验证 NMT 层不直接执行电机控制动作，PDS/Statusword 变化只由 DS402 产生。
-- 使用 fake XNET 加同进程模型线程验证单轴 RPDO → 402 → TPDO 顺序、帧提交与消费、序号/代次及本地/网络权限；验证当前配置不创建或隐式处理额外 402 轴。
-- 注入单帧写失败、批量其他条目失败、模型延迟/无锁挂起、持续故障和复位竞争；验证失败不被心跳成功掩盖，拒绝帧可恢复重算。
+- 使用 fake XNET 加同进程模型线程验证单轴 RPDO → 402 → TPDO 顺序、SI 提交与消费、序号/代次及本地/网络权限；验证不创建交换 OD、不隐式处理额外 402 轴，停机仅允许专用端口交换。
+- 注入完整提交失败、模型延迟/无锁挂起、持续故障和复位竞争；验证失败不被心跳成功掩盖，拒绝反馈可恢复重算。通用 batch 逐条失败语义另行回归，不作为模型提交路径。
 - 理想跟随模型先验收，再加入可配置延迟、斜坡跟踪误差、限幅、故障源；同一契约下替换复杂模型。若采用 Simulink 生成代码，验证 initialize/step/terminate、端口类型与固定步长；TwinCAT TcCOM 或 FMU 不是本地 C API 的隐式运行时。
 - 以功能正确性及 CANopen 毫秒级基本控制为基础，确定模式另按 §8.4 验证预算与关联，不构成硬实时/安全认证。
 
@@ -933,11 +885,11 @@ ECU                 节点核心/适配           异步 CD             PCL 模�
 
 | 阶段 | 内容 | 出口标准 |
 |---|---|---|
-| M0 | 决策：§9 待确认项、兼容 PP 帧及 motor_drive_ 布局/结果、JSON/时间/缓冲预算冻结 | EDS/PP 校验、后端资源与 signal 布局规则明确，接口编码往返测试可执行 |
+| M0 | 决策：§9 待确认项、私有 PP 类型及 motor_drive_ 布局/结果、JSON/时间/缓冲预算冻结 | EDS/PP 校验、后端资源与 signal 布局规则明确，接口编码往返测试可执行 |
 | M1 | C++ 核心：驱动动作、PDS 状态机、Controlword/Statusword | T-PDS、T-CW、T-SW 通过 |
 | M2 | JSON OD/PDO 初始化校验、单轴 OD 绑定与 PP 能力声明 | T-CONFIG、T-MODE、T-AXIS 通过 |
 | M3 | 故障、复位、安全抢占 | T-SAFE、T-FLT、T-RST 通过 |
-| M4 | xnet 与单轴模型适配：帧/OD 权限、握手、SI 端口、消费与 Reset 重绑 | T-MODEL-* 与 fake XNET 集成测试通过，ABI 无破坏，故障/旧帧不污染有效状态 |
+| M4 | xnet 与单轴模型适配：设备 OD 权限、握手、SI 私有邮箱、消费与 Reset 代次 | T-MODEL-* 与 fake XNET 集成测试通过，ABI 无破坏，故障/旧反馈不污染有效状态 |
 | M4a | VeriStand 多节点异步 CD：独立端口、逐 SYNC/时间入口、signal/PCL 端口、历史/双缓冲与关闭 | T-SYNC/T-CLOCK/T-SIGNAL/T-PIPE 及 §10.2.1 通过，固定采纳/选样预算可验证，无模型组级依赖 |
 | M5 | 未来模式扩展（不属于首期） | 另行定义范围与需求后启动 |
 | M6 | 可选 Kinco FD124 行为对照 | §10.3 的对象/PDO 与功能序列记录完成；非首期出口条件 |

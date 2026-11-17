@@ -4,7 +4,7 @@
  * @file Slave-side PP tracking plant, without a PDS or profile generator.
  * @copyright 2026 CANopenNode contributors
  */
-#include "402/CO_402_protocol.h"
+#include "motor_drive.h"
 #include <cstdint>
 #include <filesystem>
 
@@ -14,18 +14,19 @@ struct Parameters {
     uint32_t action_delay_us = 10000;
     double position_gain = 40;
     double velocity_time_constant_s = 0.01;
-    double max_velocity = 200000;
-    double max_acceleration = 2000000;
-    double stop_deceleration = 1000000;
-    int32_t min_position = -1000000;
-    int32_t max_position = 1000000;
-    int32_t initial_position = 0;
-    uint16_t fault_code = 0;
+    double max_velocity = 125.66370614359172;
+    double max_acceleration = 1256.6370614359173;
+    double stop_deceleration = 628.3185307179587;
+    double min_position = -628.3185307179587;
+    double max_position = 628.3185307179587;
+    double initial_position = 0;
+    uint32_t fault_class = 0;
+    uint32_t fault_detail = 0;
     uint32_t fault_after_us = 0;
     uint32_t fault_duration_us = 0;
     uint32_t freeze_feedback_after_us = 0;
     uint32_t freeze_heartbeat_after_us = 0;
-    uint8_t error_action = CO_402_ACTION_NONE;
+    uint8_t error_action = MOTOR_DRIVE_ACTION_NONE;
 
     void validate() const;
 };
@@ -35,7 +36,7 @@ Parameters read_parameters(const std::filesystem::path& path);
 class Motor {
 public:
     explicit Motor(Parameters parameters);
-    CO_402_feedback_frame_t step(const CO_402_command_frame_t& command, uint64_t elapsed_us);
+    motor_drive_feedback_v1 step(const motor_drive_view_v1& command, uint64_t elapsed_us);
     bool feedback_enabled(uint64_t elapsed_us) const;
     bool heartbeat_enabled(uint64_t elapsed_us) const;
 private:

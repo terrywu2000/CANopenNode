@@ -14,7 +14,12 @@
     "heartbeat_timeout_us": 200000,
     "feedback_timeout_us": 200000,
     "action_timeout_us": 1000000,
-    "command_max_age_us": 100000
+    "command_max_age_us": 100000,
+    "device_adapter": {
+      "unit_profile": "counts",
+      "counts_per_revolution": 10000,
+      "fault_mapping": [{"class": 2, "detail": 7, "device_code": "0x2310"}]
+    }
   },
   "objects": [
     {"index": "0x603F", "type": "UNSIGNED16", "value": 0, "access": "ro"},
@@ -29,13 +34,7 @@
     {"index": "0x6083", "type": "UNSIGNED32", "value": 100000, "access": "rw"},
     {"index": "0x6084", "type": "UNSIGNED32", "value": 100000, "access": "rw"},
     {"index": "0x6085", "type": "UNSIGNED32", "value": 100000, "access": "rw"},
-    {"index": "0x6502", "type": "UNSIGNED32", "value": 1, "access": "ro"},
-    {"index": "0x2F00", "type": "UNSIGNED16", "value": 0, "access": "ro", "local_write": false},
-    {"index": "0x2F01", "type": "UNSIGNED32", "value": 0, "access": "ro", "local_write": true},
-    {"index": "0x2F02", "type": "OCTET_STRING", "size": 56, "value": [], "access": "ro", "local_write": false},
-    {"index": "0x2F03", "type": "OCTET_STRING", "size": 36, "value": [], "access": "ro", "local_write": true},
-    {"index": "0x2F04", "type": "UNSIGNED32", "value": 0, "access": "ro", "local_write": false},
-    {"index": "0x2F05", "type": "UNSIGNED16", "value": 0, "access": "ro", "local_write": false}
+    {"index": "0x6502", "type": "UNSIGNED32", "value": 1, "access": "ro"}
   ],
   "rpdos": [
     {"transmission_type": 255, "mapping": [

@@ -9,7 +9,7 @@ if(NOT XNET_CANOPEN_BUILD_MODSIM_APP AND NOT XNET_CANOPEN_BUILD_TESTS)
     return()
 endif()
 set(MODSIM_STACK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
-add_library(xnet_canopen_modsim_model STATIC motor.cpp "${MODSIM_STACK_ROOT}/402/CO_402_protocol.c")
+add_library(xnet_canopen_modsim_model STATIC motor.cpp)
 target_compile_features(xnet_canopen_modsim_model PUBLIC cxx_std_17 c_std_99)
 target_include_directories(xnet_canopen_modsim_model PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}" "${MODSIM_STACK_ROOT}" "${CMAKE_CURRENT_SOURCE_DIR}/../.."

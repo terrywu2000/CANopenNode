@@ -219,7 +219,6 @@ void xnet_canopen_device::setup_stack() {
     // Extensions point into the old stack allocation; detach them before rebuilding services.
     for (auto& entry : model->entries) entry.extension = nullptr;
     drive_mode_od = {};
-    drive_feedback_od = {};
     if (co) { CO_delete(co); co = nullptr; }
     // Also reached by ordinary start/restart: update node-dependent identifiers,
     // but do not restore OD defaults here, since stop/start preserves device data.
@@ -275,17 +274,6 @@ void xnet_canopen_device::setup_stack() {
             drive_mode_od.extension.write = write_drive_mode;
             require(OD_extension_init(entry, &drive_mode_od.extension) == ODR_OK,
                 XNET_CO_STACK_ERROR, "cannot install DS402 mode OD handler");
-            if (model->drive_402_external) {
-                drive_feedback_od.device = this;
-                auto* feedback_entry = OD_find(&model->od, 0x2f03);
-                require(OD_getSub(feedback_entry, 0, &drive_feedback_od.original, false) == ODR_OK,
-                    XNET_CO_STACK_ERROR, "cannot bind external DS402 feedback OD handler");
-                drive_feedback_od.extension.object = &drive_feedback_od;
-                drive_feedback_od.extension.read = read_drive_feedback;
-                drive_feedback_od.extension.write = write_drive_feedback;
-                require(OD_extension_init(feedback_entry, &drive_feedback_od.extension) == ODR_OK,
-                    XNET_CO_STACK_ERROR, "cannot install external DS402 feedback OD handler");
-            }
         }
     }
     log(xco::LogLevel::info, "CANopen services initialized");
@@ -389,34 +377,6 @@ ODR_t xnet_canopen_device::read_drive_mode(
     return result;
 }
 
-ODR_t xnet_canopen_device::read_drive_feedback(
-    OD_stream_t* stream, void* buffer, OD_size_t count, OD_size_t* transferred) {
-    auto& binding = *static_cast<DriveFeedbackOD*>(stream->object);
-    auto original = *stream;
-    original.object = binding.original.stream.object;
-    const auto result = binding.original.read(&original, buffer, count, transferred);
-    stream->dataOffset = original.dataOffset;
-    return result;
-}
-
-ODR_t xnet_canopen_device::write_drive_feedback(
-    OD_stream_t* stream, const void* buffer, OD_size_t count, OD_size_t* transferred) {
-    auto& binding = *static_cast<DriveFeedbackOD*>(stream->object);
-    auto& d = *binding.device;
-    if (!buffer || !transferred || stream->subIndex != 0 || count != CO_402_FEEDBACK_FRAME_SIZE
-        || count != stream->dataLength || stream->dataOffset != 0) return ODR_TYPE_MISMATCH;
-    CO_402_feedback_frame_t frame{};
-    const auto* bytes = static_cast<const uint8_t*>(buffer);
-    if (!CO_402_feedback_unpack(&frame, bytes, count)) return ODR_INVALID_VALUE;
-    if (d.drive_endpoint && d.drive_endpoint->writer_open) return ODR_DATA_DEV_STATE;
-    const auto result = d.stage_drive_feedback(frame, bytes);
-    if (result == ODR_OK) {
-        *transferred = count;
-        stream->dataOffset += count;
-    }
-    return result;
-}
-
 ODR_t xnet_canopen_device::stage_drive_feedback(const CO_402_feedback_frame_t& frame, const uint8_t* bytes) {
     if (drive_feedback_pending)
         return frame.feedback_seq == drive_pending_feedback.feedback_seq
@@ -433,7 +393,6 @@ ODR_t xnet_canopen_device::stage_drive_feedback(const CO_402_feedback_frame_t& f
     drive_has_last_submitted = true;
     std::memcpy(drive_pending_feedback_bytes.data(), bytes, CO_402_FEEDBACK_FRAME_SIZE);
     drive_feedback_pending = true;
-    std::memcpy(model->value(0x2f03, 0).data(), bytes, CO_402_FEEDBACK_FRAME_SIZE);
     return ODR_OK;
 }
 
@@ -443,6 +402,9 @@ void xnet_canopen_device::start_drive_epoch() {
     ++drive_epoch;
     drive_adapter_fault = false;
     drive_command_seq = 0;
+    drive_command = {};
+    drive_processed_feedback_seq = 0;
+    drive_processed_result = 0;
     drive_action_seq = 1;
     drive_last_feedback_seq = 0;
     drive_last_submitted_seq = 0;
@@ -457,8 +419,7 @@ void xnet_canopen_device::start_drive_epoch() {
     drive_last_feedback_bytes = {};
     drive_last_submitted_bytes = {};
     drive_has_heartbeat = false;
-    drive_heartbeat_baseline = read_drive_value<uint32_t>(*model, 0x2f01);
-    drive_last_heartbeat = drive_heartbeat_baseline;
+    drive_last_heartbeat = 0;
     drive_heartbeat_changed = {};
     drive_started_at = xco::Clock::now();
     drive_startup_complete = false;
@@ -473,9 +434,6 @@ void xnet_canopen_device::start_drive_epoch() {
     drive_has_previous_pds = false;
     drive_pp_ready = false;
     drive_reset_permitted = false;
-    write_drive_value(*model, 0x2f00, uint16_t{0});
-    write_drive_value(*model, 0x2f04, uint32_t{0});
-    write_drive_value(*model, 0x2f05, uint16_t{0});
 }
 
 void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_operational) {
@@ -509,13 +467,6 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
     const auto now = xco::Clock::now();
     const auto previous_status = drive_402->status();
     if (model->drive_402_external) {
-        const uint32_t heartbeat = read_drive_value<uint32_t>(*model, 0x2f01);
-        if (heartbeat != 0 && ((!drive_has_heartbeat && heartbeat != drive_heartbeat_baseline)
-            || (drive_has_heartbeat && sequence_newer(heartbeat, drive_last_heartbeat)))) {
-            drive_last_heartbeat = heartbeat;
-            drive_has_heartbeat = true;
-            drive_heartbeat_changed = now;
-        }
         const bool heartbeat_expired = drive_has_heartbeat
             && now - drive_heartbeat_changed >= std::chrono::microseconds(model->drive_heartbeat_timeout_us);
         const auto action_deadline = drive_action_started + std::chrono::microseconds(model->drive_action_timeout_us);
@@ -558,8 +509,8 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
                 input.action_response_seq = frame.action_seq;
                 input.action_result = frame.action_result;
             }
-            write_drive_value(*model, 0x2f04, frame.feedback_seq);
-            write_drive_value(*model, 0x2f05, result);
+            drive_processed_feedback_seq = frame.feedback_seq;
+            drive_processed_result = result;
             drive_feedback_pending = false;
         }
         input.external_feedback_age_valid = true;
@@ -630,16 +581,12 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
         command.profile_deceleration = input.profile_deceleration;
         command.quick_stop_deceleration = input.quick_stop_deceleration;
         command.demand_velocity = status.demand_velocity;
-        std::array<uint8_t, CO_402_COMMAND_FRAME_SIZE> command_bytes{};
-        require(CO_402_command_pack(&command, command_bytes.data(), command_bytes.size()),
-            XNET_CO_INTERNAL_ERROR, "cannot encode DS402 command frame");
-        std::memcpy(model->value(0x2f02, 0).data(), command_bytes.data(), command_bytes.size());
+        drive_command = command;
         drive_command_history[command_seq % drive_command_history.size()] =
             DriveCommandRecord{command_seq, status.action_seq, xco::Clock::now()};
         const bool fault_active = status.model_fault || external_fault_code != 0;
         const uint16_t current_fault = external_fault_code;
         require(!status.model_fault || current_fault != 0, XNET_CO_STACK_ERROR, "DS402 model fault has no classified cause");
-        write_drive_value(*model, 0x2f00, current_fault);
         const bool reset_completed = drive_has_previous_pds
             && drive_previous_pds == xco::d402::Pds::fault
             && status.pds == xco::d402::Pds::switch_on_disabled && !fault_active;
@@ -1138,8 +1085,6 @@ static void require_od_access(xnet_canopen_device& d) {
  */
 static int32_t entry_io(xnet_canopen_device& d, uint16_t index, uint8_t subindex, const xco::Value& v,
                         uint8_t* read_buffer, const uint8_t* write_buffer, bool is_write) {
-    if (is_write && (index == 0x2f01 || index == 0x2f03) && d.drive_endpoint && d.drive_endpoint->writer_open)
-        return XNET_CO_ACCESS_ERROR;
     // Local-write ownership is separate from network SDO permissions.
     // Local reads currently still require the network SDO-readable flag.
     if ((is_write && !v.allows_local_write) || (!is_write && !(v.attr & ODA_SDO_R))) return XNET_CO_ACCESS_ERROR;
@@ -1171,17 +1116,6 @@ static int32_t batch_io(xnet_canopen_handle handle, uint32_t batch_id, uint8_t* 
         require(statuses && (is_write ? write_buffer != nullptr : read_buffer != nullptr) && count == batch.bindings.size(),
                 XNET_CO_INVALID_ARGUMENT, "buffer/status pointer or entry count mismatch");
         require(buffer_size >= batch.size, XNET_CO_BUFFER_TOO_SMALL, "batch buffer too small");
-        if (d.shutdown_joining) {
-            for (const auto& binding : batch.bindings) {
-                const bool allowed = is_write
-                    ? (binding.index == 0x2f01 || binding.index == 0x2f03)
-                    : ((binding.index >= 0x2f00 && binding.index <= 0x2f05)
-                        || binding.index == 0x6040 || binding.index == 0x6041
-                        || binding.index == 0x6061 || binding.index == 0x603f);
-                require(allowed, XNET_CO_INVALID_STATE,
-                    "only DS402 external model exchange OD traffic is allowed during shutdown");
-            }
-        }
         bool has_entry_errors = false;
         for (uint32_t i = 0; i < count; ++i) {
             const auto& b = batch.bindings[i];
@@ -1194,7 +1128,7 @@ static int32_t batch_io(xnet_canopen_handle handle, uint32_t batch_id, uint8_t* 
             }
         }
         return has_entry_errors ? XNET_CO_PARTIAL_FAILURE : XNET_CO_OK;
-    }, true);
+    });
 }
 
 int32_t xnet_canopen_read_batch(xnet_canopen_handle handle, uint32_t id, uint8_t* buffer,
@@ -1209,9 +1143,6 @@ int32_t xnet_canopen_read_od(xnet_canopen_handle handle, uint16_t index, uint8_t
                             uint8_t* buffer, uint32_t buffer_size, uint32_t* value_size) {
     return call(handle, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) -> int32_t {
         require_od_access(d);
-        require(!d.shutdown_joining || (index >= 0x2f00 && index <= 0x2f05)
-                || index == 0x6040 || index == 0x6041 || index == 0x6061 || index == 0x603f,
-            XNET_CO_INVALID_STATE, "only DS402 external model exchange reads are allowed during shutdown");
         require(value_size && (buffer || buffer_size == 0), XNET_CO_INVALID_ARGUMENT, "invalid OD read arguments");
         const auto& v = d.model->value(index, subindex);
         *value_size = v.size;
@@ -1221,21 +1152,19 @@ int32_t xnet_canopen_read_od(xnet_canopen_handle handle, uint16_t index, uint8_t
         const auto result = entry_io(d, index, subindex, v, buffer, nullptr, false);
         if (result < 0) d.fail(result, "OD " + std::to_string(index) + ":" + std::to_string(subindex) + " read failed");
         return result;
-    }, true);
+    });
 }
 int32_t xnet_canopen_write_od(xnet_canopen_handle handle, uint16_t index, uint8_t subindex,
                              const uint8_t* buffer, uint32_t buffer_size) {
     return call(handle, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) -> int32_t {
         require_od_access(d);
-        require(!d.shutdown_joining || index == 0x2f01 || index == 0x2f03,
-            XNET_CO_INVALID_STATE, "only DS402 heartbeat and feedback writes are allowed during shutdown");
         require(buffer != nullptr, XNET_CO_INVALID_ARGUMENT, "OD write buffer is required");
         const auto& v = d.model->value(index, subindex);
         require(buffer_size == v.size, XNET_CO_INVALID_ARGUMENT, "OD write size must equal the OD length");
         const auto result = entry_io(d, index, subindex, v, nullptr, buffer, true);
         if (result < 0) d.fail(result, "OD " + std::to_string(index) + ":" + std::to_string(subindex) + " write failed");
         return result;
-    }, true);
+    });
 }
 int32_t xnet_canopen_request_tpdo(xnet_canopen_handle handle, uint16_t number) {
     return call(handle, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
@@ -1364,7 +1293,7 @@ int32_t motor_drive_open_v1(motor_drive_endpoint_handle endpoint, motor_drive_po
             return XNET_CO_OK;
         }
         require(!d.drive_feedback_pending && !d.drive_has_last_submitted, XNET_CO_INVALID_STATE,
-            "restart the model epoch before replacing a legacy writer");
+            "restart the model epoch before replacing a model writer");
         auto opened = std::make_unique<motor_drive_port>();
         opened->endpoint = endpoint->shared_from_this();
         opened->epoch = d.drive_epoch;
@@ -1388,9 +1317,7 @@ int32_t motor_drive_read_v1(motor_drive_port_handle port, const motor_drive_read
         require(request->flags == MOTOR_DRIVE_READ_ASYNC || request->flags == MOTOR_DRIVE_READ_BOOTSTRAP
             || request->flags == MOTOR_DRIVE_READ_SAFETY, XNET_CO_INVALID_ARGUMENT, "invalid motor read mode");
         if (!d.drive_command_seq) return static_cast<int32_t>(MOTOR_DRIVE_NO_DATA);
-        CO_402_command_frame_t command{};
-        require(CO_402_command_unpack(&command, static_cast<const uint8_t*>(d.model->value(0x2f02, 0).data()),
-            CO_402_COMMAND_FRAME_SIZE), XNET_CO_INTERNAL_ERROR, "invalid backend command frame");
+        const auto& command = d.drive_command;
         const bool safety = command.action == CO_402_ACTION_QUICK_STOP || command.action == CO_402_ACTION_FAULT_REACTION
             || command.action == CO_402_ACTION_DISABLE_VOLTAGE;
         require(request->flags != MOTOR_DRIVE_READ_SAFETY || safety, XNET_CO_INVALID_STATE, "no priority safety command");
@@ -1411,8 +1338,8 @@ int32_t motor_drive_read_v1(motor_drive_port_handle port, const motor_drive_read
         output.demand_velocity_rad_s = adapter.velocity_rad_s(command.demand_velocity);
         const auto deceleration = safety ? command.quick_stop_deceleration : command.profile_deceleration;
         output.safety_deceleration_rad_s2 = std::abs(adapter.velocity_rad_s(deceleration));
-        output.processed_feedback_seq = read_drive_value<uint32_t>(*d.model, 0x2f04);
-        output.processed_result = read_drive_value<uint16_t>(*d.model, 0x2f05);
+        output.processed_feedback_seq = d.drive_processed_feedback_seq;
+        output.processed_result = d.drive_processed_result;
         *view = output;
         return static_cast<int32_t>(MOTOR_DRIVE_OK);
     });
@@ -1477,7 +1404,6 @@ int32_t motor_drive_heartbeat_v1(motor_drive_port_handle port, const motor_drive
             || (p.heartbeat_seq && (!sequence_newer(heartbeat_seq, p.heartbeat_seq)
                 || !advancing_step(*progress, p.heartbeat_step))))
             return motor_reject(d, MOTOR_DRIVE_STALE, "motor heartbeat has no new model progress");
-        write_drive_value(*d.model, 0x2f01, heartbeat_seq);
         d.drive_last_heartbeat = heartbeat_seq; d.drive_has_heartbeat = true;
         d.drive_heartbeat_changed = xco::Clock::now();
         p.heartbeat_seq = heartbeat_seq; p.heartbeat_step = *progress; p.pcl_epoch = progress->pcl_epoch;
