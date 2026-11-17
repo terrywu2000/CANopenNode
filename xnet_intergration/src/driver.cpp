@@ -333,6 +333,7 @@ void xnet_canopen_device::receive() {
     if (status == nxErrInputQueueOverflow) {
         co->CANmodule->CANerrorStatus |= CO_CAN_ERRRX_OVERFLOW;
         fail(XNET_CO_XNET_ERROR, "XNET input queue overflow; unread traffic lost");
+        start_sync_observation_epoch();
         adapter.check(nxFlush(adapter.input), "flush overflowed input");
         return;
     }
@@ -363,7 +364,18 @@ void xnet_canopen_device::receive() {
                 // Example: ident=0x180, mask=0x780 accepts IDs 0x180..0x1ff;
                 // the additional 0x800 mask bit still enforces the requested RTR.
                 if (subscription.CANrx_callback && ((message.ident ^ subscription.ident) & subscription.mask) == 0) {
+                    const bool sync = co->SYNC && subscription.object == co->SYNC;
+                    const bool old_toggle = sync && co->SYNC->CANrxToggle;
                     subscription.CANrx_callback(subscription.object, &message);
+                    if (sync && old_toggle != bool(co->SYNC->CANrxToggle)) {
+                        xco::require(sync_observation_sequence != UINT64_MAX, XNET_CO_STACK_ERROR,
+                            "SYNC observation sequence exhausted");
+                        const auto seq = ++sync_observation_sequence;
+                        auto& event = sync_observations[(seq - 1) % sync_observations.size()];
+                        event = {sync_observation_epoch, seq, frame.Timestamp, frame.Identifier,
+                            co->SYNC->counterOverflowValue ? message.data[0] : 0U,
+                            co->SYNC->counterOverflowValue ? 1U : 0U, 0};
+                    }
                     break;
                 }
             }

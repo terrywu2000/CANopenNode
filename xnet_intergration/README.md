@@ -512,12 +512,23 @@ produce. Existing C ABI/status layouts are unchanged; new structures are
 time=16, cycle=64, model_step=56, request=88, view=208, feedback=184 bytes.
 Check sizes before LabVIEW deployment; the binary VIs are not regenerated here.
 
+The backend exposes received SYNC observations via
+`xnet_canopen_read_sync_event`. Each port keeps 64 records with a local
+epoch/sequence, the raw XNET timestamp in 100 ns units and optional received
+counter. Start with cursor `(0, 0)`, then pass the returned epoch/sequence.
+`NOT_FOUND` means no next record; `ACCESS_ERROR` reports overwritten history;
+`INVALID_STATE` reports an invalidated epoch. RX overflow, reset/restart,
+SYNC COB-ID change and LSS silence invalidate the epoch. This is observation
+only: the counter is not checked for continuity, and receipt does not prove that
+the control loop processed that boundary. Different ports' sequences are not
+shared; raw timestamps have not been mapped or verified against PCL.
+
 This release implements **asynchronous SI exchange**, not the SYNC/PCL pipeline:
 `MOTOR_DRIVE_READ_SCHEDULED` returns `MOTOR_DRIVE_UNSUPPORTED`, cycle/target-step
 metadata is zero, and hardware RX timestamps are not fabricated. publish_time
 uses clock domain 1, seconds on the process's native steady clock; caller model
-timestamps are not mapped to that clock. Shared-interface multi-node transport
-and VeriStand signal/FIFO scheduling remain separate implementation work.
+timestamps are not mapped to that clock. Each node uses its own NI-XNET port;
+VeriStand signal/FIFO scheduling remains separate implementation work.
 
 `value_offset: "NODE_ID"` supports signed/unsigned integer VARs, record members
 other than subindex 0, and a common offset on every ARRAY element. The stored

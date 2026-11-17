@@ -496,7 +496,14 @@ fault_class/detail 须有明确设备故障码映射；无映射拒绝并失败�
 合成有效反馈的 Statusword bit11。停止握手期间模型须可交互，stop 后 close，再释放后端；
 PCL 不应阻塞等待自己下一步才能产生的反馈。
 
-本轮未实现共享总线、硬件时间映射或 VeriStand signal/FIFO 调度：
+`xnet_canopen_read_sync_event` 提供每端口的 SYNC 接收观察：保留最近 64 条局部
+epoch/序号、XNET 原始 100 ns 时间戳和可选 counter。首次使用 `(0, 0)`，之后使用
+返回的 epoch/序号；无后续记录返回 NOT_FOUND，历史覆盖返回 ACCESS_ERROR，代次失效
+返回 INVALID_STATE。RX 溢出、复位/重启、SYNC COB-ID 更改及 LSS 静默会使代次失效。
+这只是接收观察，不校验 counter 连续性，也不表示控制已逐边界处理；不同端口的
+序号不能直接比较，时间戳尚未验证或映射到 PCL。
+
+每节点使用独立 NI-XNET 端口；当前尚未实现硬件时间映射或 VeriStand signal/FIFO 调度：
 READ_SCHEDULED 明确返回 UNSUPPORTED，不将 worker 次数伪装成 SYNC。cycle/target_step
 为 0；publish_time 为进程 steady clock 的秒（域 1），不等同硬件/PCL 时间。
 既有 ABI 不变，新结构大小依次为 time 16、cycle 64、step 56、request 88、view 208、

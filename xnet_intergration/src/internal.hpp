@@ -289,6 +289,9 @@ struct xnet_canopen_device {
     } drive_feedback_od; /**< Atomic local feedback-frame submitter; refreshed after stack rebuilds. */
     std::unique_ptr<xco::d402::Drive> drive_402; /**< Present only when enabled by JSON. */
     std::shared_ptr<motor_drive_endpoint> drive_endpoint;
+    uint64_t sync_observation_epoch = 0;
+    uint64_t sync_observation_sequence = 0;
+    std::array<xnet_canopen_sync_event_t, 64> sync_observations{};
     bool drive_adapter_fault = false;
     uint64_t drive_epoch = 0;
     uint32_t drive_command_seq = 0, drive_action_seq = 1, drive_last_feedback_seq = 0;
@@ -385,6 +388,7 @@ struct xnet_canopen_device {
     void process_drive_402(uint32_t dt_us, bool force_non_operational = false);
     void drain_drive_402();
     void start_drive_epoch();
+    void start_sync_observation_epoch();
 };
 
 #endif

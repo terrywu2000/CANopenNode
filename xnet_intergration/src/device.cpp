@@ -214,6 +214,7 @@ void xnet_canopen_device::load_persistent() {
  * extensions do not. This function deliberately does not restore OD defaults.
  */
 void xnet_canopen_device::setup_stack() {
+    start_sync_observation_epoch();
     outgoing.clear();
     // Extensions point into the old stack allocation; detach them before rebuilding services.
     for (auto& entry : model->entries) entry.extension = nullptr;
@@ -290,6 +291,13 @@ void xnet_canopen_device::setup_stack() {
     log(xco::LogLevel::info, "CANopen services initialized");
 }
 
+void xnet_canopen_device::start_sync_observation_epoch() {
+    require(sync_observation_epoch != UINT64_MAX, XNET_CO_STACK_ERROR, "SYNC observation epoch exhausted");
+    ++sync_observation_epoch;
+    sync_observation_sequence = 0;
+    sync_observations = {};
+}
+
 /**
  * Delegate readback using the original service's context and caller's progress.
  * A local stream copy prevents the wrapper from losing its own dispatch context;
@@ -328,13 +336,19 @@ ODR_t xnet_canopen_device::write_communication(
     }
     auto original = *stream;
     original.object = binding.original.stream.object;
+    const bool sync_id_change = binding.index == 0x1005 && d.co->SYNC
+        && (CO_getUint32(buffer) & 0x7ffU) != d.co->SYNC->CAN_ID;
+    if (sync_id_change && d.sync_observation_epoch == UINT64_MAX) return ODR_DEV_INCOMPAT;
     const auto result = binding.original.write(&original, buffer, count, transferred);
     stream->dataOffset = original.dataOffset;
     if (result == ODR_OK) {
         // Preserve accepted EMCY routing, including its disable bit, across a
         // stop/start. An explicit communication/node reset restores JSON defaults.
         if (binding.index == 0x1014) d.model->emcy_reconfigured = true;
-        if (binding.index == 0x1005) d.model->sync_reconfigured = true;
+        if (binding.index == 0x1005) {
+            d.model->sync_reconfigured = true;
+            if (sync_id_change) d.start_sync_observation_epoch();
+        }
         if (d.co->NMT->HBproducerTime_us > 0 || d.co->NGslave->lifeTime_us == 0) {
             // Stopping supervision must also clear a previously raised error.
             // HB consumer is disabled in this port, so this shared stack error
@@ -753,6 +767,7 @@ void xnet_canopen_device::activate_bitrate(void* context, uint16_t delay) {
     d.switching = Switch::before;
     try {
         // Stop immediately so queued frames cannot violate either LSS silence interval.
+        d.start_sync_observation_epoch();
         d.adapter.stop_flush();
         for (auto& pending : d.outgoing) pending.buffer->bufferFull = false;
         d.outgoing.clear();
@@ -1311,6 +1326,26 @@ int32_t xnet_canopen_get_drive_unit_report(xnet_canopen_handle handle, char* buf
         std::memcpy(buffer, report.c_str(), *required_size);
         return XNET_CO_OK;
     }, true);
+}
+
+int32_t xnet_canopen_read_sync_event(xnet_canopen_handle handle, uint64_t epoch, uint64_t sequence,
+                                    xnet_canopen_sync_event_t* event) {
+    return call(handle, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
+        d.initialized();
+        require(event && (epoch != 0 || sequence == 0), XNET_CO_INVALID_ARGUMENT, "invalid SYNC observation cursor");
+        require(epoch == 0 || epoch == d.sync_observation_epoch, XNET_CO_INVALID_STATE, "SYNC observation epoch changed");
+        const auto last = d.sync_observation_sequence;
+        const auto oldest = last > d.sync_observations.size() ? last - d.sync_observations.size() + 1 : 1;
+        if (epoch != 0) {
+            require(sequence <= last, XNET_CO_INVALID_ARGUMENT, "SYNC cursor is ahead of observations");
+            require(sequence >= oldest - 1, XNET_CO_ACCESS_ERROR, "SYNC observation history overwritten");
+            if (sequence == last) return XNET_CO_NOT_FOUND;
+        }
+        const auto next = epoch == 0 ? oldest : sequence + 1;
+        if (next > last || last == 0) return XNET_CO_NOT_FOUND;
+        *event = d.sync_observations[(next - 1) % d.sync_observations.size()];
+        return XNET_CO_OK;
+    });
 }
 
 int32_t motor_drive_open_v1(motor_drive_endpoint_handle endpoint, motor_drive_port_handle* port) {

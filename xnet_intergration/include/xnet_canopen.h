@@ -190,6 +190,31 @@ XNET_CANOPEN_API int32_t xnet_canopen_get_motor_drive_endpoint(
 XNET_CANOPEN_API int32_t xnet_canopen_get_drive_unit_report(
     xnet_canopen_handle handle, char* buffer, uint32_t capacity, uint32_t* required_size);
 
+/** A received SYNC observation, not a processed control boundary. The sequence
+ * is local to this handle and epoch; independent ports cannot compare sequences.
+ * timestamp_100ns is the raw XNET timestamp and is not mapped to PCL time.
+ */
+typedef struct {
+    uint64_t epoch;
+    uint64_t sequence;
+    uint64_t timestamp_100ns;
+    uint32_t can_id;
+    uint32_t counter;
+    uint32_t counter_present;
+    uint32_t reserved;
+} xnet_canopen_sync_event_t;
+
+/** Read the next observation after (epoch, sequence). Pass (0, 0) to start at
+ * the oldest retained event. NOT_FOUND means no later event; ACCESS_ERROR means
+ * the cursor was overwritten; INVALID_STATE means its epoch is no longer active.
+ * Restart, protocol reset, SYNC COB-ID change, RX overflow and LSS silence
+ * invalidate the epoch. The producer counter is not checked for continuity.
+ * History is bounded to 64 records. Output is usable only on OK. This API does
+ * not imply the event was processed by the control loop or establish a clock map.
+ */
+XNET_CANOPEN_API int32_t xnet_canopen_read_sync_event(
+    xnet_canopen_handle handle, uint64_t epoch, uint64_t sequence, xnet_canopen_sync_event_t* event);
+
 /**
  * Stop/join processing and discard pending network traffic, retaining OD values,
  * configuration, bindings, and sessions. Already stopped is a no-op.

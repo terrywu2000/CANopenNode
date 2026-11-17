@@ -2281,6 +2281,59 @@ void sync_configuration_and_validation() {
     CHECK(sdo_upload(0x1006) == 0 && sdo_upload(0x1007) == 0 && sdo_upload(0x1019) == 2);
 }
 
+void sync_observations() {
+    Fixture f;
+    auto j = xco::read_json(f.model_path);
+    j["sync"] = {{"cob_id", 0x90}, {"counter_overflow", 2}};
+    f.model(j);
+    CHECK(f.initialize() == XNET_CO_OK);
+    f.start();
+    xnet_canopen_sync_event_t event{};
+    CHECK(xnet_canopen_read_sync_event(f.device, 0, 0, &event) == XNET_CO_NOT_FOUND);
+    {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        fake::inject(0x90, {}, nxFrameType_CAN_Data, 0, 100);
+        fake::inject(0x90, {1}, nxFrameType_CAN_Data, 0, 101);
+        fake::inject(0x90, {2}, nxFrameType_CAN_Data, 0, 102);
+    }
+    wait_for([&] {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        return f.device->sync_observation_sequence == 2;
+    });
+    CHECK(xnet_canopen_read_sync_event(f.device, 0, 0, &event) == XNET_CO_OK);
+    const auto epoch = event.epoch;
+    CHECK(event.sequence == 1 && event.timestamp_100ns == 101 && event.counter == 1
+        && event.counter_present == 1 && event.can_id == 0x90);
+    CHECK(xnet_canopen_read_sync_event(f.device, epoch, 1, &event) == XNET_CO_OK);
+    CHECK(event.sequence == 2 && event.timestamp_100ns == 102 && event.counter == 2);
+    CHECK(xnet_canopen_read_sync_event(f.device, epoch, 2, &event) == XNET_CO_NOT_FOUND);
+    {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        for (int i = 0; i < 65; ++i) fake::inject(0x90, {1});
+    }
+    wait_for([&] {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        return f.device->sync_observation_sequence == 67;
+    });
+    CHECK(xnet_canopen_read_sync_event(f.device, epoch, 2, &event) == XNET_CO_ACCESS_ERROR);
+    CHECK(xnet_canopen_read_sync_event(f.device, 0, 0, &event) == XNET_CO_OK && event.sequence == 4);
+    fake::fail_next("read", nxErrInputQueueOverflow);
+    wait_for([&] { return xnet_canopen_read_sync_event(f.device, epoch, 67, &event) == XNET_CO_INVALID_STATE; });
+    fake::inject(0x90, {2}, nxFrameType_CAN_Data, 0, 123);
+    wait_for([&] { return xnet_canopen_read_sync_event(f.device, 0, 0, &event) == XNET_CO_OK; });
+    CHECK(event.epoch != epoch && event.sequence == 1 && event.timestamp_100ns == 123);
+    const auto overflow_epoch = event.epoch;
+    CHECK(sdo_download(0x1005, 0, 0x91, 4).Payload[0] == 0x60);
+    CHECK(xnet_canopen_read_sync_event(f.device, overflow_epoch, 1, &event) == XNET_CO_INVALID_STATE);
+    fake::inject(0x91, {1}, nxFrameType_CAN_Data, 0, 124);
+    wait_for([&] { return xnet_canopen_read_sync_event(f.device, 0, 0, &event) == XNET_CO_OK; });
+    CHECK(event.can_id == 0x91 && event.sequence == 1 && event.timestamp_100ns == 124);
+    const auto changed_epoch = event.epoch;
+    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    f.start();
+    CHECK(xnet_canopen_read_sync_event(f.device, changed_epoch, 1, &event) == XNET_CO_INVALID_STATE);
+}
+
 void persistence_atomicity() {
     Fixture f;
     const auto contents = xco::Json{{"original", true}};
@@ -2494,7 +2547,7 @@ int main(int argc, char** argv) {
         {"queues and filtering", queues_and_filtering}, {"concurrent channels", concurrent_channels},
         {"synchronous TPDO requests", synchronous_requests}, {"node guarding", node_guarding},
         {"heartbeat and guarding switching", supervision_switching}, {"configurable SYNC and EMCY", configurable_services},
-        {"SYNC timers and service validation", sync_configuration_and_validation},
+        {"SYNC timers and service validation", sync_configuration_and_validation}, {"SYNC observations", sync_observations},
         {"atomic persistence", persistence_atomicity}, {"file logging", file_logging}};
     int failed = 0;
     for (const auto& test : tests) {

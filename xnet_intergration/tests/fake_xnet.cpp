@@ -30,9 +30,9 @@ void reset() {
     incoming.clear(); sent.clear(); trace.clear(); failures.clear();
     full = false; comm_state = 0; comm_fault = 0;
 }
-void inject(uint16_t id, std::initializer_list<uint8_t> bytes, uint8_t type, uint8_t flags) {
+void inject(uint16_t id, std::initializer_list<uint8_t> bytes, uint8_t type, uint8_t flags, uint64_t timestamp) {
     std::lock_guard<std::mutex> lock(mutex);
-    nxFrameCAN_t frame{}; frame.Identifier = id; frame.Type = type; frame.Flags = flags;
+    nxFrameCAN_t frame{}; frame.Identifier = id; frame.Type = type; frame.Flags = flags; frame.Timestamp = timestamp;
     frame.PayloadLength = static_cast<u8>(bytes.size());
     std::copy(bytes.begin(), bytes.end(), frame.Payload);
     incoming.push_back(frame);

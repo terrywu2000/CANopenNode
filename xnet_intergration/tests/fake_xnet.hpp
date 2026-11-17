@@ -9,7 +9,8 @@ struct Event {
     xco::Clock::time_point when;
 };
 void reset();
-void inject(uint16_t id, std::initializer_list<uint8_t> bytes, uint8_t type = nxFrameType_CAN_Data, uint8_t flags = 0);
+void inject(uint16_t id, std::initializer_list<uint8_t> bytes, uint8_t type = nxFrameType_CAN_Data,
+            uint8_t flags = 0, uint64_t timestamp = 0);
 std::vector<nxFrameCAN_t> transmitted();
 std::vector<Event> events();
 void clear_transmitted();
