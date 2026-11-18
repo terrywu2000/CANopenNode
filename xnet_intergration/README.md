@@ -35,19 +35,19 @@ of this guide.
 ## Design background and responsibility boundaries
 
 The purpose is to simulate a CANopen controlled node for an external master,
-with VeriStand supplying application behavior and channels. CANopenNode provides
-communication, not a motor/plant model or a CiA 402 state machine. Adding drive
-objects or importing an EDS does not implement drive behavior. Host runtime state,
-CANopen NMT state, and CiA 402 drive state are three separate concepts:
+with VeriStand supplying application behavior and channels. The optional
+single-axis CiA 402 PP profile is enabled only by `drive_402` in the JSON model;
+ordinary devices keep the existing behavior. Host runtime state, CANopen NMT
+state, and CiA 402 drive state are three separate concepts:
 NMT Operational does not mean a drive is Operation Enabled.
 
 ```text
 External CANopen master
     <-> classic CAN bus <-> NI hardware / NI-XNET
     <-> library-owned adapter / CANopenNode / runtime OD
-    <-> C batch, status, TPDO-request and fault APIs
-    <-> VeriStand adapter / channels
-    <-> external device / CiA 402 / plant model
+    <-> optional JSON-enabled DS402 PP core / internal or host external model
+    <-> C batch, OD, status, TPDO-request and fault APIs
+    <-> VeriStand adapter / channels for ordinary application objects
 ```
 
 | Layer | Responsibility |
@@ -266,6 +266,7 @@ Optional root fields:
 | `heartbeat_ms` | 1000 | uint16 milliseconds; 0 disables heartbeat production |
 | `worker_period_us` | 1000 | `100..100000` microseconds of worker wait time after processing; not a fixed cycle deadline |
 | `rpdos`, `tpdos` | Empty arrays | Up to eight configured slots per direction |
+| `drive_402` | Absent | Explicitly enables the single-axis PP profile; see [DS402 PP configuration](#ds402-pp-configuration) |
 | `node_guarding`, `sync`, `emcy` | Empty configuration objects | Services use the defaults in [service configuration](#node-guarding-sync-and-emcy), rather than being disabled by omission |
 
 Vendor ID and serial number must be nonzero; use an appropriate unique identity
@@ -329,6 +330,92 @@ room for NUL in the fixed slot. OCTET_STRING defaults may be shorter than capaci
 the remainder is zero-filled. Strings are not PDO-mappable in this edition.
 Unicode strings, DOMAIN, nonstandard integer widths, variable-size channel slots,
 and arbitrary vendor-specific communication objects are explicitly unsupported.
+
+### DS402 PP configuration
+
+The optional `drive_402` member enables the integrated single-axis Profile
+Position (PP) state machine. `internal` follows the profile demand directly;
+`external` uses the frozen v1 command/feedback exchange in
+[`402/CO_402_protocol.h`](../402/CO_402_protocol.h). External model responses
+are submitted by the host through the local OD API; the integration worker
+validates and consumes them, publishes standard DS402 values, and waits for
+matching action acknowledgements.
+
+```json
+"drive_402": {
+  "profile": "PP",
+  "model": "internal",
+  "position_tolerance_counts": 0,
+  "target_reached_time_us": 0
+}
+```
+
+For `model: "external"`, also provide all five positive timeouts (microseconds,
+each greater than `worker_period_us`): `startup_timeout_us`,
+`heartbeat_timeout_us`, `feedback_timeout_us`, `action_timeout_us`, and
+`command_max_age_us`. The JSON must also define scalar, SDO-read-only,
+unmapped objects `0x2F00..0x2F05` with exact v1 types/sizes. Only `0x2F01`
+(UNSIGNED32 heartbeat) and `0x2F03` (36-byte OCTET_STRING feedback) use
+`local_write: true`; `0x2F02` is a 56-byte OCTET_STRING command snapshot.
+`0x2F00`, `0x2F04`, and `0x2F05` are core-published status values. No exchange
+object is synthesized. See the protocol header for frame byte layouts and
+`DS402_requirements_and_dev_guide.md` §7.5 for validation and lifecycle rules.
+
+Enabling the profile requires the JSON-provided scalar OD objects `0x6040`,
+`0x6041`, `0x6060`, `0x6061`, `0x6064`, `0x607A`, `0x6081`, `0x6083`,
+and `0x6084`, with CiA 402 types/access as validated at initialization.
+`0x603F`, `0x6502`, and `0x6085` are optional; when present they are validated.
+`0x6502` must include the PP bit if present, and `0x6060` must start at 1.
+PDO mappings are optional; configured mappings must have compatible types,
+directions and lengths. Objects not mapped to PDOs remain available through SDO.
+Missing required objects, wrong access/type, or incompatible mappings fail
+initialization with `XNET_CO_MODEL_ERROR`; no object or PDO is synthesized.
+If `0x6502` advertises other modes, those bits describe the source device,
+not simulator support: this implementation still only runs PP.
+The SDO writer rejects mode values other than PP. NMT
+remains owned by CANopenNode and gates DS402 operation; processing runs after
+RPDO and before TPDO.
+
+External feedback must refer to a retained command and the current epoch/action
+sequence. Exact retries are idempotent and do not refresh feedback age; stale,
+invalid, missing, or timed-out model traffic never falls back to the internal
+model. Stop and CANopen reset allow only external model exchange OD traffic
+while draining safety actions to a terminal drive state, then invalidate the epoch.
+The adapter owns feedback age using monotonic timestamps of accepted frames;
+the core does not independently add motion-step time to that age. Startup,
+heartbeat, feedback and action deadlines are classified before each drive step.
+Timeouts use `0x8130`; actual model faults retain their supplied codes. `0x603F`
+keeps the first fault until a successful Fault Reset, while later distinct
+watchdog sources independently produce EMCY. DS402 reserves internal emergency
+bits `0x30..0x33` for startup/heartbeat/feedback/action timeout respectively;
+their EMCY info codes are `1`, `2`, `4`, `8`. This does not use the application's
+`set_fault` range `0x40..0x4F`.
+
+Faults immediately revoke output and enter Fault Reaction Active. Matching DONE
+enters FAULT; Fault Reaction ERROR or its action deadline also enters FAULT,
+retires the action sequence, and explicitly diagnoses unconfirmed physical stop
+without inventing DONE. Other timed-out actions escalate to a separately timed
+Fault Reaction. Completion submitted at/after its deadline is rejected, even if
+it is consumed before the timeout was previously observed. A valid completion
+submitted before the deadline may still be consumed later within command age.
+Actuals remain the last accepted values when feedback is stale.
+
+After fresh heartbeat/feedback and model readiness/reset permission recover,
+current timeout conditions can clear, but FAULT and its first code remain.
+A new bit-7 edge in FAULT and matching Fault Reset DONE are still required.
+Edges sampled during Fault Reaction are not deferred into FAULT. Stop/reset
+waiting uses a monotonic bound of two action timeouts plus two worker periods
+for external drives; expired safety reaction is a terminal failure, not proof of
+physical standstill. Failure to reach a terminal state within that bound is
+reported explicitly rather than silently completing.
+These behaviors provide functional validation, not a hard real-time guarantee
+or a hardware safety certification.
+
+The checked-in `examples/kinco_FD124.json` is not currently PP-compatible:
+`0x6060` and `0x6081` start at zero and several core-published outputs allow
+local writes. Its TPDO maps `0x6063`, not `0x6064`; actual position is therefore
+available via SDO, not that TPDO. Check the target device/EDS and correct the
+configuration before enabling `drive_402`.
 
 `value_offset: "NODE_ID"` supports signed/unsigned integer VARs, record members
 other than subindex 0, and a common offset on every ARRAY element. The stored
@@ -1286,8 +1373,11 @@ hardware acceptance.
 
 Important limits:
 
-- No CiA 402 state machine, motion model, in-library EDS loader, or VeriStand UI is supplied.
-  The standalone EDS-to-JSON template converter is supplied.
+- The integrated CiA 402 scope is single-axis PP with internal and protocol-v1
+  host external-model paths. PV/other modes are not supplied; the library does
+  not create or schedule the host external model. There is no in-library EDS
+  loader; the standalone EDS-to-JSON converter is supplied, and the resulting
+  JSON remains the OD/PDO source of truth.
 - Workers use normal inherited OS scheduling; no hard real-time guarantee.
 - Receive work is bounded to one 8 KiB read per iteration. Output writes one frame
   at a time with timeout zero, avoiding ambiguous multi-frame partial writes.
@@ -1314,6 +1404,6 @@ For a minimal first hardware check, use correct termination/wiring, matching
 bitrate and distinct node IDs. With simulator node 10, start the worker, verify
 boot-up/heartbeat on `0x70A`, then read vendor ID `0x1018:01` through
 `0x60A`/`0x58A`. Put the node Operational before checking a known fixed PDO
-payload. Expand to RPDO commands and external-model feedback, command pacing,
-fault/clear behavior and both reset paths. Do not treat successful SDO or NMT
-Operational as proof of implemented CiA 402 behavior.
+payload. For a JSON model with `drive_402`, exercise the PP enable/setpoint/target-reached
+sequence and quick stop, then both reset paths. Do not treat successful SDO or
+NMT Operational alone as proof that the drive is Operation Enabled.

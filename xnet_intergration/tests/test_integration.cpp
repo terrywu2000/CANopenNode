@@ -115,7 +115,9 @@ nxFrameCAN_t sdo_download(uint16_t index, uint8_t subindex, uint32_t value, uint
 uint32_t sdo_upload(uint16_t index) {
     const auto response = exchange(0x60a, {0x40, static_cast<uint8_t>(index),
         static_cast<uint8_t>(index >> 8), 0, 0, 0, 0, 0}, 0x58a);
-    CHECK(response.Payload[0] == 0x43 || response.Payload[0] == 0x4b || response.Payload[0] == 0x4f);
+    if (response.Payload[0] != 0x43 && response.Payload[0] != 0x4b && response.Payload[0] != 0x4f)
+        throw std::runtime_error("SDO upload failed for 0x" + std::to_string(index)
+            + ", command=0x" + std::to_string(response.Payload[0]));
     const auto size = 4U - ((response.Payload[0] >> 2) & 3U);
     uint32_t value = 0;
     for (uint32_t i = 0; i < size; ++i) value |= uint32_t(response.Payload[4 + i]) << (8 * i);
@@ -300,6 +302,577 @@ void model_validation() {
     bad = j; bad["emcy"] = {{"cob_id", 0x40000090}}; CHECK(rejects(bad));
     bad = j; bad["emcy"] = {{"cob_id", 0x80}}; CHECK(rejects(bad));
     bad = j; bad["emcy"] = {{"inhibit_100us", 65536}}; CHECK(rejects(bad));
+}
+
+xco::Json drive_402_model() {
+    auto j = xco::read_json(XNET_CO_EXAMPLE_MODEL);
+    j["drive_402"] = {{"profile", "PP"}, {"model", "internal"},
+        {"position_tolerance_counts", 0}, {"target_reached_time_us", 0}};
+    j["objects"] = xco::Json::array({
+        {{"index", "0x603F"}, {"type", "UNSIGNED16"}, {"value", 0}, {"access", "ro"}},
+        {{"index", "0x6040"}, {"type", "UNSIGNED16"}, {"value", 0}, {"access", "rw"}, {"pdo", "rx"}},
+        {{"index", "0x6041"}, {"type", "UNSIGNED16"}, {"value", 0}, {"access", "ro"}, {"pdo", "tx"}},
+        {{"index", "0x6060"}, {"type", "INTEGER8"}, {"value", 1}, {"access", "rw"}, {"pdo", "rx"}},
+        {{"index", "0x6061"}, {"type", "INTEGER8"}, {"value", 0}, {"access", "ro"}},
+        {{"index", "0x6064"}, {"type", "INTEGER32"}, {"value", 0}, {"access", "ro"}, {"pdo", "tx"}},
+        {{"index", "0x607A"}, {"type", "INTEGER32"}, {"value", 0}, {"access", "rw"}, {"pdo", "rx"}},
+        {{"index", "0x6081"}, {"type", "UNSIGNED32"}, {"value", 100000}, {"access", "rw"}},
+        {{"index", "0x6083"}, {"type", "UNSIGNED32"}, {"value", 1000000}, {"access", "rw"}},
+        {{"index", "0x6084"}, {"type", "UNSIGNED32"}, {"value", 1000000}, {"access", "rw"}},
+        {{"index", "0x6085"}, {"type", "UNSIGNED32"}, {"value", 1000000}, {"access", "rw"}},
+        {{"index", "0x6502"}, {"type", "UNSIGNED32"}, {"value", 1}, {"access", "ro"}}
+    });
+    j["rpdos"] = {{{"mapping", {{{"index", "0x6040"}, {"subindex", 0}},
+                                {{"index", "0x6060"}, {"subindex", 0}},
+                                {{"index", "0x607A"}, {"subindex", 0}}}}}};
+    j["tpdos"] = {{{"mapping", {{{"index", "0x6041"}, {"subindex", 0}},
+                                {{"index", "0x6064"}, {"subindex", 0}}}}}};
+    return j;
+}
+
+xco::Json external_drive_402_model() {
+    auto j = drive_402_model();
+    j["drive_402"]["model"] = "external";
+    j["drive_402"]["startup_timeout_us"] = 1000000;
+    j["drive_402"]["heartbeat_timeout_us"] = 1000000;
+    j["drive_402"]["feedback_timeout_us"] = 1000000;
+    j["drive_402"]["action_timeout_us"] = 1000000;
+    j["drive_402"]["command_max_age_us"] = 100000;
+    auto octets = [](uint16_t index, uint32_t size, bool local_write) {
+        return xco::Json{{"index", index}, {"type", "OCTET_STRING"}, {"size", size},
+            {"value", xco::Json::array()}, {"access", "ro"}, {"local_write", local_write}};
+    };
+    auto add_scalar = [&](uint16_t index, const char* type, bool local_write) {
+        j["objects"].push_back({{"index", index}, {"type", type}, {"value", 0},
+            {"access", "ro"}, {"local_write", local_write}});
+    };
+    add_scalar(0x2f00, "UNSIGNED16", false);
+    add_scalar(0x2f01, "UNSIGNED32", true);
+    j["objects"].push_back(octets(0x2f02, CO_402_COMMAND_FRAME_SIZE, false));
+    j["objects"].push_back(octets(0x2f03, CO_402_FEEDBACK_FRAME_SIZE, true));
+    add_scalar(0x2f04, "UNSIGNED32", false);
+    add_scalar(0x2f05, "UNSIGNED16", false);
+    return j;
+}
+
+void drive_402_model_validation() {
+    auto j = drive_402_model();
+    xco::Model model; model.load(j);
+    CHECK(model.drive_402_enabled);
+    CHECK(model.value(0x6040, 0).mapped_rpdo);
+    CHECK(model.value(0x607a, 0).mapped_rpdo);
+    CHECK(model.value(0x6041, 0).mapped_tpdo);
+    CHECK(model.value(0x6064, 0).mapped_tpdo);
+    auto without_quick_stop_deceleration = j;
+    without_quick_stop_deceleration["objects"].erase(10);
+    xco::Model optional_6085; optional_6085.load(without_quick_stop_deceleration);
+    CHECK(!optional_6085.drive_has_quick_stop_deceleration);
+    auto rejects = [](const xco::Json& bad) {
+        try { xco::Model candidate; candidate.load(bad); }
+        catch (const std::exception&) { return true; }
+        return false;
+    };
+    auto bad = j; bad["objects"].erase(5); CHECK(rejects(bad));
+    bad = j; bad["objects"][1]["pdo"] = "none"; CHECK(rejects(bad));
+    bad = j; bad["tpdos"][0]["mapping"][1]["index"] = "0x6061"; CHECK(rejects(bad));
+    auto minimal = j;
+    minimal["objects"].erase(11);
+    minimal["objects"].erase(0);
+    minimal["rpdos"] = xco::Json::array();
+    minimal["tpdos"] = xco::Json::array();
+    xco::Model optional_objects; optional_objects.load(minimal);
+    CHECK(!optional_objects.drive_has_error_code);
+    bad = j; bad["objects"][0]["type"] = "INTEGER16"; CHECK(rejects(bad));
+    bad = j; bad["objects"][11]["value"] = 2; CHECK(rejects(bad));
+    bad = j; bad["objects"][11]["type"] = "INTEGER32"; CHECK(rejects(bad));
+    auto multiple_modes = j; multiple_modes["objects"][11]["value"] = 3;
+    xco::Model pp_capable; pp_capable.load(multiple_modes);
+    bad = minimal; bad["objects"].erase(0); CHECK(rejects(bad));
+    bad = j; bad["drive_402"]["profile"] = "PV"; CHECK(rejects(bad));
+    bad = j; bad["drive_402"]["model"] = "external"; CHECK(rejects(bad));
+    auto external = external_drive_402_model();
+    xco::Model external_model; external_model.load(external);
+    CHECK(external_model.drive_402_external);
+    bad = external; bad["objects"].erase(14); CHECK(rejects(bad));
+    bad = external; bad["objects"][13]["local_write"] = false; CHECK(rejects(bad));
+    bad = external; bad["drive_402"]["feedback_timeout_us"] = 0; CHECK(rejects(bad));
+}
+
+void drive_402_external_exchange() {
+    Fixture f;
+    auto external = external_drive_402_model();
+    external["objects"].erase(0);
+    f.model(external);
+    CHECK(f.initialize() == XNET_CO_OK);
+    f.start();
+
+    std::array<uint8_t, CO_402_COMMAND_FRAME_SIZE> command_bytes{};
+    CO_402_command_frame_t command{};
+    wait_for([&] {
+        uint32_t size = 0;
+        if (xnet_canopen_read_od(f.device, 0x2f02, 0, command_bytes.data(),
+                command_bytes.size(), &size) != XNET_CO_OK || size != command_bytes.size()) return false;
+        return CO_402_command_unpack(&command, command_bytes.data(), command_bytes.size());
+    });
+    CHECK(command.epoch != 0 && command.command_seq != 0);
+
+    const uint32_t heartbeat = 1;
+    std::array<uint8_t, sizeof(heartbeat)> heartbeat_bytes{};
+    for (size_t i = 0; i < heartbeat_bytes.size(); ++i)
+        heartbeat_bytes[i] = static_cast<uint8_t>(heartbeat >> (8 * i));
+    CHECK(xnet_canopen_write_od(f.device, 0x2f01, 0, heartbeat_bytes.data(), heartbeat_bytes.size()) == XNET_CO_OK);
+
+    CO_402_feedback_frame_t feedback{};
+    feedback.epoch = command.epoch;
+    feedback.feedback_seq = 1;
+    feedback.command_seq = command.command_seq;
+    feedback.action_seq = command.action_seq;
+    feedback.actual_position = 12;
+    feedback.actual_velocity = 0;
+    feedback.flags = 0x15; // position valid, PP ready, reset permitted
+    std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> feedback_bytes{};
+    CHECK(CO_402_feedback_pack(&feedback, feedback_bytes.data(), feedback_bytes.size()));
+    CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, feedback_bytes.data(), feedback_bytes.size()) == XNET_CO_OK);
+    wait_for([&] {
+        uint32_t size = 0;
+        std::array<uint8_t, 4> processed{};
+        if (xnet_canopen_read_od(f.device, 0x2f04, 0, processed.data(), processed.size(), &size) != XNET_CO_OK)
+            return false;
+        uint32_t seq = 0;
+        std::memcpy(&seq, processed.data(), sizeof(seq));
+        return seq == feedback.feedback_seq;
+    });
+    std::array<uint8_t, 2> result_bytes{};
+    uint32_t result_size = 0;
+    CHECK(xnet_canopen_read_od(f.device, 0x2f05, 0, result_bytes.data(), result_bytes.size(), &result_size) == XNET_CO_OK);
+    uint16_t result = 0;
+    std::memcpy(&result, result_bytes.data(), sizeof(result));
+    CHECK(result_size == result_bytes.size() && result == 1);
+    CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, feedback_bytes.data(), feedback_bytes.size()) == XNET_CO_OK);
+
+    feedback.feedback_seq = 2;
+    feedback.flags |= 0x20; // reserved bit
+    CHECK(!CO_402_feedback_pack(&feedback, feedback_bytes.data(), feedback_bytes.size()));
+    feedback.flags &= ~0x20;
+    feedback.feedback_seq = 1; // reused sequence with different contents
+    feedback.actual_position = 13;
+    CHECK(CO_402_feedback_pack(&feedback, feedback_bytes.data(), feedback_bytes.size()));
+    CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, feedback_bytes.data(), feedback_bytes.size()) == XNET_CO_ACCESS_ERROR);
+    feedback.feedback_seq = 2;
+    feedback.epoch = command.epoch + 1;
+    CHECK(CO_402_feedback_pack(&feedback, feedback_bytes.data(), feedback_bytes.size()));
+    CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, feedback_bytes.data(), feedback_bytes.size()) == XNET_CO_OK);
+    wait_for([&] {
+        std::array<uint8_t, 4> processed{};
+        std::array<uint8_t, 2> result{};
+        uint32_t size = 0;
+        if (xnet_canopen_read_od(f.device, 0x2f04, 0, processed.data(), processed.size(), &size) != XNET_CO_OK
+            || size != processed.size()) return false;
+        uint32_t seq = 0;
+        std::memcpy(&seq, processed.data(), sizeof(seq));
+        if (seq != feedback.feedback_seq) return false;
+        if (xnet_canopen_read_od(f.device, 0x2f05, 0, result.data(), result.size(), &size) != XNET_CO_OK
+            || size != result.size()) return false;
+        uint16_t code = 0;
+        std::memcpy(&code, result.data(), sizeof(code));
+        return code == 3;
+    });
+    std::array<uint8_t, 4> actual_position_bytes{};
+    uint32_t actual_position_size = 0;
+    CHECK(xnet_canopen_read_od(f.device, 0x6064, 0, actual_position_bytes.data(),
+        actual_position_bytes.size(), &actual_position_size) == XNET_CO_OK);
+    int32_t actual_position = 0;
+    std::memcpy(&actual_position, actual_position_bytes.data(), sizeof(actual_position));
+    CHECK(actual_position_size == actual_position_bytes.size() && actual_position == 12);
+
+    std::atomic<bool> model_running{true};
+    std::atomic<bool> model_failed{false};
+    std::thread model_thread([&] {
+        uint32_t heartbeat_count = 1;
+        uint32_t feedback_seq = 2;
+        uint32_t pending_seq = 0;
+        std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> pending_bytes{};
+        bool pending = false;
+        while (model_running) {
+            std::array<uint8_t, CO_402_COMMAND_FRAME_SIZE> latest_bytes{};
+            CO_402_command_frame_t latest{};
+            uint32_t size = 0;
+            if (xnet_canopen_read_od(f.device, 0x2f02, 0, latest_bytes.data(), latest_bytes.size(), &size) != XNET_CO_OK
+                || size != latest_bytes.size() || !CO_402_command_unpack(&latest, latest_bytes.data(), latest_bytes.size())) {
+                model_failed = true;
+                break;
+            }
+            ++heartbeat_count;
+            std::array<uint8_t, 4> heartbeat_value{};
+            for (size_t i = 0; i < heartbeat_value.size(); ++i)
+                heartbeat_value[i] = static_cast<uint8_t>(heartbeat_count >> (8 * i));
+            if (xnet_canopen_write_od(f.device, 0x2f01, 0, heartbeat_value.data(), heartbeat_value.size()) != XNET_CO_OK) {
+                model_failed = true;
+                break;
+            }
+            if (pending) {
+                std::array<uint8_t, 4> processed_bytes{};
+                uint32_t processed_size = 0, processed = 0;
+                if (xnet_canopen_read_od(f.device, 0x2f04, 0, processed_bytes.data(),
+                        processed_bytes.size(), &processed_size) != XNET_CO_OK || processed_size != processed_bytes.size()) {
+                    model_failed = true;
+                    break;
+                }
+                std::memcpy(&processed, processed_bytes.data(), sizeof(processed));
+                if (processed == pending_seq) pending = false;
+            }
+            if (!pending) {
+                ++feedback_seq;
+                if (feedback_seq == 0) ++feedback_seq;
+                feedback.epoch = latest.epoch;
+                feedback.feedback_seq = feedback_seq;
+                feedback.command_seq = latest.command_seq;
+                feedback.action_seq = latest.action_seq;
+                feedback.actual_position = latest.demand_position;
+                feedback.actual_velocity = latest.demand_velocity;
+                feedback.action_result = latest.action == CO_402_ACTION_NONE
+                    ? CO_402_ACTION_RESULT_NONE : CO_402_ACTION_RESULT_DONE;
+                feedback.flags = 0x17;
+                if (!CO_402_feedback_pack(&feedback, pending_bytes.data(), pending_bytes.size())) {
+                    model_failed = true;
+                    break;
+                }
+                pending_seq = feedback_seq;
+                pending = true;
+            }
+            const auto write_result = xnet_canopen_write_od(f.device, 0x2f03, 0,
+                pending_bytes.data(), pending_bytes.size());
+            if (write_result != XNET_CO_OK && write_result != XNET_CO_ACCESS_ERROR) {
+                model_failed = true;
+                break;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+    });
+
+    operational(f);
+    CHECK(sdo_download(0x6040, 0, 0x06, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x07, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
+    wait_for([&] { return (sdo_upload(0x6041) & 0x006f) == 0x0027; });
+    CHECK(sdo_download(0x607a, 0, 1000, 4).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x1f, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
+    wait_for([&] { return sdo_upload(0x6064) == 1000; });
+
+    uint32_t resets_before = f.status().reset_communication_count;
+    CO_402_command_frame_t before_reset{};
+    uint32_t command_size = 0;
+    CHECK(xnet_canopen_read_od(f.device, 0x2f02, 0, command_bytes.data(),
+        command_bytes.size(), &command_size) == XNET_CO_OK);
+    CHECK(command_size == command_bytes.size());
+    CHECK(CO_402_command_unpack(&before_reset, command_bytes.data(), command_bytes.size()));
+    exchange(0, {0x82, static_cast<uint8_t>(f.status().active_node_id)}, 0x70a, 0);
+    wait_for([&] { return f.status().reset_communication_count == resets_before + 1; });
+    wait_for([&] {
+        uint32_t size = 0;
+        if (xnet_canopen_read_od(f.device, 0x2f02, 0, command_bytes.data(),
+                command_bytes.size(), &size) != XNET_CO_OK || size != command_bytes.size()) return false;
+        CO_402_command_frame_t after_reset{};
+        return CO_402_command_unpack(&after_reset, command_bytes.data(), command_bytes.size())
+            && after_reset.epoch > before_reset.epoch;
+    });
+    operational(f);
+    CHECK(sdo_download(0x6040, 0, 0x06, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x07, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
+    wait_for([&] { return (sdo_upload(0x6041) & 0x006f) == 0x0027; });
+    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    model_running = false;
+    model_thread.join();
+    CHECK(!model_failed);
+    if (f.status().runtime_state != XNET_CO_RUNTIME_STOPPED) {
+        const auto drive_status = f.device->drive_402->status();
+        uint16_t processed_result = 0;
+        uint32_t processed_seq = 0;
+        std::memcpy(&processed_result, f.device->model->value(0x2f05, 0).data(), sizeof(processed_result));
+        std::memcpy(&processed_seq, f.device->model->value(0x2f04, 0).data(), sizeof(processed_seq));
+        std::array<uint8_t, CO_402_COMMAND_FRAME_SIZE> command_frame_bytes{};
+        CO_402_command_frame_t command_frame{};
+        std::memcpy(command_frame_bytes.data(), f.device->model->value(0x2f02, 0).data(), command_frame_bytes.size());
+        CO_402_command_unpack(&command_frame, command_frame_bytes.data(), command_frame_bytes.size());
+        throw std::runtime_error("external stop did not reach STOPPED: " + diagnostic(f.device)
+            + ", pds=" + std::to_string(static_cast<unsigned>(drive_status.pds))
+            + ", action=" + std::to_string(drive_status.action)
+            + ", action_seq=" + std::to_string(drive_status.action_seq)
+            + ", pending=" + std::to_string(drive_status.action_pending)
+            + ", feedback_fresh=" + std::to_string(drive_status.feedback_fresh)
+            + ", submitted_seq=" + std::to_string(f.device->drive_last_submitted_seq)
+            + ", processed_seq=" + std::to_string(processed_seq)
+            + ", result=" + std::to_string(processed_result)
+            + ", cmd_action=" + std::to_string(command_frame.action)
+            + ", cmd_action_seq=" + std::to_string(command_frame.action_seq)
+            + ", fault=" + std::to_string(f.device->drive_current_fault));
+    }
+}
+
+void drive_402_watchdog_deadlines() {
+    Fixture f;
+    auto external = external_drive_402_model();
+    external["drive_402"]["feedback_timeout_us"] = 20000;
+    external["drive_402"]["action_timeout_us"] = 50000;
+    f.model(external);
+    CHECK(f.initialize() == XNET_CO_OK);
+    const auto tick = [&](uint32_t dt = 0) {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        f.device->process_drive_402(dt);
+    };
+    const auto command = [&] {
+        std::array<uint8_t, CO_402_COMMAND_FRAME_SIZE> bytes{};
+        uint32_t size = 0;
+        CHECK(xnet_canopen_read_od(f.device, 0x2f02, 0, bytes.data(), bytes.size(), &size) == XNET_CO_OK);
+        CO_402_command_frame_t frame{};
+        CHECK(CO_402_command_unpack(&frame, bytes.data(), size));
+        return frame;
+    };
+    const auto scalar = [&](uint16_t index) {
+        std::array<uint8_t, 4> bytes{};
+        uint32_t size = 0, value = 0;
+        CHECK(xnet_canopen_read_od(f.device, index, 0, bytes.data(), bytes.size(), &size) == XNET_CO_OK);
+        for (uint32_t i = 0; i < size; ++i) value |= uint32_t(bytes[i]) << (8 * i);
+        return value;
+    };
+    uint32_t seq = 0, heartbeat = 0;
+    std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> last_submission{};
+    const auto submit = [&](CO_402_command_frame_t source, uint8_t result = CO_402_ACTION_RESULT_NONE,
+                            uint16_t fault = 0, int32_t position = 123, bool consume = true) {
+        std::array<uint8_t, 4> alive{};
+        ++heartbeat;
+        for (size_t i = 0; i < alive.size(); ++i) alive[i] = static_cast<uint8_t>(heartbeat >> (8 * i));
+        CHECK(xnet_canopen_write_od(f.device, 0x2f01, 0, alive.data(), alive.size()) == XNET_CO_OK);
+        CO_402_feedback_frame_t frame{};
+        frame.epoch = source.epoch;
+        frame.feedback_seq = ++seq;
+        frame.command_seq = source.command_seq;
+        frame.action_seq = source.action_seq;
+        frame.actual_position = position;
+        frame.flags = 0x17;
+        frame.fault_code = fault;
+        frame.action_result = result;
+        CHECK(CO_402_feedback_pack(&frame, last_submission.data(), last_submission.size()));
+        CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, last_submission.data(), last_submission.size()) == XNET_CO_OK);
+        if (consume) tick();
+    };
+    const auto expire_feedback = [&](bool retry = false) {
+        {
+            std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+            f.device->drive_feedback_accepted_at = xco::Clock::now() - 20ms;
+        }
+        if (retry)
+            CHECK(xnet_canopen_write_od(f.device, 0x2f03, 0, last_submission.data(), last_submission.size()) == XNET_CO_OK);
+        tick();
+    };
+    const auto expire_action = [&] {
+        {
+            std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+            f.device->drive_action_started = xco::Clock::now() - 50ms;
+        }
+        tick();
+    };
+    const auto controlword = [&](uint16_t value) {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        std::memcpy(f.device->model->value(0x6040, 0).data(), &value, sizeof(value));
+        CO_NMT_sendInternalCommand(f.device->co->NMT, CO_NMT_ENTER_OPERATIONAL);
+        CHECK(CO_NMT_process(f.device->co->NMT, nullptr, 0, nullptr) == CO_RESET_NOT);
+    };
+
+    tick();
+    submit(command());
+    tick(1000000); // Elapsed motion dt must not age newly accepted feedback.
+    CHECK(f.device->drive_402->status().feedback_fresh && scalar(0x603f) == 0);
+    expire_feedback(true);
+    CHECK(scalar(0x603f) == 0x8130);
+    CHECK(f.device->drive_402->status().pds == xco::d402::Pds::fault_reaction_active);
+    const auto reaction = command();
+    CHECK(reaction.action == CO_402_ACTION_FAULT_REACTION && !(reaction.flags & 1));
+    expire_action();
+    auto status = f.device->drive_402->status();
+    CHECK(status.pds == xco::d402::Pds::fault && status.reaction_unconfirmed && !status.action_pending);
+    CHECK(command().action_seq != reaction.action_seq && scalar(0x6064) == 123);
+    submit(reaction, CO_402_ACTION_RESULT_DONE, 0, 999);
+    CHECK(scalar(0x2f05) == 3 && scalar(0x6064) == 123);
+    CHECK(!f.device->drive_402->status().feedback_fresh && scalar(0x603f) == 0x8130);
+
+    submit(command());
+    CHECK(f.device->drive_402->status().feedback_fresh && !f.device->drive_action_timed_out);
+    CHECK(f.device->drive_402->status().pds == xco::d402::Pds::fault && scalar(0x603f) == 0x8130);
+    controlword(0x80);
+    tick();
+    CHECK(command().action == CO_402_ACTION_FAULT_RESET);
+    CHECK(scalar(0x603f) == 0x8130);
+    submit(command(), CO_402_ACTION_RESULT_DONE);
+    CHECK(f.device->drive_402->status().pds == xco::d402::Pds::switch_on_disabled);
+    CHECK(scalar(0x603f) == 0 && !f.device->drive_402->status().output_allowed);
+
+    controlword(0);
+    submit(command(), CO_402_ACTION_RESULT_NONE, 0x2310);
+    CHECK(scalar(0x603f) == 0x2310);
+    const auto fifo_before = f.device->co->em->fifoWrPtr;
+    expire_feedback();
+    CHECK(scalar(0x603f) == 0x2310);
+    CHECK(f.device->co->em->fifoWrPtr != fifo_before); // A distinct timeout still reports EMCY.
+    CHECK(CO_isError(f.device->co->em, CO_EM_MANUFACTURER_START + 2));
+    expire_action();
+    submit(command());
+    controlword(0x80);
+    tick();
+    submit(command(), CO_402_ACTION_RESULT_DONE);
+    CHECK(scalar(0x603f) == 0);
+
+    controlword(0x06);
+    tick();
+    submit(command(), CO_402_ACTION_RESULT_DONE, 0, 123, false);
+    {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        f.device->drive_action_started = xco::Clock::now() - 50ms;
+        f.device->drive_pending_submitted_at = f.device->drive_action_started + 49999us;
+    }
+    tick(); // Completion received before the deadline remains valid if worker consumption is late.
+    CHECK(scalar(0x2f05) == 1 && scalar(0x603f) == 0);
+    CHECK(f.device->drive_402->status().pds == xco::d402::Pds::ready_to_switch_on);
+    controlword(0);
+    tick();
+    submit(command(), CO_402_ACTION_RESULT_DONE);
+
+    for (int lateness_us : {0, 1}) {
+        controlword(0x06);
+        tick();
+        const auto shutdown = command();
+        submit(shutdown, CO_402_ACTION_RESULT_DONE, 0, 123, false);
+        {
+            std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+            f.device->drive_action_started = xco::Clock::now() - 50ms;
+            f.device->drive_pending_submitted_at = f.device->drive_action_started
+                + 50ms + std::chrono::microseconds(lateness_us);
+        }
+        tick();
+        CHECK(scalar(0x2f05) == 3);
+        CHECK(command().action == CO_402_ACTION_FAULT_REACTION && scalar(0x603f) == 0x8130);
+        expire_action();
+        submit(command());
+        controlword(0x80);
+        tick();
+        submit(command(), CO_402_ACTION_RESULT_DONE);
+        CHECK(scalar(0x603f) == 0);
+    }
+}
+
+void drive_402_missing_model_startup() {
+    Fixture f;
+    f.model(external_drive_402_model());
+    CHECK(f.initialize() == XNET_CO_OK);
+    std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+    f.device->drive_started_at = xco::Clock::now() - 1s;
+    f.device->process_drive_402(0);
+    auto status = f.device->drive_402->status();
+    CHECK(status.pds == xco::d402::Pds::fault_reaction_active && !status.feedback_fresh && !status.output_allowed);
+    CHECK(f.device->drive_latched_fault == 0x8130);
+    f.device->drive_action_started = xco::Clock::now() - 1s;
+    f.device->process_drive_402(0);
+    status = f.device->drive_402->status();
+    CHECK(status.pds == xco::d402::Pds::fault && status.reaction_unconfirmed && !status.action_pending);
+    CHECK(status.actual_position == 0 && !f.device->drive_has_last_feedback);
+}
+
+void drive_402_sdo_only() {
+    Fixture f;
+    auto j = drive_402_model();
+    j["objects"].erase(11);
+    j["objects"].erase(0);
+    j["rpdos"] = xco::Json::array();
+    j["tpdos"] = xco::Json::array();
+    f.model(j);
+    CHECK(f.initialize() == XNET_CO_OK);
+    f.start();
+    operational(f);
+    CHECK(sdo_download(0x6040, 0, 0x06, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x07, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
+    CHECK((sdo_upload(0x6041) & 0x006f) == 0x0027);
+    CHECK(sdo_download(0x607a, 0, 1234, 4).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x1f, 2).Payload[0] == 0x60);
+    wait_for([&] { return sdo_upload(0x6064) == 1234; });
+    wait_for([&] { return (sdo_upload(0x6041) & 0x0400) != 0; });
+    CHECK(sdo_download(0x6060, 0, 3, 1).Payload[0] == 0x80);
+    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+}
+
+void drive_402_integration() {
+    Fixture f;
+    f.model(drive_402_model());
+    CHECK(f.initialize() == XNET_CO_OK);
+    f.start();
+
+    // The lower CANopen NMT state gates DS402 enable transitions.
+    CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
+    std::this_thread::sleep_for(5ms);
+    CHECK(sdo_upload(0x6041) == 0x0240);
+
+    operational(f);
+    CHECK(sdo_download(0x6060, 0, 8, 1).Payload[0] == 0x80);
+    CHECK(sdo_upload(0x6060) == 1);
+    CHECK(sdo_download(0x6040, 0, 0x06, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x07, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
+    CHECK((sdo_upload(0x6041) & 0x006f) == 0x0027);
+
+    const uint32_t target = 1234;
+    const auto target_bytes = std::array<uint8_t, 4>{
+        static_cast<uint8_t>(target), static_cast<uint8_t>(target >> 8),
+        static_cast<uint8_t>(target >> 16), static_cast<uint8_t>(target >> 24)};
+    fake::inject(0x20a, {0x1f, 0x00, 3, target_bytes[0], target_bytes[1], target_bytes[2], target_bytes[3]});
+    wait_for([&] { return sdo_upload(0x6060) == 1; });
+    CHECK(sdo_upload(0x6040) == 0x1b);
+    wait_for([&] { return (sdo_upload(0x6041) & 0x006f) == 0x0040; });
+    CHECK(sdo_upload(0x6064) == 0);
+    CHECK(sdo_download(0x6040, 0, 0x06, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x07, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
+    fake::inject(0x20a, {0x1f, 0x00, 1, target_bytes[0], target_bytes[1], target_bytes[2], target_bytes[3]});
+    wait_for([&] { return sdo_upload(0x607a) == target; });
+    wait_for([&] { return (sdo_upload(0x6041) & 0x1000) != 0; });
+    fake::inject(0x20a, {0x0f, 0x00, 1, target_bytes[0], target_bytes[1], target_bytes[2], target_bytes[3]});
+    const auto deadline = xco::Clock::now() + 2s;
+    while ((sdo_upload(0x6041) & 0x0400) == 0) {
+        if (xco::Clock::now() >= deadline) throw std::runtime_error("DS402 PP target was not reached");
+    }
+    CHECK(sdo_upload(0x6061) == 1);
+    CHECK(static_cast<int32_t>(sdo_upload(0x6064)) == static_cast<int32_t>(target));
+
+    const auto resets_before = f.status().reset_communication_count;
+    exchange(0, {0x82, 10}, 0x70a, 0);
+    CHECK(f.status().reset_communication_count == resets_before + 1);
+    CHECK((sdo_upload(0x6041) & 0x006f) == 0x0040);
+    CHECK(sdo_upload(0x6060) == 1);
+    operational(f);
+    CHECK(sdo_download(0x6040, 0, 0x06, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x07, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
+
+    const uint32_t next_target = 1000000;
+    const auto next_bytes = std::array<uint8_t, 4>{
+        static_cast<uint8_t>(next_target), static_cast<uint8_t>(next_target >> 8),
+        static_cast<uint8_t>(next_target >> 16), static_cast<uint8_t>(next_target >> 24)};
+    fake::inject(0x20a, {0x1f, 0x00, 1, next_bytes[0], next_bytes[1], next_bytes[2], next_bytes[3]});
+    wait_for([&] { return (sdo_upload(0x6041) & 0x1000) != 0; });
+    fake::inject(0x20a, {0x0f, 0x00, 1, next_bytes[0], next_bytes[1], next_bytes[2], next_bytes[3]});
+    wait_for([&] { return sdo_upload(0x607a) == next_target; });
+    std::this_thread::sleep_for(5ms);
+    CHECK(static_cast<int32_t>(sdo_upload(0x6064)) > static_cast<int32_t>(target));
+    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    std::array<uint8_t, 2> stopped_statusword_bytes{};
+    uint32_t read_size = 0;
+    CHECK(xnet_canopen_read_od(f.device, 0x6041, 0, stopped_statusword_bytes.data(),
+        stopped_statusword_bytes.size(), &read_size) == XNET_CO_OK);
+    uint16_t stopped_statusword = 0;
+    std::memcpy(&stopped_statusword, stopped_statusword_bytes.data(), sizeof(stopped_statusword));
+    CHECK(read_size == stopped_statusword_bytes.size());
+    CHECK((stopped_statusword & 0x006f) == 0x0040);
 }
 
 void adapter_session_configuration() {
@@ -1605,7 +2178,12 @@ int main(int argc, char** argv) {
     }
     if (!xnet_canopen_c_header_test()) return 1;
     const std::vector<std::pair<const char*, std::function<void()>>> tests = {
-        {"model validation", model_validation}, {"NODE_ID offsets", node_id_offsets},
+        {"model validation", model_validation}, {"DS402 model validation", drive_402_model_validation},
+        {"DS402 SDO only", drive_402_sdo_only},
+        {"DS402 PP integration", drive_402_integration},
+        {"DS402 external exchange", drive_402_external_exchange},
+        {"DS402 watchdog deadlines", drive_402_watchdog_deadlines}, {"NODE_ID offsets", node_id_offsets},
+        {"DS402 missing model startup", drive_402_missing_model_startup},
         {"adapter session configuration", adapter_session_configuration},
         {"CAN termination configuration", can_termination_configuration},
         {"startup bitrates", startup_bitrates}, {"scalar limits", scalar_limits},
