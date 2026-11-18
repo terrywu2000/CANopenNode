@@ -107,7 +107,7 @@ template<class Function> int32_t motor_call(motor_drive_port_handle port, Functi
             && port->endpoint->writer_open && d.model->drive_adapter, XNET_CO_INVALID_STATE, "motor port is not active");
         if (port->epoch != d.drive_epoch) {
             port->epoch = d.drive_epoch; port->pcl_epoch = 0; port->heartbeat_seq = 0;
-            port->heartbeat_step = {}; port->submitted.reset();
+            port->heartbeat_step = {}; port->submitted.reset(); port->test_issue_count = 0;
         }
         result = function(d, *port);
         return XNET_CO_OK;
@@ -124,6 +124,52 @@ bool empty_step(const motor_drive_model_step_v1& step) {
 bool empty_cycle(const motor_drive_cycle_v1& cycle) {
     return cycle.sync_domain_id == 0 && cycle.sync_domain_epoch == 0 && cycle.sync_cycle_id == 0
         && cycle.sync_counter == 0 && cycle.flags == 0 && empty_time(cycle.rx_time) && empty_time(cycle.sync_time);
+}
+void timing_feedback(xnet_canopen_timing_event_v1& event, const motor_drive_feedback_v1& feedback,
+                     const motor_drive_model_step_v1* target) {
+    event.flags &= ~(XNET_CO_TIMING_HAS_SOURCE | XNET_CO_TIMING_HAS_SOURCE_CYCLE | XNET_CO_TIMING_HAS_TARGET
+        | XNET_CO_TIMING_HAS_FEEDBACK | XNET_CO_TIMING_HAS_SOURCE_TIME | XNET_CO_TIMING_HAS_AVAILABLE_TIME
+        | XNET_CO_TIMING_HAS_DECISION_TIME | XNET_CO_TIMING_HAS_CUTOFF | XNET_CO_TIMING_HAS_TARGET_TIME
+        | XNET_CO_TIMING_HAS_SUBMITTED_STEADY_TIME);
+    event.flags |= XNET_CO_TIMING_HAS_SOURCE | XNET_CO_TIMING_HAS_FEEDBACK;
+    event.source = feedback.source;
+    event.feedback_seq = feedback.feedback_seq;
+    event.executed_step = feedback.executed_step;
+    if (!empty_cycle(feedback.source_cycle)) {
+        event.flags |= XNET_CO_TIMING_HAS_SOURCE_CYCLE;
+        event.source_cycle = feedback.source_cycle;
+    }
+    if (target) {
+        event.flags |= XNET_CO_TIMING_HAS_TARGET;
+        event.target_step = *target;
+    }
+}
+void timing_submission(xnet_canopen_timing_event_v1& event, xco::Clock::time_point submitted) {
+    const auto value = std::chrono::duration<long double, std::micro>(submitted.time_since_epoch()).count();
+    if (value >= static_cast<long double>(std::numeric_limits<int64_t>::min())
+        && value < -static_cast<long double>(std::numeric_limits<int64_t>::min())) {
+        event.flags |= XNET_CO_TIMING_HAS_SUBMITTED_STEADY_TIME;
+        event.submitted_steady_us = static_cast<int64_t>(value);
+    }
+}
+uint32_t timing_history_reason(xco::TimedHistoryResult result) {
+    switch (result) {
+        case xco::TimedHistoryResult::not_closed: return XNET_CO_TIMING_REASON_WATERMARK;
+        case xco::TimedHistoryResult::no_candidate:
+        case xco::TimedHistoryResult::stale_epoch: return XNET_CO_TIMING_REASON_STALE;
+        case xco::TimedHistoryResult::deadline_missed: return XNET_CO_TIMING_REASON_DEADLINE;
+        case xco::TimedHistoryResult::history_gap: return XNET_CO_TIMING_REASON_HISTORY_GAP;
+        case xco::TimedHistoryResult::overflow: return XNET_CO_TIMING_REASON_HISTORY_OVERFLOW;
+        default: return XNET_CO_TIMING_REASON_HISTORY_INVALID;
+    }
+}
+bool same_time(const motor_drive_time_v1& a, const motor_drive_time_v1& b) {
+    return std::tie(a.clock_domain_id, a.flags, a.time_s) == std::tie(b.clock_domain_id, b.flags, b.time_s);
+}
+bool same_cycle(const motor_drive_cycle_v1& a, const motor_drive_cycle_v1& b) {
+    return std::tie(a.sync_domain_id, a.sync_domain_epoch, a.sync_cycle_id, a.sync_counter, a.flags)
+        == std::tie(b.sync_domain_id, b.sync_domain_epoch, b.sync_cycle_id, b.sync_counter, b.flags)
+        && same_time(a.rx_time, b.rx_time) && same_time(a.sync_time, b.sync_time);
 }
 bool valid_step(const motor_drive_model_step_v1& step) {
     const auto& time = step.sample_time;
@@ -147,12 +193,29 @@ bool advancing_step(const motor_drive_model_step_v1& step, const motor_drive_mod
             || (step.sample_time.clock_domain_id == previous.sample_time.clock_domain_id
                 && step.sample_time.time_s >= previous.sample_time.time_s));
 }
+bool test_hold_step(const xco::TestHoldPlan& plan, const motor_drive_model_step_v1& first,
+                    uint64_t first_us, const motor_drive_model_step_v1& step, uint64_t step_us) {
+    if (first.pcl_epoch != plan.pcl_epoch || step.pcl_epoch != plan.pcl_epoch
+        || first.step_duration_s != plan.model_period_us / 1000000.0
+        || step.step_duration_s != first.step_duration_s
+        || step.sample_time.clock_domain_id != first.sample_time.clock_domain_id
+        || step.sample_time.flags != first.sample_time.flags
+        || step.model_step_seq < first.model_step_seq || step.pcl_tick < first.pcl_tick
+        || step.model_time_s < first.model_time_s) return false;
+    const uint64_t steps = step.model_step_seq - first.model_step_seq;
+    if (steps == 0) return first_us == step_us && same_step(first, step);
+    if (steps > UINT64_MAX / plan.tick_stride || steps > UINT64_MAX / plan.model_period_us) return false;
+    const uint64_t ticks = steps * plan.tick_stride;
+    const uint64_t elapsed = steps * plan.model_period_us;
+    return first.pcl_tick <= UINT64_MAX - ticks && step.pcl_tick == first.pcl_tick + ticks
+        && first_us <= UINT64_MAX - elapsed && step_us == first_us + elapsed;
+}
 bool same_feedback(const motor_drive_feedback_v1& a, const motor_drive_feedback_v1& b) {
     return std::tie(a.source.epoch, a.source.command_seq, a.source.action_seq, a.feedback_seq, a.action_result,
                     a.flags, a.limit_flags, a.actual_position_rad, a.actual_velocity_rad_s, a.fault_class, a.fault_detail)
         == std::tie(b.source.epoch, b.source.command_seq, b.source.action_seq, b.feedback_seq, b.action_result,
                     b.flags, b.limit_flags, b.actual_position_rad, b.actual_velocity_rad_s, b.fault_class, b.fault_detail)
-        && same_step(a.executed_step, b.executed_step);
+        && same_step(a.executed_step, b.executed_step) && same_cycle(a.source_cycle, b.source_cycle);
 }
 }
 
@@ -335,7 +398,10 @@ ODR_t xnet_canopen_device::write_communication(
         if (binding.index == 0x1014) d.model->emcy_reconfigured = true;
         if (binding.index == 0x1005) {
             d.model->sync_reconfigured = true;
-            if (sync_id_change) d.start_sync_observation_epoch();
+            if (sync_id_change) {
+                d.start_sync_observation_epoch();
+                d.invalidate_sync_execution("SYNC COB-ID changed; timing source invalidated");
+            }
         }
         if (d.co->NMT->HBproducerTime_us > 0 || d.co->NGslave->lifeTime_us == 0) {
             // Stopping supervision must also clear a previously raised error.
@@ -400,6 +466,73 @@ void xnet_canopen_device::start_drive_epoch() {
     if (!model || !model->drive_402_external) return;
     require(drive_epoch != UINT64_MAX, XNET_CO_STACK_ERROR, "DS402 external epoch exhausted");
     ++drive_epoch;
+    if (sync_execution && sync_execution->active_test_external_capture) {
+        const auto& command_plan = sync_execution->test_command_plan;
+        const auto& feedback_plan = sync_execution->test_feedback_plan;
+        require(!command_plan || (command_plan->sync_domain_id && command_plan->clock_domain_id
+            && command_plan->epsilon_us <= command_plan->max_age_us
+            && command_plan->lead_us <= command_plan->max_age_us - command_plan->epsilon_us),
+            XNET_CO_INVALID_ARGUMENT, "invalid DS402 test command budget");
+        require(!feedback_plan || (feedback_plan->epsilon_us <= feedback_plan->max_age_us
+            && feedback_plan->delay_us <= feedback_plan->max_age_us - feedback_plan->epsilon_us),
+            XNET_CO_INVALID_ARGUMENT, "invalid DS402 test feedback budget");
+        const auto validate_history_budget = [](const xco::TestHistoryBudget& budget, uint64_t max_age) {
+            if (!budget.capacity || budget.capacity > 64) return false;
+            if (!budget.min_spacing_us) return budget.retention_us == 0;
+            return budget.retention_us >= max_age
+                && budget.retention_us / budget.min_spacing_us < budget.capacity;
+        };
+        const auto command_budget = sync_execution->test_command_history_budget;
+        const auto feedback_budget = sync_execution->test_feedback_history_budget;
+        require(validate_history_budget(command_budget, command_plan ? command_plan->max_age_us : 0)
+            && validate_history_budget(feedback_budget, feedback_plan ? feedback_plan->max_age_us : 0),
+            XNET_CO_INVALID_ARGUMENT, "invalid DS402 test history capacity budget");
+        sync_execution->active_test_command_plan = command_plan;
+        sync_execution->active_test_feedback_plan = feedback_plan;
+        sync_execution->active_test_auto_retire = sync_execution->test_auto_retire;
+        require(sync_execution->commands.start_epoch(drive_epoch, command_budget.capacity, command_budget.min_spacing_us)
+                == xco::TimedHistoryResult::ok
+            && sync_execution->feedback.start_epoch(drive_epoch, feedback_budget.capacity, feedback_budget.min_spacing_us)
+                == xco::TimedHistoryResult::ok,
+            XNET_CO_STACK_ERROR, "cannot start DS402 timed history epoch");
+        sync_execution->feedback_order = 0;
+        sync_execution->active_test_ordered_sync_watermark = sync_execution->test_ordered_sync_watermark;
+        sync_execution->test_sync_watermark_anchor.reset();
+        sync_execution->active_test_sampling_plan.reset();
+        sync_execution->active_test_sampling_watermark = false;
+        sync_execution->test_sampling_closed_us.reset();
+        sync_execution->test_sampling_anchor_us.reset();
+        sync_execution->test_sampling_anchor_time.reset();
+        sync_execution->test_sampling_cursor.reset();
+        sync_execution->active_test_hold_plan.reset();
+        if (sync_execution->test_hold_plan) {
+            const auto& hold = *sync_execution->test_hold_plan;
+            require(hold.pcl_epoch && hold.model_period_us && hold.tick_stride && hold.max_hold_steps,
+                XNET_CO_INVALID_ARGUMENT, "invalid DS402 test hold plan");
+            if (sync_execution->test_sampling_plan) {
+                const auto& sampling = *sync_execution->test_sampling_plan;
+                require(sampling.pcl_epoch == hold.pcl_epoch && sampling.model_period_us == hold.model_period_us
+                    && sampling.step_stride <= UINT64_MAX / hold.tick_stride
+                    && sampling.tick_stride == sampling.step_stride * hold.tick_stride,
+                    XNET_CO_INVALID_ARGUMENT, "DS402 test hold and sampling plans disagree");
+            }
+            sync_execution->active_test_hold_plan = hold;
+        }
+        if (sync_execution->test_sampling_plan) {
+            const auto& plan = *sync_execution->test_sampling_plan;
+            require(plan.pcl_epoch && plan.first_step && plan.step_stride && plan.first_tick && plan.tick_stride && plan.model_period_us
+                && plan.acceptance_window_us && plan.step_stride <= UINT64_MAX / plan.model_period_us,
+                XNET_CO_INVALID_ARGUMENT, "invalid DS402 test sampling plan");
+            const uint64_t interval = plan.step_stride * plan.model_period_us;
+            require(plan.acceptance_window_us <= interval
+                && plan.first_sample_us <= UINT64_MAX - plan.acceptance_window_us,
+                XNET_CO_INVALID_ARGUMENT, "invalid DS402 test sampling deadline");
+            sync_execution->test_sampling_cursor =
+                xco::TestSamplingCursor{plan.first_step, plan.first_tick, plan.first_sample_us, interval};
+            sync_execution->active_test_sampling_plan = plan;
+            sync_execution->active_test_sampling_watermark = sync_execution->test_sampling_watermark;
+        }
+    }
     drive_adapter_fault = false;
     drive_command_seq = 0;
     drive_command = {};
@@ -409,12 +542,17 @@ void xnet_canopen_device::start_drive_epoch() {
     drive_last_feedback_seq = 0;
     drive_last_submitted_seq = 0;
     drive_command_history = {};
+    drive_command_history_overwrites = 0;
     drive_feedback_pending = false;
     drive_has_last_feedback = false;
     drive_has_last_submitted = false;
     drive_pending_submitted_at = drive_feedback_accepted_at = {};
     drive_pending_feedback = {};
     drive_last_feedback = {};
+    drive_pending_motor_feedback = {};
+    drive_pending_timed_source.reset();
+    drive_feedback_history = {};
+    drive_feedback_history_overwrites = 0;
     drive_pending_feedback_bytes = {};
     drive_last_feedback_bytes = {};
     drive_last_submitted_bytes = {};
@@ -436,7 +574,7 @@ void xnet_canopen_device::start_drive_epoch() {
     drive_reset_permitted = false;
 }
 
-void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_operational) {
+void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_operational, bool safety_only) {
     if (!model || !model->drive_402_enabled) return;
     require(drive_402 != nullptr, XNET_CO_INTERNAL_ERROR, "DS402 profile is enabled without a drive instance");
     const int8_t requested_mode = read_drive_value<int8_t>(*model, 0x6060);
@@ -467,6 +605,15 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
     const auto now = xco::Clock::now();
     const auto previous_status = drive_402->status();
     if (model->drive_402_external) {
+        const bool capture = sync_execution && sync_execution->active_test_external_capture;
+        xco::TimingDiagnosticScope diagnostic(capture && drive_feedback_pending ? sync_execution.get() : nullptr);
+        if (auto* context = diagnostic.get()) {
+            timing_feedback(*context, drive_pending_motor_feedback,
+                drive_pending_timed_source ? &drive_pending_timed_source->view.target_step : nullptr);
+            timing_submission(*context, drive_pending_submitted_at);
+        }
+        const char* capture_failure = nullptr;
+        uint32_t capture_reason = XNET_CO_TIMING_REASON_CLOCK;
         const bool heartbeat_expired = drive_has_heartbeat
             && now - drive_heartbeat_changed >= std::chrono::microseconds(model->drive_heartbeat_timeout_us);
         const auto action_deadline = drive_action_started + std::chrono::microseconds(model->drive_action_timeout_us);
@@ -476,16 +623,49 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
         if (drive_feedback_pending) {
             const auto frame = drive_pending_feedback;
             const auto& record = drive_command_history[frame.command_seq % drive_command_history.size()];
-            const bool identity_valid = frame.epoch == drive_epoch && frame.action_seq == drive_action_seq
-                && record.seq == frame.command_seq && record.action_seq == frame.action_seq;
-            const bool command_expired = identity_valid
-                && now - record.published > std::chrono::microseconds(model->drive_command_max_age_us);
+            bool identity_valid = frame.epoch == drive_epoch && frame.action_seq == drive_action_seq;
+            bool command_expired = false;
+            if (drive_pending_timed_source) {
+                uint64_t current = 0, mapped_target = 0, mapped_step = 0;
+                const auto& timed = *drive_pending_timed_source;
+                if (!sync_execution || sync_execution->invalid) {
+                    identity_valid = false;
+                } else if (!test_sync_watermark_valid()) {
+                    identity_valid = false;
+                    capture_failure = "ordered SYNC watermark clock mapping changed";
+                } else if (!test_sync_source_valid(timed.raw_source_timestamp, timed.source_us)) {
+                    identity_valid = false;
+                    capture_failure = "ordered SYNC source clock mapping changed";
+                } else if (!sync_now(current) || current < timed.source_us) {
+                    identity_valid = false;
+                    capture_failure = "scheduled feedback acceptance clock invalid";
+                } else if (!sync_execution->active_clock->map_model_us(timed.view.target_step.sample_time, mapped_target)
+                    || mapped_target != timed.target_us
+                    || !sync_execution->active_clock->map_model_us(drive_pending_motor_feedback.executed_step.sample_time, mapped_step)
+                    || (sync_execution->active_test_hold_plan
+                        ? !test_hold_step(*sync_execution->active_test_hold_plan, timed.view.target_step,
+                                          mapped_target, drive_pending_motor_feedback.executed_step, mapped_step)
+                        : mapped_step != timed.target_us)) {
+                    identity_valid = false;
+                    capture_failure = "scheduled feedback acceptance clock mapping changed";
+                } else {
+                    command_expired = timed.epsilon_us > model->drive_command_max_age_us
+                        || current - timed.source_us > model->drive_command_max_age_us - timed.epsilon_us;
+                }
+            } else {
+                identity_valid = identity_valid && record.seq == frame.command_seq && record.action_seq == frame.action_seq;
+                command_expired = identity_valid
+                    && now - record.published > std::chrono::microseconds(model->drive_command_max_age_us);
+            }
             const bool late_completion = previous_status.action_pending
                 && (frame.action_result == CO_402_ACTION_RESULT_DONE || frame.action_result == CO_402_ACTION_RESULT_ERROR)
                 && drive_timed_action_seq == frame.action_seq && drive_pending_submitted_at >= action_deadline;
             const bool command_valid = identity_valid && !command_expired && !late_completion;
+            const bool safety_fault_on_timing_failure = drive_pending_timed_source && frame.epoch == drive_epoch
+                && (capture_failure || !sync_execution || sync_execution->invalid || command_expired || late_completion)
+                && (frame.fault_code != 0 || frame.action_result == CO_402_ACTION_RESULT_ERROR);
             uint16_t result = command_valid ? 1 : command_expired ? 2 : 3;
-            if (command_valid) {
+            if (command_valid || safety_fault_on_timing_failure) {
                 if (frame.action_result == CO_402_ACTION_RESULT_DONE && frame.action_seq == drive_timed_action_seq)
                     action_expired = false;
                 const bool velocity_valid = (frame.flags & 0x02U) != 0;
@@ -493,16 +673,98 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
                     velocity_valid ? frame.actual_velocity : drive_402->status().actual_velocity,
                     frame.fault_code != 0 || frame.action_result == CO_402_ACTION_RESULT_ERROR,
                     (frame.flags & 0x08U) != 0};
-                drive_402->post_feedback(feedback);
+                require((safety_only || capture) ? drive_402->post_safety_feedback(feedback) : drive_402->post_feedback(feedback),
+                    XNET_CO_INTERNAL_ERROR, "DS402 external feedback rejected by drive core");
                 drive_pp_ready = (frame.flags & 0x04U) != 0;
                 drive_reset_permitted = (frame.flags & 0x10U) != 0;
-                drive_402->set_external_permissions(drive_pp_ready, drive_reset_permitted);
+                drive_402->set_external_permissions(drive_pp_ready && !capture, drive_reset_permitted);
                 drive_last_feedback = frame;
                 drive_last_feedback_seq = frame.feedback_seq;
                 drive_last_feedback_bytes = drive_pending_feedback_bytes;
                 drive_has_last_feedback = true;
                 drive_feedback_accepted_at = now;
-                drive_adapter_fault = false;
+                auto& feedback_record = drive_feedback_history[frame.feedback_seq % drive_feedback_history.size()];
+                if (feedback_record.valid) {
+                    if (drive_feedback_history_overwrites == 0)
+                        log(xco::LogLevel::warning, "asynchronous DS402 feedback history overwrote an older record; epoch={}",
+                            drive_epoch);
+                    if (drive_feedback_history_overwrites != UINT64_MAX) ++drive_feedback_history_overwrites;
+                }
+                feedback_record = {true, drive_pending_motor_feedback, frame, drive_pending_submitted_at, now};
+                const bool scheduled_sample = drive_pending_timed_source.has_value();
+                const bool sampling_enabled = capture && sync_execution->active_test_sampling_plan.has_value();
+                if (capture && command_valid && !sync_execution->invalid && !capture_failure
+                    && (!sampling_enabled || (scheduled_sample && !force_non_operational && !stop_requested))) {
+                    uint64_t source = 0, accepted = 0;
+                    const auto& sample = drive_pending_motor_feedback.executed_step.sample_time;
+                    if (!(sample.flags & MOTOR_DRIVE_TIME_VALID)
+                        || !sync_execution->active_clock->map_model_us(sample, source) || !sync_now(accepted)) {
+                        capture_failure = "DS402 feedback clock mapping invalid";
+                    } else if (sampling_enabled && !sync_execution->test_sampling_cursor) {
+                        capture_failure = "DS402 fixed sampling plan not armed";
+                        capture_reason = XNET_CO_TIMING_REASON_OTHER;
+                    } else if (sampling_enabled) {
+                        const auto& plan = *sync_execution->active_test_sampling_plan;
+                        const auto& cursor = *sync_execution->test_sampling_cursor;
+                        const auto& step = drive_pending_motor_feedback.executed_step;
+                        if (step.pcl_epoch != plan.pcl_epoch || step.model_step_seq != cursor.next_step
+                            || step.pcl_tick != cursor.next_tick || source != cursor.next_sample_us
+                            || step.step_duration_s != plan.model_period_us / 1000000.0) {
+                            capture_failure = "DS402 feedback missed fixed sampling step";
+                            capture_reason = XNET_CO_TIMING_REASON_STALE;
+                        } else if (accepted >= cursor.next_sample_us + plan.acceptance_window_us) {
+                            capture_failure = "DS402 fixed feedback acceptance deadline missed";
+                            capture_reason = XNET_CO_TIMING_REASON_DEADLINE;
+                        }                         else if (cursor.next_step > UINT64_MAX - plan.step_stride
+                            || cursor.next_tick > UINT64_MAX - plan.tick_stride
+                            || cursor.next_sample_us > UINT64_MAX - cursor.interval_us
+                            || cursor.next_sample_us + cursor.interval_us > UINT64_MAX - plan.acceptance_window_us) {
+                            capture_failure = "DS402 fixed sampling plan exhausted";
+                            capture_reason = XNET_CO_TIMING_REASON_OTHER;
+                        }
+                    }
+                    if (!capture_failure && sync_execution->feedback_order == UINT64_MAX) {
+                        capture_failure = "DS402 timed feedback sequence exhausted";
+                        capture_reason = XNET_CO_TIMING_REASON_HISTORY_INVALID;
+                    } else if (!capture_failure) {
+                        xco::TimedDriveFeedback timed{drive_pending_motor_feedback, frame, drive_pending_submitted_at, {}};
+                        if (drive_pending_timed_source) {
+                            const auto& issued = *drive_pending_timed_source;
+                            timed.source = xco::TimedFeedbackSource{
+                                issued.raw_source_timestamp, issued.source_us, issued.epsilon_us, issued.view.target_step};
+                        }
+                        const auto result = sync_execution->feedback.append(
+                            {drive_epoch, ++sync_execution->feedback_order, source, accepted, timed});
+                        if (result != xco::TimedHistoryResult::ok) {
+                            capture_failure = result == xco::TimedHistoryResult::overflow
+                                ? "DS402 timed feedback history overflow" : "DS402 timed feedback history invalid";
+                            capture_reason = timing_history_reason(result);
+                        } else if (sampling_enabled && sync_execution->active_test_sampling_watermark
+                            && sync_execution->feedback.close_through(drive_epoch, source, accepted)
+                                != xco::TimedHistoryResult::ok) {
+                            capture_failure = "DS402 fixed feedback watermark invalid";
+                            capture_reason = XNET_CO_TIMING_REASON_WATERMARK;
+                        } else if (sampling_enabled) {
+                            if (sync_execution->active_test_sampling_watermark) {
+                                sync_execution->test_sampling_closed_us = source;
+                                sync_execution->test_sampling_anchor_us = source;
+                                sync_execution->test_sampling_anchor_time = sample;
+                            }
+                            auto& cursor = *sync_execution->test_sampling_cursor;
+                            cursor.next_step += sync_execution->active_test_sampling_plan->step_stride;
+                            cursor.next_tick += sync_execution->active_test_sampling_plan->tick_stride;
+                            cursor.next_sample_us += cursor.interval_us;
+                        }
+                        if (!capture_failure) {
+                            auto& context = *diagnostic.get();
+                            context.flags |= XNET_CO_TIMING_HAS_SOURCE_TIME | XNET_CO_TIMING_HAS_AVAILABLE_TIME;
+                            context.source_us = source;
+                            context.available_us = accepted;
+                            record_timing_event(XNET_CO_TIMING_FEEDBACK_ACCEPTED);
+                        }
+                    }
+                }
+                if (command_valid && (!capture || !sync_execution->invalid)) drive_adapter_fault = false;
                 drive_current_fault = frame.fault_code
                     ? frame.fault_code
                     : frame.action_result == CO_402_ACTION_RESULT_ERROR ? CO_EMC_GENERIC : 0;
@@ -510,8 +772,17 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
                 input.action_result = frame.action_result;
             }
             drive_processed_feedback_seq = frame.feedback_seq;
-            drive_processed_result = result;
+            drive_processed_result = capture_failure ? static_cast<uint16_t>(MOTOR_DRIVE_PROCESSED_INVALID) : result;
+            if (capture && !command_valid && !capture_failure)
+                record_timing_event(XNET_CO_TIMING_FEEDBACK_REJECTED,
+                    late_completion ? XNET_CO_TIMING_REASON_DEADLINE : XNET_CO_TIMING_REASON_STALE,
+                    "feedback rejected before normal timed acceptance");
             drive_feedback_pending = false;
+            drive_pending_timed_source.reset();
+        }
+        if (capture_failure) {
+            invalidate_sync_execution(capture_failure, capture_reason);
+            return;
         }
         input.external_feedback_age_valid = true;
         input.external_feedback_age_us = drive_has_last_feedback
@@ -544,10 +815,11 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
         drive_402->set_external_fault(faults != 0 || drive_adapter_fault);
         external_fault_code = drive_current_fault ? drive_current_fault
             : drive_adapter_fault ? CO_EMC_GENERIC : faults ? 0x8130 : 0;
-        input.model_ready = drive_pp_ready;
+        input.model_ready = drive_pp_ready && !capture;
         input.reset_permitted = drive_reset_permitted;
     }
-    drive_402->step(input, dt_us);
+    if (safety_only) drive_402->process_safety(input, dt_us);
+    else drive_402->step(input, dt_us);
     const auto status = drive_402->status();
     if (model->drive_402_external) {
         if (status.action_pending && status.action_seq != drive_timed_action_seq) {
@@ -582,8 +854,16 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
         command.quick_stop_deceleration = input.quick_stop_deceleration;
         command.demand_velocity = status.demand_velocity;
         drive_command = command;
-        drive_command_history[command_seq % drive_command_history.size()] =
-            DriveCommandRecord{command_seq, status.action_seq, xco::Clock::now()};
+        auto& command_record = drive_command_history[command_seq % drive_command_history.size()];
+        if (command_record.seq) {
+            if (drive_command_history_overwrites == 0)
+                log(xco::LogLevel::warning, "asynchronous DS402 command history overwrote an older record; epoch={}",
+                    drive_epoch);
+            if (drive_command_history_overwrites != UINT64_MAX) ++drive_command_history_overwrites;
+        }
+        command_record =
+            DriveCommandRecord{command_seq, status.action_seq, xco::Clock::now(), command,
+                drive_processed_feedback_seq, drive_processed_result};
         const bool fault_active = status.model_fault || external_fault_code != 0;
         const uint16_t current_fault = external_fault_code;
         require(!status.model_fault || current_fault != 0, XNET_CO_STACK_ERROR, "DS402 model fault has no classified cause");
@@ -621,8 +901,8 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
     } else if (model->drive_has_error_code) {
         write_drive_value(*model, 0x603f, static_cast<uint16_t>(status.model_fault ? 0x1000 : 0));
     }
-    if (model->drive_adapter) model->drive_adapter->publish(status);
-    else write_drive_value(*model, 0x6064, status.actual_position);
+    if (model->drive_adapter) model->drive_adapter->publish(status, !safety_only);
+    else if (!safety_only) write_drive_value(*model, 0x6064, status.actual_position);
     write_drive_value(*model, 0x6041, status.statusword);
     write_drive_value(*model, 0x6061, status.mode_display);
     if (unsupported_mode) {
@@ -658,6 +938,122 @@ void xnet_canopen_device::drain_drive_402() {
     }
 }
 
+void xnet_canopen_device::start_test_rpdo_plan() {
+    if (!sync_execution) return;
+    auto& execution = *sync_execution;
+    execution.active_test_rpdo_plan.reset();
+    execution.test_rpdo_seen = 0;
+    execution.test_rpdo_last_us.reset();
+    if (!execution.test_rpdo_plan) return;
+    const auto& plan = *execution.test_rpdo_plan;
+    require(plan.required_mask && !(plan.required_mask >> model->rpdo_count)
+        && plan.epsilon_us <= UINT64_MAX / 2 && !co->nodeIdUnconfigured,
+        XNET_CO_INVALID_ARGUMENT, "invalid DS402 test required RPDO plan");
+    for (uint16_t i = 0; i < model->rpdo_count; ++i) {
+        if (!(plan.required_mask & (1U << i))) continue;
+        const auto& rpdo = co->RPDO[i];
+        require(rpdo.PDO_common.valid && rpdo.synchronous && rpdo.PDO_common.dataLength
+            && rpdo.PDO_common.mappedObjectsCount && rpdo.PDO_common.mappedObjectsCount <= CO_PDO_MAX_MAPPED_ENTRIES,
+            XNET_CO_INVALID_ARGUMENT, "required test RPDO must be enabled, mapped and synchronous");
+        for (uint8_t mapped = 0; mapped < rpdo.PDO_common.mappedObjectsCount; ++mapped) {
+            const auto& io = rpdo.PDO_common.OD_IO[mapped];
+            require(io.write && io.read && io.stream.dataOffset
+                && io.stream.dataOffset == io.stream.dataLength,
+                XNET_CO_INVALID_ARGUMENT, "required test RPDO mappings must be readable and writable");
+        }
+    }
+    execution.active_test_rpdo_plan = plan;
+    log(xco::LogLevel::warning,
+        "strict test RPDO plan requires every selected RPDO before every SYNC; "
+        "valid sparse or asynchronous master traffic does not satisfy this test contract");
+}
+
+void xnet_canopen_device::start_test_timing_provider() {
+    if (!sync_execution) return;
+    auto& execution = *sync_execution;
+    require(!execution.test_ordered_sync_watermark
+        || (model->drive_402_external && execution.test_external_capture && execution.test_command_plan),
+        XNET_CO_INVALID_STATE, "ordered SYNC test watermark requires external scheduled command capture");
+    require(!execution.test_sampling_watermark || execution.test_sampling_plan,
+        XNET_CO_INVALID_STATE, "test sampling watermark requires a fixed sampling plan");
+    require(!execution.test_hold_plan
+        || (model->drive_402_external && execution.test_external_capture && execution.test_command_plan),
+        XNET_CO_INVALID_STATE, "test hold requires external scheduled command capture");
+    require(!execution.test_sampling_plan
+        || (model->drive_402_external && execution.test_external_capture && execution.test_command_plan),
+        XNET_CO_INVALID_STATE, "fixed test sampling requires external scheduled command capture");
+    require(model->drive_402_enabled && (!model->drive_402_external || execution.test_external_capture)
+        && execution.clock && execution.max_interval_us && execution.tpdo_window_us,
+        XNET_CO_INVALID_STATE, "SYNC execution requires an injected clock and internal model or test capture");
+    execution.active_clock = execution.clock;
+    execution.active_max_interval_us = execution.max_interval_us;
+    execution.active_tpdo_window_us = execution.tpdo_window_us;
+    execution.active_test_external_capture = execution.test_external_capture;
+    execution.active_test_timing_provider = execution.test_timing_provider;
+    execution.active_test_max_clock_error_us = execution.test_max_clock_error_us;
+    execution.test_timing_generation = 0;
+    execution.test_command_proof.reset();
+    execution.test_feedback_proof.reset();
+    if (!execution.active_test_timing_provider) return;
+    require(model && model->drive_402_external && execution.test_external_capture
+        && !execution.test_ordered_sync_watermark && !execution.test_sampling_watermark,
+        XNET_CO_INVALID_ARGUMENT, "test timing provider requires external capture and exclusive watermarks");
+    const uint64_t error = execution.active_test_max_clock_error_us;
+    require((!execution.test_command_plan || execution.test_command_plan->epsilon_us >= error)
+        && (!execution.test_feedback_plan || execution.test_feedback_plan->epsilon_us >= error)
+        && (!execution.test_rpdo_plan || execution.test_rpdo_plan->epsilon_us >= error),
+        XNET_CO_INVALID_ARGUMENT, "test timing provider error exceeds comparison budget");
+    xco::TestTimingEvidence evidence{};
+    require(execution.active_test_timing_provider->snapshot(evidence) && evidence.generation
+        && evidence.max_error_us <= error,
+        XNET_CO_INVALID_ARGUMENT, "test timing provider unavailable or inaccurate");
+    execution.test_timing_generation = evidence.generation;
+}
+
+bool xnet_canopen_device::test_timing_provider_valid() const {
+    const auto& execution = *sync_execution;
+    if (!execution.active_test_timing_provider) return true;
+    xco::TestTimingEvidence evidence{};
+    return execution.active_test_timing_provider->snapshot(evidence)
+        && evidence.generation == execution.test_timing_generation
+        && evidence.max_error_us <= execution.active_test_max_clock_error_us;
+}
+
+bool xnet_canopen_device::apply_test_timing_watermark(bool commands, uint64_t now) {
+    auto& execution = *sync_execution;
+    if (!execution.active_test_timing_provider) return true;
+    xco::TestTimingEvidence evidence{};
+    if (!execution.active_test_timing_provider->snapshot(evidence)
+        || evidence.generation != execution.test_timing_generation
+        || evidence.max_error_us > execution.active_test_max_clock_error_us) {
+        invalidate_sync_execution("test timing provider invalid", XNET_CO_TIMING_REASON_CLOCK);
+        return false;
+    }
+    const auto& proof = commands ? evidence.commands : evidence.feedback;
+    auto& previous = commands ? execution.test_command_proof : execution.test_feedback_proof;
+    if (!proof) {
+        if (!previous) return true;
+        invalidate_sync_execution("test timing provider withdrew watermark", XNET_CO_TIMING_REASON_WATERMARK);
+        return false;
+    }
+    if (proof->through_us > proof->observed_us || proof->observed_us > now
+        || (previous && (proof->through_us < previous->through_us || proof->observed_us < previous->observed_us))) {
+        invalidate_sync_execution("test timing provider watermark invalid", XNET_CO_TIMING_REASON_WATERMARK);
+        return false;
+    }
+    if (!previous || proof->through_us > previous->through_us) {
+        const auto result = commands
+            ? execution.commands.close_through(drive_epoch, proof->through_us, proof->observed_us)
+            : execution.feedback.close_through(drive_epoch, proof->through_us, proof->observed_us);
+        if (result != xco::TimedHistoryResult::ok) {
+            invalidate_sync_execution("test timing provider watermark violated", XNET_CO_TIMING_REASON_WATERMARK);
+            return false;
+        }
+    }
+    previous = proof;
+    return true;
+}
+
 void xnet_canopen_device::reset_stack(bool reset_all_objects) {
     log(xco::LogLevel::info, reset_all_objects ? "Reset Node requested" : "Reset Communication requested");
     drain_drive_402();
@@ -674,8 +1070,23 @@ void xnet_canopen_device::reset_stack(bool reset_all_objects) {
     }
     model->restore(reset_all_objects, pending_node);
     if (drive_402) drive_402->reset();
+    start_test_timing_provider();
     start_drive_epoch();
+    if (sync_execution) {
+        sync_execution->last_sync_us.reset();
+        sync_execution->last_sync_event.reset();
+        sync_execution->last_counter.reset();
+        sync_execution->started_us.reset();
+        sync_execution->invalid = false;
+        sync_execution->invalid_reason = {};
+    }
     setup_stack();
+    start_test_rpdo_plan();
+    if (sync_execution) {
+        uint64_t now = 0;
+        if (sync_now(now)) sync_execution->started_us = now;
+        else invalidate_sync_execution("SYNC clock invalid after reset", XNET_CO_TIMING_REASON_CLOCK);
+    }
     adapter.start();
     CO_CANsetNormalMode(co->CANmodule);
     // Publish completion only after all fallible reset work succeeds. The worker
@@ -715,6 +1126,7 @@ void xnet_canopen_device::activate_bitrate(void* context, uint16_t delay) {
     try {
         // Stop immediately so queued frames cannot violate either LSS silence interval.
         d.start_sync_observation_epoch();
+        d.invalidate_sync_execution("bitrate switch invalidated SYNC timing");
         d.adapter.stop_flush();
         for (auto& pending : d.outgoing) pending.buffer->bufferFull = false;
         d.outgoing.clear();
@@ -752,6 +1164,346 @@ bool_t xnet_canopen_device::store(void* context, uint8_t node, uint16_t bitrate)
     }
 }
 
+void xnet_canopen_device::record_timing_event(uint32_t kind, uint32_t reason, const char* message) {
+    if (!sync_execution || timing_event_exhausted) return;
+    if (timing_event_sequence == UINT64_MAX) {
+        timing_event_exhausted = true;
+        fail(XNET_CO_STACK_ERROR, "timing diagnostic sequence exhausted");
+        return;
+    }
+    auto event = sync_execution->diagnostic_context.value_or(xnet_canopen_timing_event_v1{});
+    event.abi_version = XNET_CO_TIMING_EVENT_ABI_VERSION;
+    event.struct_size = sizeof(event);
+    event.kind = kind;
+    event.reason = reason;
+    event.sequence = ++timing_event_sequence;
+    event.drive_epoch = drive_epoch;
+    event.node_id = active_node;
+    if (message) {
+        const auto length = std::min(std::strlen(message), sizeof(event.message) - 1);
+        std::memcpy(event.message, message, length);
+        event.message[length] = '\0';
+    }
+    timing_events[(event.sequence - 1) % timing_events.size()] = event;
+}
+
+void xnet_canopen_device::invalidate_sync_execution(const char* reason, uint32_t category) {
+    if (!sync_execution || sync_execution->invalid) return;
+    record_timing_event(XNET_CO_TIMING_FAILURE, category, reason);
+    sync_execution->invalid = true;
+    if (sync_execution->active_test_external_capture) {
+        sync_execution->commands.invalidate();
+        sync_execution->feedback.invalidate();
+    }
+    const auto length = std::min(std::strlen(reason), sync_execution->invalid_reason.size() - 1);
+    std::memcpy(sync_execution->invalid_reason.data(), reason, length);
+    sync_execution->invalid_reason[length] = '\0';
+    if (co) CO_CANclearPendingSyncPDOs(co->CANmodule);
+    fail(XNET_CO_STACK_ERROR, reason);
+    if (drive_402) {
+        drive_adapter_fault = true;
+        if (model && model->drive_402_external) drive_402->invalidate_selected_feedback();
+        drive_402->set_external_fault(true);
+        process_drive_402(0, false, true);
+    }
+}
+
+bool xnet_canopen_device::sync_now(uint64_t& now) {
+    auto& execution = *sync_execution;
+    if (!test_timing_provider_valid() || !execution.active_clock->now_us(now)
+        || (execution.last_now_us && now < *execution.last_now_us)) return false;
+    execution.last_now_us = now;
+    return true;
+}
+
+bool xnet_canopen_device::test_sync_source_valid(uint64_t raw, uint64_t expected_us) const {
+    const auto& execution = *sync_execution;
+    if (!execution.active_test_ordered_sync_watermark) return true;
+    uint64_t mapped = 0;
+    return execution.active_clock->map_rx_us(raw, mapped) && mapped == expected_us;
+}
+
+bool xnet_canopen_device::test_sync_watermark_valid() const {
+    const auto& anchor = sync_execution->test_sync_watermark_anchor;
+    return !anchor || test_sync_source_valid(anchor->raw, anchor->mapped_us);
+}
+
+bool xnet_canopen_device::validate_test_sync_watermark() {
+    if (test_sync_watermark_valid()) return true;
+    invalidate_sync_execution("ordered SYNC watermark clock mapping changed", XNET_CO_TIMING_REASON_CLOCK);
+    return false;
+}
+
+void xnet_canopen_device::advance_test_sampling(uint64_t now) {
+    auto& execution = *sync_execution;
+    if (execution.invalid || !execution.active_test_sampling_plan) return;
+    if (!execution.test_sampling_cursor) {
+        invalidate_sync_execution("DS402 fixed sampling plan not armed");
+        return;
+    }
+    const auto& cursor = *execution.test_sampling_cursor;
+    if (now >= cursor.next_sample_us + execution.active_test_sampling_plan->acceptance_window_us) {
+        invalidate_sync_execution("DS402 fixed feedback acceptance deadline missed", XNET_CO_TIMING_REASON_DEADLINE);
+        return;
+    }
+    if (execution.active_test_sampling_watermark && execution.test_sampling_closed_us) {
+        uint64_t anchor_us = 0, next_us = 0;
+        if (!execution.test_sampling_anchor_time || !execution.test_sampling_anchor_us) {
+            invalidate_sync_execution("DS402 fixed feedback watermark anchor missing", XNET_CO_TIMING_REASON_WATERMARK);
+            return;
+        }
+        auto next = *execution.test_sampling_anchor_time;
+        next.time_s += cursor.interval_us / 1000000.0;
+        if (!std::isfinite(next.time_s) || next.time_s <= execution.test_sampling_anchor_time->time_s
+            || !execution.active_clock->map_model_us(*execution.test_sampling_anchor_time, anchor_us)
+            || anchor_us != *execution.test_sampling_anchor_us
+            || !execution.active_clock->map_model_us(next, next_us) || next_us != cursor.next_sample_us) {
+            invalidate_sync_execution("DS402 fixed feedback watermark clock mapping changed", XNET_CO_TIMING_REASON_CLOCK);
+            return;
+        }
+        const uint64_t through = std::min(now, cursor.next_sample_us - 1);
+        if (through > *execution.test_sampling_closed_us) {
+            if (execution.feedback.close_through(drive_epoch, through, now) != xco::TimedHistoryResult::ok)
+                invalidate_sync_execution("DS402 fixed feedback watermark invalid", XNET_CO_TIMING_REASON_WATERMARK);
+            else execution.test_sampling_closed_us = through;
+        }
+    }
+}
+
+void xnet_canopen_device::process_sync_boundary(xnet_canopen_device& d,
+                                                const xnet_canopen_sync_event_t& event, void*) {
+    auto& execution = *d.sync_execution;
+    if (execution.invalid) return;
+    xco::TimingDiagnosticScope diagnostic(&execution);
+    auto& context = *diagnostic.get();
+    context.flags |= XNET_CO_TIMING_HAS_BOUNDARY;
+    context.boundary = event;
+    if (!d.validate_test_sync_watermark()) return;
+    uint64_t source = 0, now = 0;
+    const bool valid_clock = execution.active_clock->map_rx_us(event.timestamp_100ns, source) && d.sync_now(now)
+        && execution.started_us && source >= *execution.started_us && now >= source;
+    if (!valid_clock || now - source >= execution.active_tpdo_window_us) {
+        d.invalidate_sync_execution("SYNC timestamp invalid or TPDO deadline missed",
+            valid_clock ? XNET_CO_TIMING_REASON_DEADLINE : XNET_CO_TIMING_REASON_CLOCK);
+        return;
+    }
+    if (event.counter_present) {
+        const auto overflow = d.co->SYNC->counterOverflowValue;
+        if (event.counter == 0 || event.counter > overflow
+            || (execution.last_counter && event.counter != (*execution.last_counter == overflow ? 1 : *execution.last_counter + 1))) {
+            d.invalidate_sync_execution("SYNC counter invalid or discontinuous");
+            return;
+        }
+        execution.last_counter = event.counter;
+    } else if (execution.last_counter) {
+        d.invalidate_sync_execution("SYNC counter configuration changed");
+        return;
+    }
+    if (std::any_of(d.outgoing.begin(), d.outgoing.end(),
+                    [](const Pending& frame) { return frame.buffer->syncFlag; })) {
+        d.invalidate_sync_execution("previous synchronous TPDO remained queued at next SYNC", XNET_CO_TIMING_REASON_DEADLINE);
+        return;
+    }
+    uint32_t interval = 0;
+    if (execution.last_sync_us) {
+        if (source <= *execution.last_sync_us
+            || source - *execution.last_sync_us > execution.active_max_interval_us) {
+            d.invalidate_sync_execution("SYNC timestamp regressed or interval exceeded", XNET_CO_TIMING_REASON_CLOCK);
+            return;
+        }
+        interval = static_cast<uint32_t>(source - *execution.last_sync_us);
+    }
+    execution.last_sync_us = source;
+    execution.last_sync_event = event;
+    if (execution.active_test_rpdo_plan
+        && !xco::d402::Drive::mode_supported(read_drive_value<int8_t>(*d.model, 0x6060))) {
+        d.invalidate_sync_execution("required RPDO selected an unsupported DS402 mode", XNET_CO_TIMING_REASON_RPDO);
+        return;
+    }
+    d.process_drive_402(0, false, true);
+    if (execution.invalid) return;
+    if (execution.active_test_sampling_plan) {
+        uint64_t current = 0;
+        if (!d.sync_now(current)) d.invalidate_sync_execution("DS402 fixed sampling clock invalid", XNET_CO_TIMING_REASON_CLOCK);
+        else d.advance_test_sampling(current);
+        if (execution.invalid) return;
+    }
+    bool feedback_selected = false;
+    if (d.model->drive_402_external && execution.active_test_external_capture && execution.active_test_feedback_plan) {
+        const auto& plan = *execution.active_test_feedback_plan;
+        uint64_t decision = 0;
+        if (source < plan.delay_us || source > UINT64_MAX - execution.active_tpdo_window_us
+            || !d.sync_now(decision) || decision < source) {
+            d.invalidate_sync_execution("DS402 feedback selection timing invalid", XNET_CO_TIMING_REASON_CLOCK);
+            return;
+        }
+        const uint64_t elapsed = decision - source;
+        if (!d.apply_test_timing_watermark(false, decision)) return;
+        if (plan.max_age_us < plan.delay_us || plan.max_age_us - plan.delay_us < elapsed
+            || plan.max_age_us - plan.delay_us - elapsed < plan.epsilon_us) {
+            d.invalidate_sync_execution("DS402 feedback sample missing or stale", XNET_CO_TIMING_REASON_STALE);
+            return;
+        }
+        xco::TimedHistory<xco::TimedDriveFeedback, 64>::Record selected{};
+        const auto result = execution.feedback.select(d.drive_epoch, source - plan.delay_us, plan.epsilon_us,
+            decision, source + execution.active_tpdo_window_us,
+            plan.max_age_us - plan.delay_us - elapsed - plan.epsilon_us, selected);
+        if (result != xco::TimedHistoryResult::ok) {
+            const char* reason = "DS402 feedback selection history invalid";
+            if (result == xco::TimedHistoryResult::not_closed) reason = "DS402 feedback watermark not closed";
+            else if (result == xco::TimedHistoryResult::no_candidate) reason = "DS402 feedback sample missing or stale";
+            else if (result == xco::TimedHistoryResult::deadline_missed) reason = "DS402 feedback selection deadline missed";
+            else if (result == xco::TimedHistoryResult::history_gap) reason = "DS402 feedback selection intersects retired history";
+            else if (result == xco::TimedHistoryResult::stale_epoch) reason = "DS402 feedback selection epoch invalid";
+            d.invalidate_sync_execution(reason, timing_history_reason(result));
+            return;
+        }
+        timing_feedback(context, selected.value.feedback,
+            selected.value.source ? &selected.value.source->target_step : nullptr);
+        timing_submission(context, selected.value.submitted);
+        context.flags |= XNET_CO_TIMING_HAS_SOURCE_TIME | XNET_CO_TIMING_HAS_AVAILABLE_TIME
+            | XNET_CO_TIMING_HAS_DECISION_TIME;
+        context.source_us = selected.source_time;
+        context.available_us = selected.available_time;
+        context.decision_us = decision;
+        uint64_t mapped_sample = 0;
+        if (!execution.active_clock->map_model_us(selected.value.feedback.executed_step.sample_time, mapped_sample)
+            || mapped_sample != selected.source_time) {
+            d.invalidate_sync_execution("DS402 feedback source clock mapping changed", XNET_CO_TIMING_REASON_CLOCK);
+            return;
+        }
+        if (selected.value.source) {
+            const auto& command = *selected.value.source;
+            uint64_t mapped_command = 0;
+            if (!execution.active_clock->map_rx_us(command.raw_timestamp, mapped_command)
+                || mapped_command != command.source_us) {
+                d.invalidate_sync_execution("DS402 feedback source command clock mapping changed", XNET_CO_TIMING_REASON_CLOCK);
+                return;
+            }
+            if (decision < command.source_us || command.epsilon_us > d.model->drive_command_max_age_us
+                || decision - command.source_us > d.model->drive_command_max_age_us - command.epsilon_us) {
+                d.invalidate_sync_execution("DS402 feedback source command stale", XNET_CO_TIMING_REASON_STALE);
+                return;
+            }
+        }
+        const auto& frame = selected.value.converted;
+        if (!(frame.flags & MOTOR_DRIVE_VELOCITY_VALID)
+            || !d.drive_402->select_feedback({frame.actual_position, frame.actual_velocity,
+                frame.fault_code != 0 || frame.action_result == CO_402_ACTION_RESULT_ERROR,
+                (frame.flags & 0x08U) != 0})) {
+            d.invalidate_sync_execution("DS402 selected feedback is incomplete");
+            return;
+        }
+        if (execution.active_test_auto_retire) {
+            const uint64_t cutoff = source - plan.delay_us;
+            const uint64_t age = plan.max_age_us - plan.delay_us - elapsed - plan.epsilon_us;
+            const uint64_t oldest = cutoff > age ? cutoff - age : 0;
+            if (execution.feedback.retire_before(d.drive_epoch, oldest) != xco::TimedHistoryResult::ok) {
+                d.invalidate_sync_execution("DS402 feedback history retirement failed", XNET_CO_TIMING_REASON_HISTORY_INVALID);
+                return;
+            }
+        }
+        feedback_selected = true;
+    }
+    if (!d.drive_402->status().output_allowed) interval = 0;
+    d.process_drive_402(interval);
+    if (execution.invalid) return;
+    if (feedback_selected) {
+        d.record_timing_event(XNET_CO_TIMING_FEEDBACK_SELECTED);
+        context.flags &= ~(XNET_CO_TIMING_HAS_SOURCE | XNET_CO_TIMING_HAS_SOURCE_CYCLE
+            | XNET_CO_TIMING_HAS_TARGET | XNET_CO_TIMING_HAS_FEEDBACK | XNET_CO_TIMING_HAS_SOURCE_TIME
+            | XNET_CO_TIMING_HAS_AVAILABLE_TIME | XNET_CO_TIMING_HAS_DECISION_TIME
+            | XNET_CO_TIMING_HAS_SUBMITTED_STEADY_TIME);
+    }
+    if (d.model->drive_402_external && execution.active_test_external_capture) {
+        uint64_t available = 0;
+        if (!d.sync_now(available)) {
+            d.invalidate_sync_execution("DS402 command publication clock invalid", XNET_CO_TIMING_REASON_CLOCK);
+            return;
+        }
+        const xco::TimedDriveCommand command{d.drive_command, event,
+            d.drive_processed_feedback_seq, d.drive_processed_result};
+        const auto result = execution.commands.append({d.drive_epoch, event.sequence, source, available, command});
+        if (result != xco::TimedHistoryResult::ok) {
+            d.invalidate_sync_execution(result == xco::TimedHistoryResult::overflow
+                ? "DS402 timed command history overflow" : "DS402 timed command history invalid", timing_history_reason(result));
+            return;
+        }
+        {
+            xco::TimingDiagnosticScope publication(&execution);
+            auto& published = *publication.get();
+            published.flags |= XNET_CO_TIMING_HAS_SOURCE | XNET_CO_TIMING_HAS_SOURCE_TIME
+                | XNET_CO_TIMING_HAS_AVAILABLE_TIME;
+            published.source = {d.drive_command.epoch, d.drive_command.command_seq, d.drive_command.action_seq};
+            published.source_us = source;
+            published.available_us = available;
+            d.record_timing_event(XNET_CO_TIMING_COMMAND_PUBLISHED);
+        }
+        if (execution.active_test_ordered_sync_watermark) {
+            if (execution.commands.close_through(d.drive_epoch, source, available) != xco::TimedHistoryResult::ok) {
+                d.invalidate_sync_execution("ordered SYNC command watermark invalid", XNET_CO_TIMING_REASON_WATERMARK);
+                return;
+            }
+            execution.test_sync_watermark_anchor = xco::TestSyncWatermarkAnchor{event.timestamp_100ns, source};
+        }
+    }
+    CO_process_TPDO(d.co, true, 0, nullptr);
+}
+
+void xnet_canopen_device::process_sync_iteration(uint32_t dt_us) {
+    auto reset = CO_process(co, false, dt_us, nullptr);
+    if (reset != CO_RESET_NOT) {
+        reset_stack(reset == CO_RESET_APP);
+        return;
+    }
+    if (CO_NMT_getInternalState(co->NMT) != CO_NMT_OPERATIONAL) {
+        sync_execution->test_rpdo_seen = 0;
+        sync_execution->test_rpdo_last_us.reset();
+    }
+    if (switching != Switch::none || stop_requested) return;
+    if (!co->nodeIdUnconfigured) {
+        CO_process_RPDO(co, false, dt_us, nullptr);
+        CO_process_TPDO(co, false, dt_us, nullptr);
+        process_drive_402(dt_us, false, true);
+    }
+    if (!sync_execution->invalid && sync_execution->active_test_sampling_plan) {
+        uint64_t now = 0;
+        if (!sync_now(now)) invalidate_sync_execution("DS402 fixed sampling clock invalid", XNET_CO_TIMING_REASON_CLOCK);
+        else advance_test_sampling(now);
+    }
+    receive(process_sync_boundary);
+    if (switching != Switch::none || stop_requested) return;
+    if (!co->nodeIdUnconfigured) process_drive_402(0, false, true);
+    auto& execution = *sync_execution;
+    if (!execution.invalid && execution.started_us) {
+        uint64_t now = 0;
+        const uint64_t anchor = execution.last_sync_us.value_or(*execution.started_us);
+        const bool valid_clock = sync_now(now) && now >= anchor;
+        if (!valid_clock || now - anchor > execution.active_max_interval_us)
+            invalidate_sync_execution("SYNC clock invalid or SYNC interval exceeded",
+                valid_clock ? XNET_CO_TIMING_REASON_DEADLINE : XNET_CO_TIMING_REASON_CLOCK);
+        else if (execution.last_sync_us && now - *execution.last_sync_us >= execution.active_tpdo_window_us
+                 && std::any_of(outgoing.begin(), outgoing.end(),
+                                [](const Pending& frame) { return frame.buffer->syncFlag; })) {
+            xco::TimingDiagnosticScope diagnostic(&execution);
+            if (execution.last_sync_event) {
+                diagnostic.get()->flags |= XNET_CO_TIMING_HAS_BOUNDARY;
+                diagnostic.get()->boundary = *execution.last_sync_event;
+            }
+            invalidate_sync_execution("synchronous TPDO expired before submission", XNET_CO_TIMING_REASON_DEADLINE);
+        }
+        else if (!co->nodeIdUnconfigured) {
+            const uint64_t age = now - anchor;
+            if (age < co->SYNC->timer)
+                invalidate_sync_execution("SYNC clock regressed relative to protocol timer", XNET_CO_TIMING_REASON_CLOCK);
+            else if (CO_process_SYNC(co, static_cast<uint32_t>(age - co->SYNC->timer), nullptr))
+                invalidate_sync_execution("locally produced SYNC is not supported by this timing source");
+        }
+    }
+    if (execution.invalid && !co->nodeIdUnconfigured) CO_process_SYNC(co, dt_us, nullptr);
+    if (!stop_requested) transmit();
+}
+
 /**
  * Sole owner of frame dispatch and protocol time advancement while running.
  * Elapsed time is measured between loop starts, not assumed equal to the wait
@@ -774,6 +1526,7 @@ void xnet_canopen_device::run() {
             uint32_t dt = static_cast<uint32_t>(std::min<int64_t>(elapsed, UINT32_MAX));
             if (switching != Switch::none) {
                 // Neither protocol processing nor queued transmission may break LSS silence.
+                if (sync_execution && !co->nodeIdUnconfigured) process_drive_402(dt, false, true);
                 if (now >= switch_deadline) {
                     if (switching == Switch::before) {
                         adapter.bitrate(pending_bitrate);
@@ -788,20 +1541,31 @@ void xnet_canopen_device::run() {
                     }
                 }
             } else {
-                receive();
-                // Receive dispatch can request a reset, stop, or bitrate switch in a callback.
-                if (switching == Switch::none && !stop_requested) {
-                    auto reset = CO_process(co, false, dt, nullptr);
+                if (sync_execution) {
+                    process_sync_iteration(dt);
+                } else {
+                    bool processed_sync = false;
+                    const auto boundary = [](xnet_canopen_device& d, const xnet_canopen_sync_event_t&, void* context) {
+                        *static_cast<bool*>(context) = true;
+                        d.process_drive_402(0);
+                        CO_process_TPDO(d.co, true, 0, nullptr);
+                        d.transmit();
+                    };
+                    receive(boundary, &processed_sync);
+                    // Receive dispatch can request a reset, stop, or bitrate switch in a callback.
                     if (switching == Switch::none && !stop_requested) {
-                        if (reset != CO_RESET_NOT) reset_stack(reset == CO_RESET_APP);
-                        else if (!co->nodeIdUnconfigured) {
-                            // Apply RPDO commands before packing values for this cycle's TPDOs.
-                            bool_t sync = CO_process_SYNC(co, dt, nullptr);
-                            CO_process_RPDO(co, sync, dt, nullptr);
-                            process_drive_402(dt);
-                            CO_process_TPDO(co, sync, dt, nullptr);
+                        auto reset = CO_process(co, false, dt, nullptr);
+                        if (switching == Switch::none && !stop_requested) {
+                            if (reset != CO_RESET_NOT) reset_stack(reset == CO_RESET_APP);
+                            else if (!co->nodeIdUnconfigured) {
+                                // Apply RPDO commands before packing values for this cycle's TPDOs.
+                                bool_t sync = CO_process_SYNC(co, processed_sync ? 0 : dt, nullptr);
+                                CO_process_RPDO(co, sync, dt, nullptr);
+                                process_drive_402(dt);
+                                CO_process_TPDO(co, sync, dt, nullptr);
+                            }
+                            if (!stop_requested) transmit();
                         }
-                        if (!stop_requested) transmit();
                     }
                 }
             }
@@ -879,6 +1643,7 @@ void xnet_canopen_device::release() {
     if (co || model) log(xco::LogLevel::info, "device uninitialized");
     if (co) { CO_delete(co); co = nullptr; }
     drive_402.reset();
+    sync_execution.reset();
     model.reset();
     batches.clear();
     interface_name.clear(); persistence_path.clear();
@@ -972,12 +1737,25 @@ int32_t xnet_canopen_start(xnet_canopen_handle handle) {
         d.initialized();
         if (d.state == XNET_CO_RUNTIME_RUNNING) return XNET_CO_OK;
         require(d.state == XNET_CO_RUNTIME_STOPPED, XNET_CO_INVALID_STATE, "uninitialize a failed device before restarting");
+        if (d.sync_execution) {
+            d.start_test_timing_provider();
+            d.sync_execution->last_now_us.reset();
+            uint64_t now = 0;
+            require(d.sync_now(now), XNET_CO_INVALID_STATE, "SYNC clock is unavailable");
+            d.sync_execution->last_sync_us.reset();
+            d.sync_execution->last_sync_event.reset();
+            d.sync_execution->last_counter.reset();
+            d.sync_execution->started_us = now;
+            d.sync_execution->invalid = false;
+            d.sync_execution->invalid_reason = {};
+        }
         try {
             // A new stack restarts protocol state without resetting live OD
             // values. Launch only after sessions and CANnormal are ready.
             if (d.drive_402) d.drive_402->reset();
             d.start_drive_epoch();
             d.setup_stack();
+            d.start_test_rpdo_plan();
             d.adapter.start();
             CO_CANsetNormalMode(d.co->CANmodule);
             d.stop_requested = false;
@@ -1277,6 +2055,23 @@ int32_t xnet_canopen_read_sync_event(xnet_canopen_handle handle, uint64_t epoch,
     });
 }
 
+int32_t xnet_canopen_read_timing_event_v1(xnet_canopen_handle handle, uint64_t sequence,
+                                          xnet_canopen_timing_event_v1* event, uint32_t capacity) {
+    if (!handle || !event) return XNET_CO_INVALID_ARGUMENT;
+    if (capacity < sizeof(*event)) return XNET_CO_BUFFER_TOO_SMALL;
+    std::lock_guard<std::recursive_mutex> lock(handle->mutex);
+    const auto last = handle->timing_event_sequence;
+    const auto oldest = last > handle->timing_events.size() ? last - handle->timing_events.size() + 1 : 1;
+    if (sequence > last) return XNET_CO_INVALID_ARGUMENT;
+    if (sequence && sequence < oldest - 1) return XNET_CO_ACCESS_ERROR;
+    if (sequence == last && sequence != 0)
+        return handle->timing_event_exhausted ? XNET_CO_STACK_ERROR : XNET_CO_NOT_FOUND;
+    if (!last) return XNET_CO_NOT_FOUND;
+    const auto next = sequence == 0 ? oldest : sequence + 1;
+    *event = handle->timing_events[(next - 1) % handle->timing_events.size()];
+    return XNET_CO_OK;
+}
+
 int32_t motor_drive_open_v1(motor_drive_endpoint_handle endpoint, motor_drive_port_handle* port) {
     if (port) *port = nullptr;
     if (!endpoint) return MOTOR_DRIVE_INVALID_ARGUMENT;
@@ -1306,18 +2101,162 @@ int32_t motor_drive_open_v1(motor_drive_endpoint_handle endpoint, motor_drive_po
 }
 int32_t motor_drive_read_v1(motor_drive_port_handle port, const motor_drive_read_request_v1* request,
                            motor_drive_view_v1* view, uint32_t capacity) {
-    return motor_call(port, [&](xnet_canopen_device& d, motor_drive_port&) {
+    return motor_call(port, [&](xnet_canopen_device& d, motor_drive_port& p) {
         require(request && view, XNET_CO_INVALID_ARGUMENT, "motor request and view are required");
         require(capacity >= sizeof(*view), XNET_CO_BUFFER_TOO_SMALL, "motor view buffer too small");
         require(request->abi_version == MOTOR_DRIVE_ABI_VERSION && request->struct_size == sizeof(*request)
             && request->reserved == 0, XNET_CO_INVALID_ARGUMENT, "invalid motor read request ABI");
-        if (request->flags == MOTOR_DRIVE_READ_SCHEDULED || !empty_step(request->target_step)
-            || !empty_time(request->source_cutoff))
-            return motor_reject(d, MOTOR_DRIVE_UNSUPPORTED, "scheduled SYNC/PCL exchange is not implemented by this backend");
-        require(request->flags == MOTOR_DRIVE_READ_ASYNC || request->flags == MOTOR_DRIVE_READ_BOOTSTRAP
+        const bool scheduled = request->flags == MOTOR_DRIVE_READ_SCHEDULED;
+        xco::TimingDiagnosticScope diagnostic(scheduled && d.sync_execution
+            && d.sync_execution->active_test_external_capture ? d.sync_execution.get() : nullptr);
+        if (auto* context = diagnostic.get()) {
+            context->flags |= XNET_CO_TIMING_HAS_TARGET;
+            context->target_step = request->target_step;
+        }
+        if (!scheduled && (!empty_step(request->target_step) || !empty_time(request->source_cutoff)))
+            return motor_reject(d, MOTOR_DRIVE_UNSUPPORTED, "target step and cutoff require scheduled exchange");
+        require(scheduled || request->flags == MOTOR_DRIVE_READ_ASYNC || request->flags == MOTOR_DRIVE_READ_BOOTSTRAP
             || request->flags == MOTOR_DRIVE_READ_SAFETY, XNET_CO_INVALID_ARGUMENT, "invalid motor read mode");
-        if (!d.drive_command_seq) return static_cast<int32_t>(MOTOR_DRIVE_NO_DATA);
-        const auto& command = d.drive_command;
+        CO_402_command_frame_t command{};
+        motor_drive_cycle_v1 cycle{};
+        motor_drive_time_v1 publish_time{};
+        uint32_t processed_seq = 0;
+        uint16_t processed_result = 0;
+        uint64_t scheduled_source = 0, scheduled_epsilon = 0, scheduled_target = 0, scheduled_cutoff = 0, scheduled_raw = 0;
+        uint64_t scheduled_oldest = 0;
+        if (scheduled) {
+            if (!d.sync_execution || !d.sync_execution->active_test_external_capture || !d.sync_execution->active_test_command_plan)
+                return motor_reject(d, MOTOR_DRIVE_UNSUPPORTED, "scheduled exchange is not available");
+            auto& execution = *d.sync_execution;
+            const auto& plan = *execution.active_test_command_plan;
+            if (execution.invalid) return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "scheduled timing is invalid");
+            require(plan.sync_domain_id && plan.clock_domain_id && valid_step(request->target_step)
+                && (request->target_step.sample_time.flags & MOTOR_DRIVE_TIME_VALID)
+                && (request->source_cutoff.flags & MOTOR_DRIVE_TIME_VALID)
+                && !(request->source_cutoff.flags & ~3U) && request->source_cutoff.clock_domain_id
+                && std::isfinite(request->source_cutoff.time_s) && request->source_cutoff.time_s >= 0,
+                XNET_CO_INVALID_ARGUMENT, "invalid scheduled timing request");
+            if (p.pcl_epoch && p.pcl_epoch != request->target_step.pcl_epoch)
+                return motor_reject(d, MOTOR_DRIVE_STALE, "scheduled target belongs to another PCL epoch");
+            uint64_t target = 0, cutoff = 0, decision = 0;
+            require(execution.active_clock->map_model_us(request->target_step.sample_time, target)
+                && execution.active_clock->map_model_us(request->source_cutoff, cutoff),
+                XNET_CO_INVALID_ARGUMENT, "scheduled target or cutoff clock mapping unavailable");
+            require(target >= cutoff && target - cutoff >= plan.lead_us,
+                XNET_CO_INVALID_ARGUMENT, "scheduled cutoff violates target lead time");
+            auto& timing = *diagnostic.get();
+            timing.flags |= XNET_CO_TIMING_HAS_TARGET_TIME | XNET_CO_TIMING_HAS_CUTOFF;
+            timing.target_us = target;
+            timing.cutoff_us = cutoff;
+            if (!d.sync_now(decision)) {
+                d.invalidate_sync_execution("scheduled command clock invalid", XNET_CO_TIMING_REASON_CLOCK);
+                return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "scheduled command clock invalid");
+            }
+            timing.flags |= XNET_CO_TIMING_HAS_DECISION_TIME;
+            timing.decision_us = decision;
+            if (!d.validate_test_sync_watermark())
+                return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "ordered SYNC watermark clock mapping changed");
+            if (!d.apply_test_timing_watermark(true, decision))
+                return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "test timing provider watermark invalid");
+            if (decision >= target) {
+                d.invalidate_sync_execution("scheduled command deadline missed", XNET_CO_TIMING_REASON_DEADLINE);
+                return motor_reject(d, MOTOR_DRIVE_STALE, "scheduled command deadline missed");
+            }
+            if (execution.active_test_hold_plan
+                && !test_hold_step(*execution.active_test_hold_plan, request->target_step, target,
+                                   request->target_step, target))
+                return motor_reject(d, MOTOR_DRIVE_INVALID_ARGUMENT, "scheduled target violates test hold plan");
+            if (p.test_issue_count) {
+                const auto& previous = p.test_issues[p.test_issue_count - 1];
+                if (same_step(request->target_step, previous.view.target_step)) {
+                    if (!same_time(request->source_cutoff, previous.cutoff))
+                        return motor_reject(d, MOTOR_DRIVE_INVALID_ARGUMENT, "scheduled target retry changed cutoff");
+                    if (target != previous.target_us || cutoff != previous.cutoff_us) {
+                        d.invalidate_sync_execution("scheduled command clock mapping changed", XNET_CO_TIMING_REASON_CLOCK);
+                        return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "scheduled command clock mapping changed");
+                    }
+                    if (!d.test_sync_source_valid(previous.raw_source_timestamp, previous.source_us)) {
+                        d.invalidate_sync_execution("ordered SYNC source clock mapping changed", XNET_CO_TIMING_REASON_CLOCK);
+                        return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "ordered SYNC source clock mapping changed");
+                    }
+                    if (previous.view.token.action_seq != d.drive_action_seq
+                        || ((previous.view.flags & MOTOR_DRIVE_OUTPUT_ALLOWED) && !d.drive_402->status().output_allowed))
+                        return motor_reject(d, MOTOR_DRIVE_STALE, "scheduled command was superseded by a safety transition");
+                    *view = previous.view;
+                    return static_cast<int32_t>(MOTOR_DRIVE_OK);
+                }
+                if (!advancing_step(request->target_step, previous.view.target_step))
+                    return motor_reject(d, MOTOR_DRIVE_STALE, "scheduled target step did not advance");
+                if (execution.active_test_hold_plan) {
+                    uint64_t previous_target = 0;
+                    if (!execution.active_clock->map_model_us(previous.view.target_step.sample_time, previous_target)
+                        || previous_target != previous.target_us) {
+                        d.invalidate_sync_execution("scheduled command clock mapping changed", XNET_CO_TIMING_REASON_CLOCK);
+                        return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "scheduled command clock mapping changed");
+                    }
+                    if (!test_hold_step(*execution.active_test_hold_plan, previous.view.target_step,
+                                        previous.target_us, request->target_step, target))
+                        return motor_reject(d, MOTOR_DRIVE_INVALID_ARGUMENT, "scheduled target violates test hold plan");
+                }
+            }
+            if (target - cutoff > plan.max_age_us
+                || plan.max_age_us - (target - cutoff) < plan.epsilon_us) {
+                d.invalidate_sync_execution("scheduled command age budget is insufficient", XNET_CO_TIMING_REASON_STALE);
+                return motor_reject(d, MOTOR_DRIVE_STALE, "scheduled command age budget is insufficient");
+            }
+            xco::TimedHistory<xco::TimedDriveCommand, 64>::Record selected{};
+            const auto result = execution.commands.select(d.drive_epoch, cutoff, plan.epsilon_us, decision, target,
+                plan.max_age_us - (target - cutoff) - plan.epsilon_us, selected);
+            if (result == xco::TimedHistoryResult::not_closed)
+                return motor_reject(d, MOTOR_DRIVE_NO_DATA, "scheduled command watermark not closed");
+            if (result != xco::TimedHistoryResult::ok) {
+                d.invalidate_sync_execution(result == xco::TimedHistoryResult::deadline_missed
+                    ? "scheduled command deadline missed" : result == xco::TimedHistoryResult::no_candidate
+                    ? "scheduled command missing or stale" : "scheduled command history invalid or retired",
+                    timing_history_reason(result));
+                return motor_reject(d, MOTOR_DRIVE_STALE, execution.invalid_reason.data());
+            }
+            timing.flags |= XNET_CO_TIMING_HAS_BOUNDARY | XNET_CO_TIMING_HAS_SOURCE
+                | XNET_CO_TIMING_HAS_SOURCE_TIME | XNET_CO_TIMING_HAS_AVAILABLE_TIME;
+            timing.boundary = selected.value.sync;
+            timing.source = {selected.value.command.epoch, selected.value.command.command_seq,
+                selected.value.command.action_seq};
+            timing.source_us = selected.source_time;
+            timing.available_us = selected.available_time;
+            if (!d.test_sync_source_valid(selected.value.sync.timestamp_100ns, selected.source_time)) {
+                d.invalidate_sync_execution("ordered SYNC source clock mapping changed", XNET_CO_TIMING_REASON_CLOCK);
+                return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "ordered SYNC source clock mapping changed");
+            }
+            command = selected.value.command;
+            if (command.action_seq != d.drive_action_seq
+                || ((command.flags & 1U) && !d.drive_402->status().output_allowed))
+                return motor_reject(d, MOTOR_DRIVE_STALE, "scheduled command was superseded by a safety transition");
+            const auto& sync = selected.value.sync;
+            cycle.sync_domain_id = plan.sync_domain_id;
+            cycle.sync_domain_epoch = sync.epoch;
+            cycle.sync_cycle_id = sync.sequence;
+            cycle.sync_counter = sync.counter_present ? sync.counter : 0;
+            cycle.rx_time = {plan.clock_domain_id, MOTOR_DRIVE_TIME_VALID, selected.source_time / 1000000.0};
+            publish_time = {plan.clock_domain_id, MOTOR_DRIVE_TIME_VALID, selected.available_time / 1000000.0};
+            processed_seq = selected.value.processed_feedback_seq;
+            processed_result = selected.value.processed_result;
+            scheduled_source = selected.source_time;
+            scheduled_epsilon = plan.epsilon_us;
+            scheduled_target = target;
+            scheduled_cutoff = cutoff;
+            scheduled_raw = sync.timestamp_100ns;
+            const uint64_t age = plan.max_age_us - (target - cutoff) - plan.epsilon_us;
+            scheduled_oldest = cutoff > age ? cutoff - age : 0;
+        } else {
+            if (!d.drive_command_seq) return static_cast<int32_t>(MOTOR_DRIVE_NO_DATA);
+            const auto& record = d.drive_command_history[d.drive_command_seq % d.drive_command_history.size()];
+            require(record.seq == d.drive_command_seq, XNET_CO_INTERNAL_ERROR, "missing command publication record");
+            command = record.command;
+            publish_time = {1, MOTOR_DRIVE_TIME_VALID,
+                std::chrono::duration<double>(record.published.time_since_epoch()).count()};
+            processed_seq = record.processed_feedback_seq;
+            processed_result = record.processed_result;
+        }
         const bool safety = command.action == CO_402_ACTION_QUICK_STOP || command.action == CO_402_ACTION_FAULT_REACTION
             || command.action == CO_402_ACTION_DISABLE_VOLTAGE;
         require(request->flags != MOTOR_DRIVE_READ_SAFETY || safety, XNET_CO_INVALID_STATE, "no priority safety command");
@@ -1327,10 +2266,9 @@ int32_t motor_drive_read_v1(motor_drive_port_handle port, const motor_drive_read
         motor_drive_view_v1 output{};
         output.abi_version = MOTOR_DRIVE_ABI_VERSION; output.struct_size = sizeof(output);
         output.token = {command.epoch, command.command_seq, command.action_seq};
-        const auto& record = d.drive_command_history[command.command_seq % d.drive_command_history.size()];
-        require(record.seq == command.command_seq, XNET_CO_INTERNAL_ERROR, "missing command publication record");
-        output.publish_time = {1, MOTOR_DRIVE_TIME_VALID,
-            std::chrono::duration<double>(record.published.time_since_epoch()).count()};
+        output.source_cycle = cycle;
+        if (scheduled) output.target_step = request->target_step;
+        output.publish_time = publish_time;
         output.action = command.action;
         output.flags = command.flags | MOTOR_DRIVE_SAFETY_DECELERATION_VALID;
         output.mode = command.mode;
@@ -1338,8 +2276,31 @@ int32_t motor_drive_read_v1(motor_drive_port_handle port, const motor_drive_read
         output.demand_velocity_rad_s = adapter.velocity_rad_s(command.demand_velocity);
         const auto deceleration = safety ? command.quick_stop_deceleration : command.profile_deceleration;
         output.safety_deceleration_rad_s2 = std::abs(adapter.velocity_rad_s(deceleration));
-        output.processed_feedback_seq = d.drive_processed_feedback_seq;
-        output.processed_result = d.drive_processed_result;
+        output.processed_feedback_seq = processed_seq;
+        output.processed_result = processed_result;
+        if (scheduled) {
+            if (p.test_issue_count == p.test_issues.size()) {
+                d.invalidate_sync_execution("scheduled command assignment history overflow", XNET_CO_TIMING_REASON_HISTORY_OVERFLOW);
+                return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "scheduled command assignment history overflow");
+            }
+            if (d.sync_execution->active_test_auto_retire
+                && d.sync_execution->commands.retire_before(d.drive_epoch, scheduled_oldest)
+                    != xco::TimedHistoryResult::ok) {
+                d.invalidate_sync_execution("scheduled command history retirement failed", XNET_CO_TIMING_REASON_HISTORY_INVALID);
+                return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "scheduled command history retirement failed");
+            }
+            p.test_issues[p.test_issue_count++] = {output, request->source_cutoff,
+                scheduled_source, scheduled_epsilon, scheduled_target, scheduled_cutoff,
+                d.sync_execution->active_test_command_plan->max_age_us, scheduled_raw};
+            auto& record = d.drive_command_history[output.token.command_seq % d.drive_command_history.size()];
+            if (record.seq == output.token.command_seq && record.command.epoch == output.token.epoch)
+                record.test_scheduled = true;
+            p.pcl_epoch = request->target_step.pcl_epoch;
+            auto& timing = *diagnostic.get();
+            timing.flags |= XNET_CO_TIMING_HAS_SOURCE_CYCLE;
+            timing.source_cycle = output.source_cycle;
+            d.record_timing_event(XNET_CO_TIMING_COMMAND_ASSIGNED);
+        }
         *view = output;
         return static_cast<int32_t>(MOTOR_DRIVE_OK);
     });
@@ -1352,8 +2313,11 @@ int32_t motor_drive_submit_v1(motor_drive_port_handle port, const motor_drive_fe
         const auto& f = *feedback;
         require(f.feedback_seq && (f.flags & MOTOR_DRIVE_POSITION_VALID) && !(f.flags & ~0x17U)
             && f.action_result <= MOTOR_DRIVE_RESULT_ERROR && valid_step(f.executed_step)
-            && empty_cycle(f.source_cycle) && std::isfinite(f.actual_position_rad)
+            && std::isfinite(f.actual_position_rad)
             && std::isfinite(f.actual_velocity_rad_s), XNET_CO_ACCESS_ERROR, "invalid motor feedback fields");
+        xco::TimingDiagnosticScope diagnostic(d.sync_execution && d.sync_execution->active_test_external_capture
+            && !empty_cycle(f.source_cycle) ? d.sync_execution.get() : nullptr);
+        if (auto* context = diagnostic.get()) timing_feedback(*context, f, nullptr);
         if (f.source.epoch != d.drive_epoch)
             return motor_reject(d, MOTOR_DRIVE_STALE, "motor feedback belongs to an old node epoch");
         if (p.submitted && f.feedback_seq == p.submitted->feedback_seq)
@@ -1364,10 +2328,88 @@ int32_t motor_drive_submit_v1(motor_drive_port_handle port, const motor_drive_fe
             || (p.submitted && (!sequence_newer(f.feedback_seq, p.submitted->feedback_seq)
                 || !advancing_step(f.executed_step, p.submitted->executed_step))))
             return motor_reject(d, MOTOR_DRIVE_STALE, "motor feedback step/sequence did not advance; restart on PCL epoch change");
+        std::optional<xco::TestScheduledIssue> timed_source;
+        size_t timed_source_index = 0;
+        if (!empty_cycle(f.source_cycle)) {
+            if (!d.sync_execution || !d.sync_execution->active_test_external_capture || d.sync_execution->invalid)
+                return motor_reject(d, MOTOR_DRIVE_INVALID_FEEDBACK, "scheduled feedback is not available");
+            if (!d.validate_test_sync_watermark())
+                return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "ordered SYNC watermark clock mapping changed");
+            const auto& hold = d.sync_execution->active_test_hold_plan;
+            for (size_t i = 0; i < p.test_issue_count; ++i) {
+                const auto& issue = p.test_issues[i];
+                if (hold) {
+                    if (issue.view.target_step.model_step_seq <= f.executed_step.model_step_seq) {
+                        timed_source = issue;
+                        timed_source_index = i;
+                    }
+                } else if (f.source.epoch == issue.view.token.epoch && f.source.command_seq == issue.view.token.command_seq
+                    && f.source.action_seq == issue.view.token.action_seq && same_cycle(f.source_cycle, issue.view.source_cycle)
+                    && same_step(f.executed_step, issue.view.target_step)) {
+                    timed_source = issue;
+                    timed_source_index = i;
+                    break;
+                }
+            }
+            if (!timed_source)
+                return motor_reject(d, MOTOR_DRIVE_INVALID_FEEDBACK, "scheduled feedback source or execution step was not issued");
+            diagnostic.get()->flags |= XNET_CO_TIMING_HAS_TARGET;
+            diagnostic.get()->target_step = timed_source->view.target_step;
+            if (!d.test_sync_source_valid(timed_source->raw_source_timestamp, timed_source->source_us)) {
+                d.invalidate_sync_execution("ordered SYNC source clock mapping changed", XNET_CO_TIMING_REASON_CLOCK);
+                return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "ordered SYNC source clock mapping changed");
+            }
+            if (f.source.epoch != timed_source->view.token.epoch
+                || f.source.command_seq != timed_source->view.token.command_seq
+                || f.source.action_seq != timed_source->view.token.action_seq
+                || !same_cycle(f.source_cycle, timed_source->view.source_cycle))
+                return motor_reject(d, MOTOR_DRIVE_INVALID_FEEDBACK, "scheduled feedback did not use latest applicable command");
+            uint64_t now = 0, target = 0;
+            if (!d.sync_now(now)) {
+                d.invalidate_sync_execution("scheduled feedback clock invalid", XNET_CO_TIMING_REASON_CLOCK);
+                return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "scheduled feedback clock invalid");
+            }
+            if (!d.sync_execution->active_clock->map_model_us(f.executed_step.sample_time, target)) {
+                d.invalidate_sync_execution("scheduled feedback step clock mapping unavailable", XNET_CO_TIMING_REASON_CLOCK);
+                return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "scheduled feedback step clock mapping unavailable");
+            }
+            uint64_t issued_target = 0;
+            if (!d.sync_execution->active_clock->map_model_us(timed_source->view.target_step.sample_time, issued_target)
+                || issued_target != timed_source->target_us) {
+                d.invalidate_sync_execution("scheduled feedback clock mapping changed", XNET_CO_TIMING_REASON_CLOCK);
+                return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "scheduled feedback clock mapping changed");
+            }
+            if (hold) {
+                if (!test_hold_step(*hold, timed_source->view.target_step, issued_target, f.executed_step, target)
+                    || f.executed_step.model_step_seq - timed_source->view.target_step.model_step_seq > hold->max_hold_steps)
+                    return motor_reject(d, MOTOR_DRIVE_INVALID_FEEDBACK, "scheduled feedback violates test hold plan");
+                if (timed_source->epsilon_us > timed_source->max_age_us || target < timed_source->source_us
+                    || target - timed_source->source_us > timed_source->max_age_us - timed_source->epsilon_us)
+                    return motor_reject(d, MOTOR_DRIVE_STALE, "held command exceeded scheduled age budget");
+            } else if (target != timed_source->target_us) {
+                d.invalidate_sync_execution("scheduled feedback clock mapping changed", XNET_CO_TIMING_REASON_CLOCK);
+                return motor_reject(d, MOTOR_DRIVE_INVALID_STATE, "scheduled feedback clock mapping changed");
+            }
+            if (now < target || now < timed_source->source_us)
+                return motor_reject(d, MOTOR_DRIVE_STALE, "scheduled feedback step is in the future");
+            if (timed_source->epsilon_us > d.model->drive_command_max_age_us
+                || now - timed_source->source_us > d.model->drive_command_max_age_us - timed_source->epsilon_us)
+                return motor_reject(d, MOTOR_DRIVE_STALE, "scheduled feedback source command is too old");
+        } else if (d.sync_execution && d.sync_execution->active_test_external_capture) {
+            const auto& record = d.drive_command_history[f.source.command_seq % d.drive_command_history.size()];
+            if (record.seq == f.source.command_seq && record.test_scheduled)
+                return motor_reject(d, MOTOR_DRIVE_INVALID_FEEDBACK, "scheduled feedback omitted source cycle");
+            for (size_t i = 0; i < p.test_issue_count; ++i) {
+                const auto& issued = p.test_issues[i].view.token;
+                if (f.source.epoch == issued.epoch && f.source.command_seq == issued.command_seq
+                    && f.source.action_seq == issued.action_seq)
+                    return motor_reject(d, MOTOR_DRIVE_INVALID_FEEDBACK, "scheduled feedback omitted source cycle");
+            }
+        }
         const auto& record = d.drive_command_history[f.source.command_seq % d.drive_command_history.size()];
         if (!f.source.command_seq || f.source.action_seq != d.drive_action_seq
-            || record.seq != f.source.command_seq || record.action_seq != f.source.action_seq
-            || xco::Clock::now() - record.published > std::chrono::microseconds(d.model->drive_command_max_age_us))
+            || (!timed_source && (record.seq != f.source.command_seq || record.action_seq != f.source.action_seq
+                || xco::Clock::now() - record.published > std::chrono::microseconds(d.model->drive_command_max_age_us))))
             return motor_reject(d, MOTOR_DRIVE_STALE, "motor feedback source command is obsolete");
         auto& adapter = *d.model->drive_adapter;
         CO_402_feedback_frame_t frame{};
@@ -1386,6 +2428,15 @@ int32_t motor_drive_submit_v1(motor_drive_port_handle port, const motor_drive_fe
         require(CO_402_feedback_pack(&frame, bytes.data(), bytes.size()), XNET_CO_ACCESS_ERROR, "cannot encode motor feedback");
         const auto staged = d.stage_drive_feedback(frame, bytes.data());
         require(staged == ODR_OK, XNET_CO_ACCESS_ERROR, "motor feedback staging rejected");
+        d.drive_pending_motor_feedback = f;
+        d.drive_pending_timed_source = timed_source;
+        if (timed_source) {
+            size_t kept = 0;
+            for (size_t i = 0; i < p.test_issue_count; ++i)
+                if (i == timed_source_index || p.test_issues[i].view.target_step.model_step_seq > f.executed_step.model_step_seq)
+                    p.test_issues[kept++] = p.test_issues[i];
+            p.test_issue_count = kept;
+        }
         p.submitted = f; p.pcl_epoch = f.executed_step.pcl_epoch;
         return static_cast<int32_t>(MOTOR_DRIVE_OK);
     });

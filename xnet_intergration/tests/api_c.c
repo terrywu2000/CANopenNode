@@ -4,6 +4,9 @@
 
 typedef char status_size_must_be_48[(sizeof(xnet_canopen_status_t) == 48) ? 1 : -1];
 typedef char sync_event_size_must_be_40[(sizeof(xnet_canopen_sync_event_t) == 40) ? 1 : -1];
+typedef char timing_event_size_must_be_464[(sizeof(xnet_canopen_timing_event_v1) == 464) ? 1 : -1];
+typedef char timing_event_sequence_offset[(offsetof(xnet_canopen_timing_event_v1, sequence) == 16) ? 1 : -1];
+typedef char timing_event_boundary_offset[(offsetof(xnet_canopen_timing_event_v1, boundary) == 40) ? 1 : -1];
 typedef char motor_time_size[(sizeof(motor_drive_time_v1) == 16) ? 1 : -1];
 typedef char motor_cycle_size[(sizeof(motor_drive_cycle_v1) == 64) ? 1 : -1];
 typedef char motor_step_size[(sizeof(motor_drive_model_step_v1) == 56) ? 1 : -1];
@@ -35,6 +38,7 @@ int xnet_canopen_c_header_test(void) {
         && xnet_canopen_write_od(NULL, 0x2000, 0, buffer, sizeof(buffer)) == XNET_CO_INVALID_ARGUMENT
         && xnet_canopen_stop(NULL) == XNET_CO_INVALID_ARGUMENT
         && xnet_canopen_read_sync_event(NULL, 0, 0, NULL) == XNET_CO_INVALID_ARGUMENT
+        && xnet_canopen_read_timing_event_v1(NULL, 0, NULL, 0) == XNET_CO_INVALID_ARGUMENT
         && motor_drive_open_v1(NULL, NULL) == MOTOR_DRIVE_INVALID_ARGUMENT
         && motor_drive_read_v1(NULL, NULL, NULL, 0) == MOTOR_DRIVE_INVALID_ARGUMENT
         && motor_drive_submit_v1(NULL, NULL, 0) == MOTOR_DRIVE_INVALID_ARGUMENT

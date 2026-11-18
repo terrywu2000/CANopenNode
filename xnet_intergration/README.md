@@ -707,6 +707,21 @@ Each entry contains:
   existing absolute-ID behavior for explicit IDs. Resolved IDs must be valid,
   nonrestricted 11-bit IDs and must not collide with other local services.
 
+PDOs do not have to appear in pairs with SYNC. Synchronous RPDOs apply their
+most recently received buffered data at the next SYNC; when no new RPDO arrived,
+the OD retains its value. This CANopenNode implementation treats RPDO types
+0..240 as synchronous and does not enforce a master transmission cadence.
+TPDO type 0 is event-triggered but waits for SYNC, types 1..240 transmit cyclically
+according to the configured SYNC count, and types 254/255 are asynchronous.
+The default worker processes multiple received SYNC boundaries in order, but
+XNET backpressure, bounded buffers and scheduling still preclude a physical
+delivery or real-time guarantee. The optional internal strict RPDO test plan
+requires one selected RPDO per SYNC and warns when enabled; it is not a general
+CANopen requirement and must not be used for a sparse master schedule.
+PDO communication and mapping entries generated here are read-only to the master:
+configure their startup values in JSON and match them on the master; live SDO
+PDO reconfiguration is not supported.
+
 Disabled PDOs have bit 31 set in their generated communication COB-ID and neither
 transmit nor apply received data. Empty mappings are valid inactive slots, not
 mapping errors. `request_tpdo()` rejects inactive slots. Their configured IDs

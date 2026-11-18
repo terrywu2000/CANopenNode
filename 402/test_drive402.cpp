@@ -372,6 +372,186 @@ static void test_reset_edge_during_reaction_is_not_deferred() {
     CHECK(d.status().action == CO_402_ACTION_FAULT_RESET);
 }
 
+static void test_safety_without_motion_boundary() {
+    Drive d;
+    d.use_external_model(true);
+    d.set_external_permissions(true, true);
+    CHECK(d.post_feedback(Feedback{0, 0, false}));
+    Inputs in = base_inputs();
+    in.controlword = cw_shutdown;
+    d.process_safety(in, 1000);
+    CHECK(!d.status().action_pending && d.status().pds == Pds::switch_on_disabled);
+    CHECK(d.status().mode_display == 0);
+
+    d.step(in, 0);
+    auto action = d.status();
+    CHECK(action.action == CO_402_ACTION_SHUTDOWN);
+    in.controlword = cw_switch_on;
+    in.action_response_seq = action.action_seq;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    d.process_safety(in, 1000);
+    CHECK(d.status().pds == Pds::ready_to_switch_on && !d.status().action_pending);
+    in.action_result = CO_402_ACTION_RESULT_NONE;
+    d.step(in, 0);
+    CHECK(d.status().action == CO_402_ACTION_SWITCH_ON);
+    in.action_response_seq = d.status().action_seq;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    d.process_safety(in, 1000);
+    CHECK(d.status().pds == Pds::switched_on && !d.status().action_pending);
+    in.action_result = CO_402_ACTION_RESULT_NONE;
+    in.controlword = cw_enable;
+    d.step(in, 0);
+    in.action_response_seq = d.status().action_seq;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    d.process_safety(in, 0);
+    CHECK(d.status().pds == Pds::operation_enabled && d.status().output_allowed);
+    in.action_result = CO_402_ACTION_RESULT_NONE;
+    in.controlword = cw_enable | 0x10;
+    in.target_position = 1000;
+    for (int i = 0; i < 10; ++i) d.process_safety(in, 1000);
+    CHECK(d.status().demand_position == 0 && !(d.status().statusword & 0x1000));
+    d.step(in, 1000);
+    CHECK(d.status().statusword & 0x1000);
+
+    in.controlword = 0x0b;
+    d.process_safety(in, 1000);
+    CHECK(d.status().action == CO_402_ACTION_QUICK_STOP && !d.status().output_allowed);
+    const auto quick_stop = d.status().action_seq;
+    d.set_external_fault(true);
+    in.action_response_seq = quick_stop;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    d.process_safety(in, 1000);
+    CHECK(d.status().action == CO_402_ACTION_FAULT_REACTION
+        && d.status().action_seq != quick_stop && !d.status().output_allowed);
+    in.action_timeout_seq = d.status().action_seq;
+    in.action_response_seq = in.action_timeout_seq;
+    d.process_safety(in, 1000);
+    CHECK(d.status().pds == Pds::fault && d.status().reaction_unconfirmed);
+}
+
+static void test_safety_ages_feedback_without_motion_boundary() {
+    Drive d(5000);
+    d.use_external_model(true);
+    d.set_external_permissions(true, true);
+    CHECK(d.post_feedback(Feedback{7, 0, false}));
+    Inputs in = base_inputs();
+    in.controlword = cw_enable;
+    in.external_feedback_age_valid = true;
+    in.external_feedback_age_us = 4999;
+    d.process_safety(in, 10000);
+    CHECK(d.status().feedback_fresh && !d.status().model_fault);
+    in.external_feedback_age_us = 5000;
+    d.process_safety(in, 0);
+    CHECK(!d.status().feedback_fresh && d.status().model_fault);
+    CHECK(d.status().pds == Pds::fault_reaction_active && !d.status().output_allowed);
+
+    Drive internal;
+    Inputs motion = base_inputs();
+    motion.target_reached_time_us = 5000;
+    enable(internal, motion);
+    internal.step(motion, 0);
+    CHECK(!(internal.status().statusword & 0x0400));
+    internal.process_safety(motion, 10000);
+    CHECK(!(internal.status().statusword & 0x0400));
+    internal.step(motion, 5000);
+    CHECK(internal.status().statusword & 0x0400);
+}
+
+static void test_safety_does_not_defer_fault_reset_edge() {
+    Drive d;
+    d.use_external_model(true);
+    d.set_external_permissions(true, true);
+    CHECK(d.post_feedback(Feedback{0, 0, true}));
+    Inputs in = base_inputs();
+    d.process_safety(in, 0);
+    const auto reaction = d.status().action_seq;
+    CHECK(d.post_feedback(Feedback{0, 0, false}));
+    in.controlword = 0x80;
+    in.action_response_seq = reaction;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    d.process_safety(in, 0);
+    CHECK(d.status().pds == Pds::fault && !d.status().action_pending);
+    in.action_result = CO_402_ACTION_RESULT_NONE;
+    d.step(in, 0);
+    CHECK(d.status().pds == Pds::fault && !d.status().action_pending);
+    in.controlword = 0;
+    d.process_safety(in, 0);
+    in.controlword = 0x80;
+    d.step(in, 0);
+    CHECK(d.status().action == CO_402_ACTION_FAULT_RESET);
+}
+
+static void test_safety_preempts_pending_enable() {
+    Drive d;
+    d.use_external_model(true);
+    d.set_external_permissions(true, true);
+    CHECK(d.post_feedback(Feedback{0, 0, false}));
+    Inputs in = base_inputs();
+    in.controlword = cw_shutdown;
+    run(d, in, 1, 0);
+    in.controlword = cw_switch_on;
+    run(d, in, 1, 0);
+    in.controlword = cw_enable;
+    d.step(in, 0);
+    const auto enabling = d.status().action_seq;
+    CHECK(d.status().action == CO_402_ACTION_ENABLE_OPERATION);
+    in.controlword = 0;
+    in.action_response_seq = enabling;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    d.process_safety(in, 0);
+    CHECK(d.status().action == CO_402_ACTION_QUICK_STOP
+        && d.status().action_seq != enabling && !d.status().output_allowed);
+}
+
+static void test_selected_feedback_is_independent_of_safety() {
+    Drive d;
+    d.use_external_model(true);
+    d.set_external_permissions(true, true);
+    Inputs in = base_inputs();
+    CHECK(!d.select_feedback(Feedback{40, 0, false}));
+    CHECK(d.post_safety_feedback(Feedback{100, 0, false}));
+    CHECK(d.status().actual_position == 0 && !d.status().feedback_fresh && !d.status().model_ready);
+    enable(d, in);
+    CHECK(d.status().pds == Pds::switched_on && !d.status().output_allowed);
+    CHECK(d.select_feedback(Feedback{40, 0, false}));
+    d.set_external_permissions(true, true);
+    in.controlword = cw_enable;
+    d.step(in, 0);
+    CHECK(d.status().action == CO_402_ACTION_ENABLE_OPERATION);
+    in.action_response_seq = d.status().action_seq;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    d.process_safety(in, 0);
+    CHECK(d.status().output_allowed && d.status().actual_position == 40);
+    in.action_result = CO_402_ACTION_RESULT_NONE;
+    CHECK(d.post_safety_feedback(Feedback{200, 1, false}));
+    d.step(in, 0);
+    CHECK(d.status().actual_position == 40 && !d.status().model_fault);
+    d.invalidate_selected_feedback();
+    CHECK(!d.status().output_allowed && !d.status().feedback_fresh);
+    in.target_position = 1000;
+    in.controlword = cw_enable | 0x10;
+    const auto previous = d.status().demand_position;
+    d.step(in, 1000);
+    CHECK(d.status().demand_position == previous && !(d.status().statusword & 0x1000));
+    CHECK(d.post_safety_feedback(Feedback{300, 0, true}));
+    CHECK(d.select_feedback(Feedback{40, 0, false}));
+    CHECK(d.status().model_fault && d.status().actual_position == 40);
+    d.process_safety(in, 0);
+    CHECK(d.status().pds == Pds::fault_reaction_active && !d.status().output_allowed);
+
+    Drive aged(5000);
+    aged.use_external_model(true);
+    CHECK(aged.post_safety_feedback(Feedback{100, 0, false}));
+    Inputs age = base_inputs();
+    age.external_feedback_age_valid = true;
+    age.external_feedback_age_us = 4999;
+    aged.process_safety(age, 0);
+    CHECK(aged.select_feedback(Feedback{40, 0, false}));
+    age.external_feedback_age_us = 5000;
+    aged.process_safety(age, 0);
+    CHECK(!aged.status().feedback_fresh && aged.status().model_fault);
+}
+
 int main() {
     test_pds_path();
     test_pp_profile_reaches_target();
@@ -389,6 +569,11 @@ int main() {
     test_fault_preempts_quick_stop_and_failed_reaction();
     test_action_timeout_takes_priority_over_done();
     test_reset_edge_during_reaction_is_not_deferred();
+    test_safety_without_motion_boundary();
+    test_safety_ages_feedback_without_motion_boundary();
+    test_safety_does_not_defer_fault_reset_edge();
+    test_safety_preempts_pending_enable();
+    test_selected_feedback_is_independent_of_safety();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return EXIT_FAILURE;

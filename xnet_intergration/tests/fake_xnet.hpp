@@ -17,6 +17,7 @@ void clear_transmitted();
 size_t sessions();
 void fail_next(const std::string& operation, nxStatus_t status);
 void output_full(bool value);
+void write_hook(void (*hook)(uint32_t identifier, void* context), void* context);
 void bus_state(u32 value, nxStatus_t fault = 0);
 }
 #endif

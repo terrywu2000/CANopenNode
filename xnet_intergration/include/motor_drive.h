@@ -155,9 +155,10 @@ typedef struct {
  */
 MOTOR_DRIVE_API int32_t motor_drive_open_v1(
     motor_drive_endpoint_handle endpoint, motor_drive_port_handle* port);
-/** Output is usable only on OK. This backend implements ASYNC/BOOTSTRAP/SAFETY,
- * not SCHEDULED: SYNC/clock mapping is not inferred from worker iterations.
- * Unavailable time/cycle metadata is zero. Request target_step/cutoff are zero.
+/** Output is usable only on OK. The deployable backend implements
+ * ASYNC/BOOTSTRAP/SAFETY, not SCHEDULED: SYNC/clock mapping is not inferred
+ * from worker iterations. Unavailable time/cycle metadata is zero, and
+ * target_step/cutoff must be zero for these modes.
  */
 MOTOR_DRIVE_API int32_t motor_drive_read_v1(
     motor_drive_port_handle port, const motor_drive_read_request_v1* request,

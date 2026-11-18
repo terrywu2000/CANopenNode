@@ -183,15 +183,16 @@ int64_t DriveAdapter::raw(DriveQuantity quantity, int64_t counts) const {
     return scaled_integer(counts, item.denominator, item.numerator, item.is_unsigned, item.role);
 }
 
-void DriveAdapter::publish(const d402::Status& status) {
+void DriveAdapter::publish(const d402::Status& status, bool actual) {
     const std::pair<DriveQuantity, int32_t> outputs[] = {
         {DriveQuantity::demand_position, status.demand_position}, {DriveQuantity::demand_velocity, status.demand_velocity},
         {DriveQuantity::actual_position, status.actual_position}, {DriveQuantity::actual_velocity, status.actual_velocity}
     };
     std::array<int32_t, 4> values{};
-    for (size_t i = 0; i < values.size(); ++i)
+    const size_t count = actual ? values.size() : 2;
+    for (size_t i = 0; i < count; ++i)
         if (binding(*this, outputs[i].first).value) values[i] = static_cast<int32_t>(raw(outputs[i].first, outputs[i].second));
-    for (size_t i = 0; i < values.size(); ++i)
+    for (size_t i = 0; i < count; ++i)
         if (auto* value = binding(*this, outputs[i].first).value) std::memcpy(value->data(), &values[i], sizeof(values[i]));
 }
 

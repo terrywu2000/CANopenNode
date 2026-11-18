@@ -11,6 +11,8 @@ std::vector<fake::Event> trace;
 std::map<std::string, nxStatus_t> failures;
 nxSessionRef_t next_ref = 1;
 bool full = false;
+void (*write_callback)(uint32_t, void*) = nullptr;
+void* write_context = nullptr;
 u32 comm_state = 0;
 nxStatus_t comm_fault = 0;
 nxStatus_t result(const std::string& operation) {
@@ -28,7 +30,7 @@ void reset() {
     std::lock_guard<std::mutex> lock(mutex);
     if (!refs.empty()) throw std::runtime_error("fake reset with leaked sessions");
     incoming.clear(); sent.clear(); trace.clear(); failures.clear();
-    full = false; comm_state = 0; comm_fault = 0;
+    full = false; comm_state = 0; comm_fault = 0; write_callback = nullptr; write_context = nullptr;
 }
 void inject(uint16_t id, std::initializer_list<uint8_t> bytes, uint8_t type, uint8_t flags, uint64_t timestamp) {
     std::lock_guard<std::mutex> lock(mutex);
@@ -45,6 +47,9 @@ void fail_next(const std::string& operation, nxStatus_t status) {
     std::lock_guard<std::mutex> lock(mutex); failures[operation] = status;
 }
 void output_full(bool value) { std::lock_guard<std::mutex> lock(mutex); full = value; }
+void write_hook(void (*hook)(uint32_t, void*), void* context) {
+    std::lock_guard<std::mutex> lock(mutex); write_callback = hook; write_context = context;
+}
 void bus_state(u32 value, nxStatus_t fault) { std::lock_guard<std::mutex> lock(mutex); comm_state = value; comm_fault = fault; }
 }
 
@@ -123,7 +128,9 @@ nxStatus_t _NXFUNC nxWriteFrame(nxSessionRef_t ref, void* buffer, u32 bytes, f64
     if (!refs.count(ref) || !refs.at(ref).started || timeout != 0 || bytes != sizeof(nxFrameCAN_t))
         return nxErrParameterNullOrEmpty;
     nxFrameCAN_t frame{}; std::memcpy(&frame, buffer, sizeof(frame));
-    sent.push_back(frame); event("write", frame.Identifier); return 0;
+    sent.push_back(frame); event("write", frame.Identifier);
+    if (write_callback) write_callback(frame.Identifier, write_context);
+    return 0;
 }
 nxStatus_t _NXFUNC nxReadState(nxSessionRef_t ref, u32 state, u32 size, void* value, nxStatus_t* fault) {
     std::lock_guard<std::mutex> lock(mutex);

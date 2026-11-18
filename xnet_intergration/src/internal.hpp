@@ -12,6 +12,7 @@
 #include "CANopen.h"
 #include "402/CO_402_protocol.h"
 #include "402/drive402.hpp"
+#include "timed_history.hpp"
 #include "xnet_canopen.h"
 #include "nlohmann/json.hpp"
 #include "spdlog/common.h"
@@ -107,7 +108,7 @@ struct DriveAdapter {
     void bind(Model& model);
     int64_t read(DriveQuantity quantity) const;
     int64_t raw(DriveQuantity quantity, int64_t counts) const;
-    void publish(const d402::Status& status);
+    void publish(const d402::Status& status, bool actual = true);
     double position_rad(int32_t counts) const;
     double velocity_rad_s(int64_t counts_s) const;
     int32_t position_counts(double radians) const;
@@ -209,6 +210,163 @@ struct Adapter {
     void close();
     void check(nxStatus_t status, const char* operation);
 };
+
+/** Internal injected clock; no production provider or public activation exists yet. */
+struct SyncClock {
+    virtual ~SyncClock() = default;
+    virtual bool map_rx_us(uint64_t raw_timestamp, uint64_t& mapped_us) const = 0;
+    virtual bool now_us(uint64_t& current_us) const = 0;
+    virtual bool map_model_us(const motor_drive_time_v1&, uint64_t&) const { return false; }
+};
+
+struct TestWatermarkProof {
+    uint64_t through_us = 0, observed_us = 0;
+};
+
+struct TestTimingEvidence {
+    uint64_t generation = 0, max_error_us = 0;
+    std::optional<TestWatermarkProof> commands, feedback;
+};
+
+/* Snapshots are coherent with the associated clock generation. Proofs attest
+ * processed events through the watermark, not merely an empty source queue. */
+struct TestTimingProvider {
+    virtual ~TestTimingProvider() = default;
+    virtual bool snapshot(TestTimingEvidence&) const = 0;
+};
+
+struct TimedDriveCommand {
+    CO_402_command_frame_t command{};
+    xnet_canopen_sync_event_t sync{};
+    uint32_t processed_feedback_seq = 0;
+    uint16_t processed_result = 0;
+};
+
+struct TimedFeedbackSource {
+    uint64_t raw_timestamp = 0, source_us = 0, epsilon_us = 0;
+    motor_drive_model_step_v1 target_step{};
+};
+
+struct TimedDriveFeedback {
+    motor_drive_feedback_v1 feedback{};
+    CO_402_feedback_frame_t converted{};
+    Clock::time_point submitted{};
+    std::optional<TimedFeedbackSource> source;
+};
+
+struct TestFeedbackPlan {
+    uint64_t delay_us = 0, epsilon_us = 0, max_age_us = 0;
+};
+
+struct TestCommandPlan {
+    uint64_t lead_us = 0, epsilon_us = 0, max_age_us = 0, sync_domain_id = 0;
+    uint32_t clock_domain_id = 0;
+};
+
+struct TestSamplingPlan {
+    uint64_t pcl_epoch = 0, first_step = 0, step_stride = 0;
+    uint64_t first_tick = 0, tick_stride = 0;
+    uint64_t first_sample_us = 0, model_period_us = 0, acceptance_window_us = 0;
+};
+
+struct TestSamplingCursor {
+    uint64_t next_step = 0, next_tick = 0, next_sample_us = 0, interval_us = 0;
+};
+
+struct TestHoldPlan {
+    uint64_t pcl_epoch = 0, model_period_us = 0, tick_stride = 0, max_hold_steps = 0;
+};
+
+struct TestRpdoPlan {
+    uint32_t required_mask = 0;
+    uint64_t epsilon_us = 0;
+};
+
+struct TestHistoryBudget {
+    size_t capacity = 64;
+    uint64_t retention_us = 0, min_spacing_us = 0;
+};
+
+struct TestSyncWatermarkAnchor {
+    uint64_t raw = 0, mapped_us = 0;
+};
+
+struct TestScheduledIssue {
+    motor_drive_view_v1 view{};
+    motor_drive_time_v1 cutoff{};
+    uint64_t source_us = 0, epsilon_us = 0, target_us = 0, cutoff_us = 0;
+    uint64_t max_age_us = 0;
+    uint64_t raw_source_timestamp = 0;
+};
+
+struct SyncExecution {
+    std::shared_ptr<const SyncClock> clock;
+    std::shared_ptr<const SyncClock> active_clock;
+    std::shared_ptr<const TestTimingProvider> test_timing_provider;
+    std::shared_ptr<const TestTimingProvider> active_test_timing_provider;
+    uint64_t test_max_clock_error_us = 0, active_test_max_clock_error_us = 0;
+    uint64_t test_timing_generation = 0;
+    std::optional<TestWatermarkProof> test_command_proof, test_feedback_proof;
+    uint32_t max_interval_us = 0;
+    uint32_t tpdo_window_us = 0;
+    uint32_t active_max_interval_us = 0;
+    uint32_t active_tpdo_window_us = 0;
+    bool test_external_capture = false;
+    bool active_test_external_capture = false;
+    bool test_auto_retire = false;
+    bool active_test_auto_retire = false;
+    bool test_ordered_sync_watermark = false;
+    bool active_test_ordered_sync_watermark = false;
+    std::optional<TestSyncWatermarkAnchor> test_sync_watermark_anchor;
+    TestHistoryBudget test_command_history_budget;
+    TestHistoryBudget test_feedback_history_budget;
+    TimedHistory<TimedDriveCommand, 64> commands;
+    TimedHistory<TimedDriveFeedback, 64> feedback;
+    uint64_t feedback_order = 0;
+    std::optional<TestFeedbackPlan> test_feedback_plan;
+    std::optional<TestCommandPlan> test_command_plan;
+    std::optional<TestFeedbackPlan> active_test_feedback_plan;
+    std::optional<TestCommandPlan> active_test_command_plan;
+    std::optional<TestSamplingPlan> test_sampling_plan;
+    std::optional<TestSamplingPlan> active_test_sampling_plan;
+    std::optional<TestSamplingCursor> test_sampling_cursor;
+    bool test_sampling_watermark = false;
+    bool active_test_sampling_watermark = false;
+    std::optional<uint64_t> test_sampling_closed_us;
+    std::optional<uint64_t> test_sampling_anchor_us;
+    std::optional<motor_drive_time_v1> test_sampling_anchor_time;
+    std::optional<TestHoldPlan> test_hold_plan;
+    std::optional<TestHoldPlan> active_test_hold_plan;
+    std::optional<TestRpdoPlan> test_rpdo_plan;
+    std::optional<TestRpdoPlan> active_test_rpdo_plan;
+    uint32_t test_rpdo_seen = 0;
+    std::optional<uint64_t> test_rpdo_last_us;
+    std::optional<uint64_t> last_sync_us;
+    std::optional<xnet_canopen_sync_event_t> last_sync_event;
+    std::optional<xnet_canopen_timing_event_v1> diagnostic_context;
+    std::optional<uint32_t> last_counter;
+    std::optional<uint64_t> started_us;
+    std::optional<uint64_t> last_now_us;
+    bool invalid = false;
+    std::array<char, 128> invalid_reason{};
+};
+
+struct TimingDiagnosticScope {
+    SyncExecution* execution;
+    std::optional<xnet_canopen_timing_event_v1> previous;
+    explicit TimingDiagnosticScope(SyncExecution* active) : execution(active) {
+        if (execution) {
+            previous = execution->diagnostic_context;
+            execution->diagnostic_context = previous.value_or(xnet_canopen_timing_event_v1{});
+        }
+    }
+    ~TimingDiagnosticScope() {
+        if (execution) execution->diagnostic_context = previous;
+    }
+    xnet_canopen_timing_event_v1* get() {
+        return execution ? &*execution->diagnostic_context : nullptr;
+    }
+};
 } // namespace xco
 
 struct motor_drive_endpoint : std::enable_shared_from_this<motor_drive_endpoint> {
@@ -221,6 +379,8 @@ struct motor_drive_port {
     uint32_t heartbeat_seq = 0;
     motor_drive_model_step_v1 heartbeat_step{};
     std::optional<motor_drive_feedback_v1> submitted;
+    std::array<xco::TestScheduledIssue, 64> test_issues{};
+    size_t test_issue_count = 0;
 };
 
 /**
@@ -287,6 +447,10 @@ struct xnet_canopen_device {
     uint64_t sync_observation_epoch = 0;
     uint64_t sync_observation_sequence = 0;
     std::array<xnet_canopen_sync_event_t, 64> sync_observations{};
+    std::unique_ptr<xco::SyncExecution> sync_execution;
+    std::array<xnet_canopen_timing_event_v1, 128> timing_events{};
+    uint64_t timing_event_sequence = 0;
+    bool timing_event_exhausted = false;
     bool drive_adapter_fault = false;
     uint64_t drive_epoch = 0;
     uint32_t drive_command_seq = 0, drive_action_seq = 1, drive_last_feedback_seq = 0;
@@ -298,10 +462,25 @@ struct xnet_canopen_device {
         uint32_t seq = 0;
         uint32_t action_seq = 0;
         xco::Clock::time_point published{};
+        CO_402_command_frame_t command{};
+        uint32_t processed_feedback_seq = 0;
+        uint16_t processed_result = 0;
+        bool test_scheduled = false;
     };
     std::array<DriveCommandRecord, 64> drive_command_history{};
+    uint64_t drive_command_history_overwrites = 0;
     CO_402_feedback_frame_t drive_pending_feedback{};
     CO_402_feedback_frame_t drive_last_feedback{};
+    motor_drive_feedback_v1 drive_pending_motor_feedback{};
+    std::optional<xco::TestScheduledIssue> drive_pending_timed_source;
+    struct DriveFeedbackRecord {
+        bool valid = false;
+        motor_drive_feedback_v1 feedback{};
+        CO_402_feedback_frame_t converted{};
+        xco::Clock::time_point submitted{}, accepted{};
+    };
+    std::array<DriveFeedbackRecord, 64> drive_feedback_history{};
+    uint64_t drive_feedback_history_overwrites = 0;
     std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> drive_pending_feedback_bytes{};
     std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> drive_last_feedback_bytes{};
     std::array<uint8_t, CO_402_FEEDBACK_FRAME_SIZE> drive_last_submitted_bytes{};
@@ -367,8 +546,23 @@ struct xnet_canopen_device {
     void load_persistent();
     void setup_stack();
     void reset_stack(bool reset_all_objects);
+    void start_test_rpdo_plan();
+    void start_test_timing_provider();
+    bool test_timing_provider_valid() const;
+    bool apply_test_timing_watermark(bool commands, uint64_t now);
+    void advance_test_sampling(uint64_t now);
+    bool test_sync_source_valid(uint64_t raw, uint64_t expected_us) const;
+    bool test_sync_watermark_valid() const;
+    bool validate_test_sync_watermark();
     void run();
-    void receive();
+    using SyncBoundaryHandler = void (*)(xnet_canopen_device&, const xnet_canopen_sync_event_t&, void*);
+    void receive(SyncBoundaryHandler boundary = nullptr, void* context = nullptr);
+    static void process_sync_boundary(xnet_canopen_device&, const xnet_canopen_sync_event_t&, void*);
+    void process_sync_iteration(uint32_t dt_us);
+    void record_timing_event(uint32_t kind, uint32_t reason = XNET_CO_TIMING_REASON_NONE,
+                             const char* message = nullptr);
+    void invalidate_sync_execution(const char* reason, uint32_t category = XNET_CO_TIMING_REASON_OTHER);
+    bool sync_now(uint64_t& now);
     void transmit();
     void stop();
     void release();
@@ -380,7 +574,7 @@ struct xnet_canopen_device {
     static ODR_t read_drive_mode(OD_stream_t*, void*, OD_size_t, OD_size_t*);
     static ODR_t write_drive_mode(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
     ODR_t stage_drive_feedback(const CO_402_feedback_frame_t& frame, const uint8_t* bytes);
-    void process_drive_402(uint32_t dt_us, bool force_non_operational = false);
+    void process_drive_402(uint32_t dt_us, bool force_non_operational = false, bool safety_only = false);
     void drain_drive_402();
     void start_drive_epoch();
     void start_sync_observation_epoch();

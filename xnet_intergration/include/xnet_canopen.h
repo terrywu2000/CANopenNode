@@ -215,6 +215,85 @@ typedef struct {
 XNET_CANOPEN_API int32_t xnet_canopen_read_sync_event(
     xnet_canopen_handle handle, uint64_t epoch, uint64_t sequence, xnet_canopen_sync_event_t* event);
 
+/** Internal test-timing diagnostics; these events do not enable scheduled mode. */
+#define XNET_CO_TIMING_EVENT_ABI_VERSION 1U
+enum {
+    XNET_CO_TIMING_COMMAND_PUBLISHED = 1,
+    XNET_CO_TIMING_COMMAND_ASSIGNED = 2,
+    XNET_CO_TIMING_FEEDBACK_ACCEPTED = 3,
+    XNET_CO_TIMING_FEEDBACK_SELECTED = 4,
+    XNET_CO_TIMING_TPDO_ACCEPTED = 5,
+    XNET_CO_TIMING_FAILURE = 6,
+    XNET_CO_TIMING_FEEDBACK_REJECTED = 7
+};
+enum {
+    XNET_CO_TIMING_REASON_NONE = 0,
+    XNET_CO_TIMING_REASON_OTHER = 1,
+    XNET_CO_TIMING_REASON_RPDO = 2,
+    XNET_CO_TIMING_REASON_CLOCK = 3,
+    XNET_CO_TIMING_REASON_WATERMARK = 4,
+    XNET_CO_TIMING_REASON_HISTORY_OVERFLOW = 5,
+    XNET_CO_TIMING_REASON_HISTORY_GAP = 6,
+    XNET_CO_TIMING_REASON_HISTORY_INVALID = 7,
+    XNET_CO_TIMING_REASON_STALE = 8,
+    XNET_CO_TIMING_REASON_DEADLINE = 9,
+    XNET_CO_TIMING_REASON_TRANSPORT = 10
+};
+enum {
+    XNET_CO_TIMING_HAS_BOUNDARY = 1U << 0,
+    XNET_CO_TIMING_HAS_FRAME = 1U << 1,
+    XNET_CO_TIMING_HAS_FRAME_TIMESTAMP = 1U << 2,
+    XNET_CO_TIMING_HAS_SOURCE = 1U << 3,
+    XNET_CO_TIMING_HAS_TARGET = 1U << 4,
+    XNET_CO_TIMING_HAS_FEEDBACK = 1U << 5,
+    XNET_CO_TIMING_HAS_SOURCE_TIME = 1U << 6,
+    XNET_CO_TIMING_HAS_AVAILABLE_TIME = 1U << 7,
+    XNET_CO_TIMING_HAS_DECISION_TIME = 1U << 8,
+    XNET_CO_TIMING_XNET_ACCEPTED = 1U << 9,
+    XNET_CO_TIMING_HAS_SOURCE_CYCLE = 1U << 10,
+    XNET_CO_TIMING_HAS_CUTOFF = 1U << 11,
+    XNET_CO_TIMING_HAS_TARGET_TIME = 1U << 12,
+    XNET_CO_TIMING_HAS_SUBMITTED_STEADY_TIME = 1U << 13
+};
+typedef struct {
+    uint32_t abi_version, struct_size, kind, reason;
+    uint64_t sequence, drive_epoch;
+    uint32_t node_id, flags;
+    xnet_canopen_sync_event_t boundary;
+    uint32_t frame_can_id, feedback_seq;
+    uint64_t frame_timestamp_100ns;
+    motor_drive_token_v1 source;
+    motor_drive_cycle_v1 source_cycle;
+    motor_drive_model_step_v1 target_step, executed_step;
+    uint64_t source_us, available_us, decision_us, cutoff_us, target_us;
+    int64_t submitted_steady_us;
+    char message[128];
+} xnet_canopen_timing_event_v1;
+
+/** Read the next event after sequence, or use zero to begin at the oldest.
+ * The handle-local sequence and bounded 128-event ring survive stop, reset,
+ * uninitialize and reinitialize, and end at destroy. ACCESS_ERROR reports an
+ * overwritten cursor; NOT_FOUND means no later event; a future cursor is
+ * INVALID_ARGUMENT. On sequence exhaustion STACK_ERROR is returned after the
+ * final event. Output is unchanged on failure. Capacity is in bytes and must
+ * be at least sizeof(xnet_canopen_timing_event_v1). Reading never clears or
+ * replaces the last-error diagnostic. Flags identify fields actually known;
+ * source_us/available_us/decision_us/cutoff_us/target_us use the injected
+ * clock domain. submitted_steady_us is instead the local steady-clock time
+ * of the first complete feedback staging, and must not be subtracted from
+ * injected-clock timestamps without a separately verified mapping.
+ * For COMMAND_PUBLISHED/ASSIGNED, boundary is the command's
+ * source SYNC; for FEEDBACK_SELECTED it is the SYNC updating actual values;
+ * for a TPDO event it is the associated preceding SYNC. A failure's boundary,
+ * when present, is the SYNC being processed or associated with a pending TPDO.
+ * FEEDBACK_ACCEPTED is a normal timed-history commit, not a submit or safety
+ * acceptance. FEEDBACK_REJECTED reports worker rejection, not every API refusal.
+ * TPDO_ACCEPTED is XNET queue acceptance, not proof of physical transmission.
+ * The first timing invalidation is recorded; later API errors do not replace it.
+ */
+XNET_CANOPEN_API int32_t xnet_canopen_read_timing_event_v1(
+    xnet_canopen_handle handle, uint64_t sequence, xnet_canopen_timing_event_v1* event, uint32_t capacity);
+
 /**
  * Stop/join processing and discard pending network traffic, retaining OD values,
  * configuration, bindings, and sessions. Already stopped is a no-op.
