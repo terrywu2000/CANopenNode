@@ -6,15 +6,16 @@
  * C ABI for one CANopen slave simulated over NI-XNET.
  *
  * The library owns CAN transport, protocol processing and OD storage; an external
- * model supplies application behavior through batch access. PDO tx/rx directions
- * are relative to the simulated slave, not to the VeriStand model. No function
- * interprets a CiA 402 controlword or generates the application's statusword.
+ * model supplies ordinary application behavior through batch access. A JSON model
+ * may explicitly enable the integrated single-axis CiA 402 PP profile. PDO tx/rx
+ * directions are relative to the simulated slave, not to the VeriStand model.
  *
  * Runtime state, CANopen NMT state and an application's drive state are separate.
  * Unless explicitly documented otherwise, output values are usable only after
  * checking the operation result and any required per-entry results.
  */
 #include <stdint.h>
+#include "motor_drive.h"
 
 #if defined(_WIN32)
 #define XNET_CANOPEN_API __declspec(dllexport)
@@ -177,6 +178,17 @@ XNET_CANOPEN_API int32_t xnet_canopen_uninitialize(xnet_canopen_handle handle);
  * for later asynchronous failures; a FAILED runtime must first be uninitialized.
  */
 XNET_CANOPEN_API int32_t xnet_canopen_start(xnet_canopen_handle handle);
+
+/** Backend-only endpoint binding; requires external PP and device_adapter.
+ * Endpoint is borrowed until uninitialize. No existing xnet ABI is changed.
+ */
+XNET_CANOPEN_API int32_t xnet_canopen_get_motor_drive_endpoint(
+    xnet_canopen_handle handle, motor_drive_endpoint_handle* endpoint);
+/** JSON conversion audit: converted, unchanged, assumed_identity and unbound.
+ * Required byte count includes NUL; a NULL/0 size query returns BUFFER_TOO_SMALL.
+ */
+XNET_CANOPEN_API int32_t xnet_canopen_get_drive_unit_report(
+    xnet_canopen_handle handle, char* buffer, uint32_t capacity, uint32_t* required_size);
 
 /**
  * Stop/join processing and discard pending network traffic, retaining OD values,

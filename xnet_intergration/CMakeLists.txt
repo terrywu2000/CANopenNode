@@ -19,7 +19,7 @@ set(STACK_SOURCES
     "${STACK_ROOT}/301/CO_PDO.c"
     "${STACK_ROOT}/305/CO_LSSslave.c")
 set(DS402_ROOT "${STACK_ROOT}/402")
-set(PORT_SOURCES src/model.cpp src/persistence.cpp src/driver.cpp src/device.cpp src/logging.cpp
+set(PORT_SOURCES src/model.cpp src/persistence.cpp src/driver.cpp src/device.cpp src/drive_adapter.cpp src/logging.cpp
     "${DS402_ROOT}/drive402.cpp" "${DS402_ROOT}/CO_402_protocol.c")
 
 add_library(xnet_canopen_objects OBJECT ${STACK_SOURCES} ${PORT_SOURCES})
@@ -49,7 +49,7 @@ if(XNET_CANOPEN_BUILD_LIBRARY)
     target_link_options(xnet_canopen PRIVATE "$<$<PLATFORM_ID:Linux>:-Wl,--no-undefined>")
     set_target_properties(xnet_canopen PROPERTIES VERSION 0.1.0 SOVERSION 0)
     install(TARGETS xnet_canopen LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
-    install(FILES include/xnet_canopen.h DESTINATION include)
+    install(FILES include/xnet_canopen.h include/motor_drive.h DESTINATION include)
 endif()
 
 if(XNET_CANOPEN_BUILD_APP)

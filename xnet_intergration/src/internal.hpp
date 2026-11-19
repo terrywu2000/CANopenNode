@@ -51,6 +51,7 @@ struct Error : std::runtime_error {
     Error(int32_t c, const std::string& text) : std::runtime_error(text), code(c) {}
 };
 void require(bool condition, int32_t code, const std::string& message);
+void keys(const Json& value, std::initializer_list<const char*> allowed, const std::string& where);
 /** Numeric range for configured Classical CAN rates in kbit/s; XNET checks hardware support. */
 bool valid_bitrate(uint16_t kbps);
 uint64_t unsigned_number(const Json& value, uint64_t maximum, const std::string& where);
@@ -79,6 +80,40 @@ struct Value {
     bool mapped_tpdo = false; /**< Present in an enabled TPDO mapping. */
     /** Address published to OD descriptors; stable while storage is not resized. */
     void* data() { return storage.data(); }
+};
+
+enum class DriveQuantity : size_t {
+    target_position, profile_velocity, profile_acceleration, profile_deceleration,
+    quick_stop_deceleration, demand_position, demand_velocity, actual_position, actual_velocity, count
+};
+
+struct Model;
+struct DriveUnitBinding {
+    const char* role = nullptr;
+    uint16_t index = 0;
+    Value* value = nullptr;
+    uint32_t numerator = 1, denominator = 1;
+    bool is_unsigned = false;
+    bool confirmed = true;
+    std::string basis;
+};
+struct DriveAdapter {
+    std::array<DriveUnitBinding, static_cast<size_t>(DriveQuantity::count)> bindings{};
+    std::map<std::pair<uint32_t, uint32_t>, uint16_t> fault_mapping;
+    std::string unit_profile;
+    uint32_t counts_per_revolution = 0;
+    int32_t direction = 1, zero_counts = 0;
+    void load(const Json& config);
+    void bind(Model& model);
+    int64_t read(DriveQuantity quantity) const;
+    int64_t raw(DriveQuantity quantity, int64_t counts) const;
+    void publish(const d402::Status& status);
+    double position_rad(int32_t counts) const;
+    double velocity_rad_s(int64_t counts_s) const;
+    int32_t position_counts(double radians) const;
+    int32_t velocity_counts(double radians_s) const;
+    uint16_t fault_code(uint32_t fault_class, uint32_t detail) const;
+    Json report() const;
 };
 
 /**
@@ -117,6 +152,7 @@ struct Model {
     uint32_t worker_period_us = 1000; /**< Worker wait interval in microseconds; not a hard real-time guarantee. */
     bool drive_402_enabled = false; /**< True only when the JSON explicitly enables the PP profile. */
     bool drive_402_external = false; /**< Selects the validated 0x2F00..0x2F05 model exchange. */
+    std::optional<DriveAdapter> drive_adapter;
     bool drive_has_error_code = false; /**< Optional 0x603F fault-code output. */
     bool drive_has_quick_stop_deceleration = false; /**< Optional 0x6085; defaults to PP profile deceleration. */
     uint32_t drive_position_tolerance = 0; /**< Allowed actual-to-target position error in counts. */
@@ -174,6 +210,18 @@ struct Adapter {
     void check(nxStatus_t status, const char* operation);
 };
 } // namespace xco
+
+struct motor_drive_endpoint : std::enable_shared_from_this<motor_drive_endpoint> {
+    std::atomic<xnet_canopen_handle> device{nullptr};
+    std::atomic<bool> writer_open{false};
+};
+struct motor_drive_port {
+    std::shared_ptr<motor_drive_endpoint> endpoint;
+    uint64_t epoch = 0, pcl_epoch = 0;
+    uint32_t heartbeat_seq = 0;
+    motor_drive_model_step_v1 heartbeat_step{};
+    std::optional<motor_drive_feedback_v1> submitted;
+};
 
 /**
  * Per-device context behind the opaque public xnet_canopen_handle.
@@ -240,6 +288,8 @@ struct xnet_canopen_device {
         OD_extension_t extension{};
     } drive_feedback_od; /**< Atomic local feedback-frame submitter; refreshed after stack rebuilds. */
     std::unique_ptr<xco::d402::Drive> drive_402; /**< Present only when enabled by JSON. */
+    std::shared_ptr<motor_drive_endpoint> drive_endpoint;
+    bool drive_adapter_fault = false;
     uint64_t drive_epoch = 0;
     uint32_t drive_command_seq = 0, drive_action_seq = 1, drive_last_feedback_seq = 0;
     uint32_t drive_last_submitted_seq = 0;
@@ -331,6 +381,7 @@ struct xnet_canopen_device {
     static ODR_t write_drive_mode(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
     static ODR_t read_drive_feedback(OD_stream_t*, void*, OD_size_t, OD_size_t*);
     static ODR_t write_drive_feedback(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
+    ODR_t stage_drive_feedback(const CO_402_feedback_frame_t& frame, const uint8_t* bytes);
     void process_drive_402(uint32_t dt_us, bool force_non_operational = false);
     void drain_drive_402();
     void start_drive_epoch();
