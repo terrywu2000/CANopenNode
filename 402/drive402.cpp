@@ -52,8 +52,7 @@ Feedback InternalModel::sample(int32_t demand_position, int32_t demand_velocity,
     return Feedback{demand_position, demand_velocity, false};
 }
 
-void ExternalModel::post(const Feedback& feedback) {
-    last_ = feedback;
+void ExternalModel::refresh() {
     age_us_ = 0;
     has_feedback_ = true;
 }
@@ -73,10 +72,26 @@ void Drive::use_external_model(bool external) {
 }
 
 bool Drive::post_feedback(const Feedback& feedback) {
+    return post_safety_feedback(feedback) && select_feedback(feedback);
+}
+
+bool Drive::post_safety_feedback(const Feedback& feedback) {
     if (!use_external_) return false;
-    external_.post(feedback);
-    feedback_ = feedback;
+    external_.refresh();
+    safety_feedback_ = feedback;
     return true;
+}
+
+bool Drive::select_feedback(const Feedback& feedback) {
+    if (!use_external_ || !external_.has_feedback()) return false;
+    external_.select(feedback);
+    feedback_ = feedback;
+    selected_feedback_valid_ = true;
+    return true;
+}
+
+void Drive::invalidate_selected_feedback() {
+    selected_feedback_valid_ = false;
 }
 
 void Drive::set_external_fault(bool fault) {
@@ -94,6 +109,8 @@ bool Drive::mode_supported(int8_t mode) {
 
 void Drive::reset() {
     external_.reset();
+    safety_feedback_ = {};
+    selected_feedback_valid_ = false;
     pds_ = Pds::switch_on_disabled;
     demand_pos_ = feedback_.position;
     demand_vel_ = 0.0;
@@ -144,7 +161,7 @@ void Drive::step(const Inputs& in, uint32_t dt_us) {
     const bool within_tolerance = std::fabs(double(feedback_.position) - target_pos_)
         <= double(in.position_tolerance);
     if (pds_ == Pds::operation_enabled && mode_display_ == mode_profile_position
-        && (!use_external_ || external_.fresh()) && !model_faulted()
+        && (!use_external_ || (external_.fresh() && selected_feedback_valid_)) && !model_faulted()
         && std::fabs(demand_vel_) < 1e-9 && within_tolerance) {
         target_reached_age_us_ = std::min<uint64_t>(
             target_reached_age_us_ + dt_us, std::numeric_limits<uint32_t>::max());
@@ -155,8 +172,30 @@ void Drive::step(const Inputs& in, uint32_t dt_us) {
     }
 }
 
+void Drive::process_safety(const Inputs& in, uint32_t dt_us) {
+    if (use_external_) {
+        if (in.external_feedback_age_valid) external_.set_age(in.external_feedback_age_us);
+        else external_.advance_age(dt_us);
+    }
+    transition(in, true);
+    fault_reset_prev_ = (in.controlword & cw_fault_reset) != 0;
+    const bool stopping = pds_ == Pds::quick_stop_active || pds_ == Pds::fault_reaction_active
+        || (action_pending_ && (pending_action_ == CO_402_ACTION_QUICK_STOP
+                               || pending_action_ == CO_402_ACTION_FAULT_REACTION));
+    if (stopping) {
+        motion(in, dt_us / 1e6);
+        feedback_ = model().sample(clamp_i32(demand_pos_), clamp_i32(demand_vel_), dt_us);
+    }
+    if (stopping || pds_ != Pds::operation_enabled || action_pending_
+        || !in.nmt_operational || model_faulted()) {
+        target_reached_ = false;
+        target_reached_age_us_ = 0;
+        speed_reached_ = false;
+    }
+}
+
 bool Drive::model_faulted() const {
-    if (feedback_.fault || external_transport_fault_) return true;
+    if ((use_external_ ? safety_feedback_.fault : feedback_.fault) || external_transport_fault_) return true;
     return use_external_ && external_.has_feedback() && !external_.fresh();
 }
 
@@ -165,7 +204,7 @@ MotorModel& Drive::model() {
     return internal_;
 }
 
-void Drive::transition(const Inputs& in) {
+void Drive::transition(const Inputs& in, bool safety_only) {
     uint16_t cw = in.controlword;
     if (!in.nmt_operational) {
         // NMT remains owned by CANopen; leaving Operational requests the DS402
@@ -189,7 +228,8 @@ void Drive::transition(const Inputs& in) {
     }
 
     if (use_external_ && action_pending_) {
-        const bool safety_request = (!in.nmt_operational && pending_action_ == CO_402_ACTION_ENABLE_OPERATION)
+        const bool safety_request = (pending_action_ == CO_402_ACTION_ENABLE_OPERATION
+                                     && (!in.nmt_operational || disable_voltage || quick_stop_request))
             || (pds_ == Pds::operation_enabled && (disable_voltage || quick_stop_request));
         if (safety_request && pending_action_ != CO_402_ACTION_FAULT_REACTION
             && pending_action_ != CO_402_ACTION_QUICK_STOP) {
@@ -227,19 +267,20 @@ void Drive::transition(const Inputs& in) {
     Pds target = pds_;
     switch (pds_) {
     case Pds::not_ready_to_switch_on:
-        target = Pds::switch_on_disabled;
+        if (!safety_only) target = Pds::switch_on_disabled;
         break;
     case Pds::switch_on_disabled:
-        if (shutdown_request(cw)) { action = CO_402_ACTION_SHUTDOWN; target = Pds::ready_to_switch_on; }
+        if (!safety_only && shutdown_request(cw)) { action = CO_402_ACTION_SHUTDOWN; target = Pds::ready_to_switch_on; }
         break;
     case Pds::ready_to_switch_on:
         if (disable_voltage) { action = CO_402_ACTION_DISABLE_VOLTAGE; target = Pds::switch_on_disabled; }
-        else if (switch_on_request(cw)) { action = CO_402_ACTION_SWITCH_ON; target = Pds::switched_on; }
+        else if (!safety_only && switch_on_request(cw)) { action = CO_402_ACTION_SWITCH_ON; target = Pds::switched_on; }
         break;
     case Pds::switched_on:
         if (disable_voltage) { action = CO_402_ACTION_DISABLE_VOLTAGE; target = Pds::switch_on_disabled; }
-        else if (shutdown_request(cw)) { action = CO_402_ACTION_SHUTDOWN; target = Pds::ready_to_switch_on; }
-        else if (enable_request(cw) && (!use_external_ || (external_model_ready_ && external_.fresh()))) {
+        else if (!safety_only && shutdown_request(cw)) { action = CO_402_ACTION_SHUTDOWN; target = Pds::ready_to_switch_on; }
+        else if (!safety_only && enable_request(cw)
+                 && (!use_external_ || (external_model_ready_ && external_.fresh() && selected_feedback_valid_))) {
             action = CO_402_ACTION_ENABLE_OPERATION; target = Pds::operation_enabled;
         }
         break;
@@ -249,13 +290,13 @@ void Drive::transition(const Inputs& in) {
             quick_stop_option_ = in.quick_stop_option;
             action = CO_402_ACTION_QUICK_STOP;
             target = in.quick_stop_option == 0 ? Pds::switch_on_disabled : Pds::quick_stop_active;
-        } else if (switch_on_request(cw)) { action = CO_402_ACTION_SWITCH_ON; target = Pds::switched_on; }
-        else if (shutdown_request(cw)) { action = CO_402_ACTION_SHUTDOWN; target = Pds::ready_to_switch_on; }
+        } else if (!safety_only && switch_on_request(cw)) { action = CO_402_ACTION_SWITCH_ON; target = Pds::switched_on; }
+        else if (!safety_only && shutdown_request(cw)) { action = CO_402_ACTION_SHUTDOWN; target = Pds::ready_to_switch_on; }
         break;
     case Pds::quick_stop_active:
         if (disable_voltage) {
             action = CO_402_ACTION_DISABLE_VOLTAGE; target = Pds::switch_on_disabled;
-        } else if ((quick_stop_option_ == 5 || quick_stop_option_ == 6) && enable_request(cw)) {
+        } else if (!safety_only && (quick_stop_option_ == 5 || quick_stop_option_ == 6) && enable_request(cw)) {
             // Options 5 and 6 resume operation when the quick-stop request is withdrawn.
             action = CO_402_ACTION_ENABLE_OPERATION; target = Pds::operation_enabled;
         } else if ((quick_stop_option_ == 1 || quick_stop_option_ == 2) && std::fabs(demand_vel_) < 1e-9) {
@@ -266,7 +307,7 @@ void Drive::transition(const Inputs& in) {
         if (std::fabs(demand_vel_) < 1e-9) pds_ = Pds::fault;
         break;
     case Pds::fault:
-        if (in.nmt_operational && (cw & cw_fault_reset) && !fault_reset_prev_ && !model_faulted()
+        if (!safety_only && in.nmt_operational && (cw & cw_fault_reset) && !fault_reset_prev_ && !model_faulted()
             && (!use_external_ || (in.reset_permitted && external_reset_permitted_))) {
             action = CO_402_ACTION_FAULT_RESET; target = Pds::switch_on_disabled;
         }
@@ -318,7 +359,11 @@ void Drive::motion(const Inputs& in, double dt_s) {
         : pds_;
     switch (motion_pds) {
     case Pds::operation_enabled:
-        if (halt_) {
+        if (use_external_ && !selected_feedback_valid_) {
+            demand_vel_ = 0.0;
+            target_reached_ = false;
+            speed_reached_ = false;
+        } else if (halt_) {
             approach(0.0, in.profile_acceleration, in.profile_deceleration, dt_s);
             target_reached_ = false;
             speed_reached_ = false;
@@ -415,13 +460,14 @@ Status Drive::status() const {
     s.actual_position = feedback_.position;
     s.actual_velocity = feedback_.velocity;
     s.model_fault = model_faulted();
-    s.feedback_fresh = use_external_ ? external_.fresh() : true;
-    s.model_ready = !use_external_ || external_model_ready_;
+    s.feedback_fresh = use_external_ ? external_.fresh() && selected_feedback_valid_ : true;
+    s.model_ready = !use_external_ || (external_model_ready_ && selected_feedback_valid_);
     s.action = action_;
     s.action_seq = action_seq_;
     s.action_pending = action_pending_;
     s.reaction_unconfirmed = reaction_unconfirmed_;
-    s.output_allowed = pds_ == Pds::operation_enabled && !action_pending_ && !s.model_fault;
+    s.output_allowed = pds_ == Pds::operation_enabled && !action_pending_ && !s.model_fault
+        && (!use_external_ || selected_feedback_valid_);
 
     uint16_t sw = base_statusword(pds_) | sw_remote;
     if (target_reached_) sw |= sw_target_reached;

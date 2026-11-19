@@ -11,6 +11,86 @@
 #include <algorithm>
 #include <cstring>
 
+namespace {
+struct TestRpdoWrite {
+    OD_IO_t* io = nullptr;
+    decltype(OD_IO_t::write) original = nullptr;
+    void* object = nullptr;
+    bool called = false;
+    bool failed = false;
+};
+
+ODR_t test_rpdo_write(OD_stream_t* stream, const void* data, OD_size_t count, OD_size_t* written) {
+    auto& tracked = *static_cast<TestRpdoWrite*>(stream->object);
+    stream->object = tracked.object;
+    *written = 0;
+    const auto result = tracked.original(stream, data, count, written);
+    stream->object = &tracked;
+    tracked.called = true;
+    tracked.failed = tracked.failed || result != ODR_OK || *written != count;
+    return result;
+}
+
+class TestRpdoWrites {
+public:
+    TestRpdoWrites(CO_t& co, uint16_t count, uint32_t mask) {
+        for (uint16_t pdo = 0; pdo < count; ++pdo) {
+            if (!(mask & (1U << pdo))) continue;
+            auto& common = co.RPDO[pdo].PDO_common;
+            for (uint8_t i = 0; i < common.mappedObjectsCount; ++i) {
+                auto& io = common.OD_IO[i];
+                auto& tracked = entries_[count_++];
+                tracked.io = &io;
+                tracked.original = io.write;
+                tracked.object = io.stream.object;
+                io.stream.object = &tracked;
+                io.write = test_rpdo_write;
+            }
+        }
+    }
+
+    ~TestRpdoWrites() {
+        for (size_t i = 0; i < count_; ++i) {
+            auto& tracked = entries_[i];
+            tracked.io->stream.object = tracked.object;
+            tracked.io->write = tracked.original;
+        }
+    }
+
+    bool ok() const {
+        for (size_t i = 0; i < count_; ++i)
+            if (!entries_[i].called || entries_[i].failed) return false;
+        return true;
+    }
+
+private:
+    std::array<TestRpdoWrite, 8 * CO_PDO_MAX_MAPPED_ENTRIES> entries_{};
+    size_t count_ = 0;
+};
+
+bool test_rpdo_applied(const CO_RPDO_t& rpdo) {
+    const uint8_t buffer = rpdo.SYNC && !rpdo.SYNC->CANrxToggle ? 1 : 0;
+    size_t offset = 0;
+    for (uint8_t i = 0; i < rpdo.PDO_common.mappedObjectsCount; ++i) {
+        const auto& io = rpdo.PDO_common.OD_IO[i];
+        auto stream = io.stream;
+        const size_t size = stream.dataOffset;
+        if (!io.read || !size || size != stream.dataLength || size > CO_PDO_MAX_SIZE - offset) return false;
+        std::array<uint8_t, CO_PDO_MAX_SIZE> value{};
+        OD_size_t read = 0;
+        stream.dataOffset = 0;
+        if (io.read(&stream, value.data(), static_cast<OD_size_t>(size), &read) != ODR_OK || read != size)
+            return false;
+#ifdef CO_BIG_ENDIAN
+        if (stream.attribute & ODA_MB) std::reverse(value.begin(), value.begin() + size);
+#endif
+        if (std::memcmp(value.data(), rpdo.CANrxData[buffer] + offset, size) != 0) return false;
+        offset += size;
+    }
+    return offset == rpdo.PDO_common.dataLength;
+}
+} // namespace
+
 namespace xco {
 void Adapter::check(nxStatus_t status, const char* operation) {
     // Treat warnings as observable failures too; do not assume partially
@@ -299,7 +379,30 @@ void xnet_canopen_device::record_can_state(uint32_t raw, uint16_t flags) noexcep
  */
 void xnet_canopen_device::transmit() {
     while (!outgoing.empty()) {
+        xco::TimingDiagnosticScope diagnostic(sync_execution && outgoing.front().buffer->syncFlag
+            ? sync_execution.get() : nullptr);
+        if (auto* context = diagnostic.get()) {
+            context->flags |= XNET_CO_TIMING_HAS_FRAME;
+            context->frame_can_id = outgoing.front().frame.ident & 0x7ff;
+            if (sync_execution->last_sync_event) {
+                context->flags |= XNET_CO_TIMING_HAS_BOUNDARY;
+                context->boundary = *sync_execution->last_sync_event;
+            }
+        }
+        if (sync_execution && outgoing.front().buffer->syncFlag) {
+            uint64_t now = 0;
+            const auto& execution = *sync_execution;
+            const bool valid_clock = !execution.invalid && execution.last_sync_us && sync_now(now)
+                && now >= *execution.last_sync_us;
+            if (execution.invalid || !valid_clock || now - *execution.last_sync_us >= execution.active_tpdo_window_us) {
+                if (execution.invalid) CO_CANclearPendingSyncPDOs(co->CANmodule);
+                else invalidate_sync_execution("synchronous TPDO expired before submission",
+                    valid_clock ? XNET_CO_TIMING_REASON_DEADLINE : XNET_CO_TIMING_REASON_CLOCK);
+                continue;
+            }
+        }
         const auto& pending = outgoing.front();
+        const bool timed_sync = sync_execution && pending.buffer->syncFlag;
         nxFrameCAN_t frame{};
         // Remove our internal RTR bit from the on-wire ID; translate it into
         // XNET's separate frame type instead. Only the low 11 ID bits are sent.
@@ -314,25 +417,44 @@ void xnet_canopen_device::transmit() {
             fail(XNET_CO_XNET_ERROR, "XNET output queue full; frame remains in bounded adapter queue");
             return;
         }
+        if (status != nxSuccess && sync_execution)
+            invalidate_sync_execution("XNET write failed during SYNC execution", XNET_CO_TIMING_REASON_TRANSPORT);
         adapter.check(status, "write CAN frame");
         pending.buffer->bufferFull = false;
         outgoing.pop_front();
+        if (timed_sync) {
+            diagnostic.get()->flags |= XNET_CO_TIMING_XNET_ACCEPTED;
+            record_timing_event(XNET_CO_TIMING_TPDO_ACCEPTED);
+            uint64_t now = 0;
+            const auto& execution = *sync_execution;
+            if (!execution.last_sync_us || !sync_now(now) || now < *execution.last_sync_us) {
+                co->CANmodule->CANerrorStatus |= CO_CAN_ERRTX_PDO_LATE;
+                invalidate_sync_execution("synchronous TPDO accepted but clock invalid; frame cannot be recalled",
+                    XNET_CO_TIMING_REASON_CLOCK);
+            } else if (now - *execution.last_sync_us >= execution.active_tpdo_window_us) {
+                co->CANmodule->CANerrorStatus |= CO_CAN_ERRTX_PDO_LATE;
+                invalidate_sync_execution("synchronous TPDO accepted after deadline; frame cannot be recalled",
+                    XNET_CO_TIMING_REASON_DEADLINE);
+            }
+        }
     }
 }
 
 /**
  * Process at most one nonblocking 8 KiB stream read per worker iteration.
- * Validate record boundaries before reading payloads and keep RTR/data filtering
- * distinct. On input overflow, flush unread traffic and expose the loss instead
- * of presenting the remaining OD values as a lossless command stream.
+ * A boundary handler consumes each received SYNC and its RPDOs before the next
+ * frame; the caller owns timer advancement and TPDO deadlines. The default worker
+ * does not install a handler. On input overflow, flush and expose the loss.
  */
-void xnet_canopen_device::receive() {
+void xnet_canopen_device::receive(SyncBoundaryHandler boundary, void* context) {
     std::array<uint64_t, 1024> storage{};
     u32 bytes = 0;
     auto status = nxReadFrame(adapter.input, storage.data(), static_cast<u32>(sizeof(storage)), nxTimeout_None, &bytes);
     if (status == nxErrInputQueueOverflow) {
         co->CANmodule->CANerrorStatus |= CO_CAN_ERRRX_OVERFLOW;
         fail(XNET_CO_XNET_ERROR, "XNET input queue overflow; unread traffic lost");
+        start_sync_observation_epoch();
+        invalidate_sync_execution("XNET input queue overflow invalidated SYNC timing", XNET_CO_TIMING_REASON_TRANSPORT);
         adapter.check(nxFlush(adapter.input), "flush overflowed input");
         return;
     }
@@ -349,6 +471,12 @@ void xnet_canopen_device::receive() {
         xco::require(size <= bytes - offset, XNET_CO_XNET_ERROR, "truncated XNET frame payload");
         if ((frame.Type == nxFrameType_CAN_Data || frame.Type == nxFrameType_CAN20_Data || frame.Type == nxFrameType_CAN_Remote)
             && frame.Identifier <= 0x7ff && frame.PayloadLength <= 8 && !(frame.Flags & nxFrameFlags_TransmitEcho)) {
+            xco::TimingDiagnosticScope diagnostic(boundary ? sync_execution.get() : nullptr);
+            if (auto* timing = diagnostic.get()) {
+                timing->flags |= XNET_CO_TIMING_HAS_FRAME | XNET_CO_TIMING_HAS_FRAME_TIMESTAMP;
+                timing->frame_can_id = frame.Identifier;
+                timing->frame_timestamp_100ns = frame.Timestamp;
+            }
             CO_CANrxMsg_t message{};
             // Pack XNET's separate ID/type into the representation registered by
             // CO_CANrxBufferInit(): low 11 bits are the ID, bit 11 marks RTR.
@@ -363,16 +491,106 @@ void xnet_canopen_device::receive() {
                 // Example: ident=0x180, mask=0x780 accepts IDs 0x180..0x1ff;
                 // the additional 0x800 mask bit still enforces the requested RTR.
                 if (subscription.CANrx_callback && ((message.ident ^ subscription.ident) & subscription.mask) == 0) {
+                    const bool sync = co->SYNC && subscription.object == co->SYNC;
+                    const bool old_toggle = sync && co->SYNC->CANrxToggle;
+                    if (boundary && sync_execution && sync_execution->active_test_rpdo_plan
+                        && !sync_execution->invalid && CO_NMT_getInternalState(co->NMT) == CO_NMT_OPERATIONAL) {
+                        auto& execution = *sync_execution;
+                        const auto& plan = *execution.active_test_rpdo_plan;
+                        for (uint16_t pdo = 0; pdo < model->rpdo_count; ++pdo) {
+                            const uint32_t bit = 1U << pdo;
+                            auto& rpdo = co->RPDO[pdo];
+                            if (!(plan.required_mask & bit) || subscription.object != &rpdo) continue;
+                            uint64_t source = 0, now = 0;
+                            const uint64_t guard = plan.epsilon_us * 2;
+                            if (!rpdo.PDO_common.valid || !rpdo.synchronous
+                                || message.DLC != rpdo.PDO_common.dataLength) {
+                                invalidate_sync_execution("required RPDO invalid or wrong length", XNET_CO_TIMING_REASON_RPDO);
+                            } else if (execution.test_rpdo_seen & bit) {
+                                invalidate_sync_execution("duplicate required RPDO before SYNC", XNET_CO_TIMING_REASON_RPDO);
+                            } else if (!execution.active_clock->map_rx_us(frame.Timestamp, source) || !sync_now(now)
+                                || !execution.started_us || source < *execution.started_us || source > now
+                                || (execution.last_sync_us && (source <= *execution.last_sync_us
+                                    || source - *execution.last_sync_us <= guard))
+                                || (execution.test_rpdo_last_us && (source <= *execution.test_rpdo_last_us
+                                    || source - *execution.test_rpdo_last_us <= guard))) {
+                                invalidate_sync_execution("required RPDO timestamp invalid or unordered", XNET_CO_TIMING_REASON_RPDO);
+                            } else {
+                                execution.test_rpdo_seen |= bit;
+                                execution.test_rpdo_last_us = source;
+                            }
+                            break;
+                        }
+                    }
                     subscription.CANrx_callback(subscription.object, &message);
+                    if (sync && old_toggle != bool(co->SYNC->CANrxToggle)) {
+                        xco::require(sync_observation_sequence != UINT64_MAX, XNET_CO_STACK_ERROR,
+                            "SYNC observation sequence exhausted");
+                        const auto seq = ++sync_observation_sequence;
+                        auto& event = sync_observations[(seq - 1) % sync_observations.size()];
+                        event = {sync_observation_epoch, seq, frame.Timestamp, frame.Identifier,
+                            co->SYNC->counterOverflowValue ? message.data[0] : 0U,
+                            co->SYNC->counterOverflowValue ? 1U : 0U, 0};
+                        if (auto* timing = diagnostic.get()) {
+                            timing->flags |= XNET_CO_TIMING_HAS_BOUNDARY;
+                            timing->boundary = event;
+                        }
+                        if (boundary && !co->nodeIdUnconfigured) {
+                            const bool_t sync = CO_process_SYNC(co, 0, nullptr);
+                            if (sync && sync_execution && sync_execution->active_test_rpdo_plan
+                                && !sync_execution->invalid) {
+                                auto& execution = *sync_execution;
+                                const auto& plan = *execution.active_test_rpdo_plan;
+                                const uint64_t guard = plan.epsilon_us * 2;
+                                uint64_t source = 0;
+                                if (execution.test_rpdo_seen != plan.required_mask) {
+                                    invalidate_sync_execution("required RPDO missing at SYNC boundary", XNET_CO_TIMING_REASON_RPDO);
+                                } else if (!execution.active_clock->map_rx_us(event.timestamp_100ns, source)
+                                    || !execution.test_rpdo_last_us || source <= *execution.test_rpdo_last_us
+                                    || source - *execution.test_rpdo_last_us <= guard) {
+                                    invalidate_sync_execution("required RPDO timestamp overlaps SYNC boundary", XNET_CO_TIMING_REASON_RPDO);
+                                } else {
+                                    execution.test_rpdo_seen = 0;
+                                    execution.test_rpdo_last_us.reset();
+                                }
+                            }
+                            const bool allow_sync_rpdo = !sync_execution || !sync_execution->active_test_rpdo_plan
+                                || !sync_execution->invalid;
+                            bool required_writes_ok = true;
+                            if (sync && allow_sync_rpdo && sync_execution && sync_execution->active_test_rpdo_plan) {
+                                TestRpdoWrites writes(*co, model->rpdo_count,
+                                    sync_execution->active_test_rpdo_plan->required_mask);
+                                CO_process_RPDO(co, true, 0, nullptr);
+                                required_writes_ok = writes.ok();
+                            } else {
+                                CO_process_RPDO(co, sync && allow_sync_rpdo, 0, nullptr);
+                            }
+                            if (sync && sync_execution && sync_execution->active_test_rpdo_plan
+                                && !sync_execution->invalid) {
+                                const auto mask = sync_execution->active_test_rpdo_plan->required_mask;
+                                for (uint16_t pdo = 0; pdo < model->rpdo_count; ++pdo) {
+                                    if ((mask & (1U << pdo))
+                                        && (!required_writes_ok || !test_rpdo_applied(co->RPDO[pdo]))) {
+                                        invalidate_sync_execution("required RPDO OD application failed or changed", XNET_CO_TIMING_REASON_RPDO);
+                                        break;
+                                    }
+                                }
+                            }
+                            if (sync) boundary(*this, event, context);
+                        }
+                    }
                     break;
                 }
             }
-            // Drain general-protocol mailboxes (including SDO/NMT) before the next
-            // frame, without advancing timers again. RPDO application/SYNC remain
-            // in the outer loop, so this is not a lossless RPDO command queue.
+            // Drain general-protocol mailboxes without advancing timers again.
             auto reset = CO_process(co, false, 0, nullptr);
             if (reset != CO_RESET_NOT) { reset_stack(reset == CO_RESET_APP); return; }
+            if (sync_execution && CO_NMT_getInternalState(co->NMT) != CO_NMT_OPERATIONAL) {
+                sync_execution->test_rpdo_seen = 0;
+                sync_execution->test_rpdo_last_us.reset();
+            }
             if (switching != Switch::none || stop_requested) return;
+            if (boundary && !co->nodeIdUnconfigured) CO_process_RPDO(co, false, 0, nullptr);
         } else if (frame.Type != nxFrameType_CAN_BusError && !(frame.Flags & nxFrameFlags_TransmitEcho)) {
             fail(XNET_CO_XNET_ERROR, "unsupported CAN frame type, identifier, or payload ignored");
         }

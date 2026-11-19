@@ -239,6 +239,8 @@ void Model::load(const Json& root) {
             return value;
         };
         if (drive_402_external) {
+            require(drive_adapter.has_value(), XNET_CO_MODEL_ERROR,
+                "external drive_402 requires device_adapter for the motor_drive_ SI interface");
             drive_startup_timeout_us = timeout("startup_timeout_us");
             drive_heartbeat_timeout_us = timeout("heartbeat_timeout_us");
             drive_feedback_timeout_us = timeout("feedback_timeout_us");
@@ -511,35 +513,6 @@ void Model::load(const Json& root) {
             require(quick_stop_decel > 0, XNET_CO_MODEL_ERROR, "drive_402 0x6085 must be positive when configured");
         }
         (void)target;
-        if (drive_402_external) {
-            const struct RequiredExchange { uint16_t index; const char* type; uint32_t size; bool local_write; } exchange[] = {
-                {0x2f00, "UNSIGNED16", 2, false},
-                {0x2f01, "UNSIGNED32", 4, true},
-                {0x2f02, "OCTET_STRING", CO_402_COMMAND_FRAME_SIZE, false},
-                {0x2f03, "OCTET_STRING", CO_402_FEEDBACK_FRAME_SIZE, true},
-                {0x2f04, "UNSIGNED32", 4, false},
-                {0x2f05, "UNSIGNED16", 2, false},
-            };
-            for (const auto& requirement : exchange) {
-                auto object = std::find_if(objects.begin(), objects.end(), [&](const auto& candidate) {
-                    return candidate->index == requirement.index;
-                });
-                std::ostringstream where;
-                where << "external drive_402 requires OD 0x" << std::hex << requirement.index;
-                require(object != objects.end(), XNET_CO_MODEL_ERROR, where.str() + ": missing object");
-                require((*object)->is_var_object && (*object)->values.size() == 1
-                        && (*object)->values[0].sub == 0,
-                        XNET_CO_MODEL_ERROR, where.str() + ": expected scalar VAR at subindex 0");
-                const auto& v = (*object)->values[0];
-                require(v.type == requirement.type && v.size == requirement.size,
-                        XNET_CO_MODEL_ERROR, where.str() + ": invalid type or size");
-                require((v.attr & ODA_SDO_R) && !(v.attr & ODA_SDO_W)
-                        && !(v.attr & (ODA_RPDO | ODA_TPDO)) && !v.mapped_rpdo && !v.mapped_tpdo,
-                        XNET_CO_MODEL_ERROR, where.str() + ": must be SDO read-only and unmapped");
-                require(v.allows_local_write == requirement.local_write,
-                        XNET_CO_MODEL_ERROR, where.str() + ": invalid local_write permission");
-            }
-        }
         if (drive_adapter) drive_adapter->bind(*this);
     }
     // OD_find uses binary search. Publish pointers only after all owning storage is finalized.

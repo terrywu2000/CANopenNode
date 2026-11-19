@@ -417,8 +417,15 @@ python -m unittest discover -s .\tests -p test_eds_to_json.py
 
 ### DS402 外部模型故障与超时
 
-显式启用单轴 external PP 的配置与 v1 帧布局见
-[英文配置说明](README.md#ds402-pp-configuration) 和
+显式启用单轴 external PP 的配置与专用 SI 接口见
+[英文配置说明](README.md#ds402-pp-configuration)
+模型交换已改为 `motor_drive_` 私有邮箱，不再经由 OD/batch。
+external 必须显式配置 `device_adapter`（含有效 `counts_per_revolution`）及五个超时。
+
+**迁移要求**：从模型 JSON 删除原 `0x2F00..0x2F05` 交换扩展，从宿主删除对应
+batch/OD 访问，改用 open/read/submit/heartbeat/close。命令、pending 反馈、处理确认
+及心跳时间保存在设备私有存储中，不要求或自动创建交换 OD。这些厂商索引不再保留或
+特殊处理；显式声明的同址对象只是普通设备存储，写成功不代表模型收到反馈。
 
 适配层使用完整反馈消费时刻的单调时间戳统一判断新鲜度，在核心步进之前分类启动、
 心跳、反馈和动作超时；不会再由核心另外累加运动步长而抢先产生通用故障。
@@ -459,8 +466,9 @@ direction 为 +1/-1，zero_counts 为 I32，均为初始化坐标配置，不自
 
 适配层用已有 OD 绑定处理：设备原始单位 ↔ 核心 counts ↔ 外部 SI（rad、rad/s、
 rad/s²）。不生成 OD、不覆盖 ECU 的 target/profile。可选 0x60FC/0x606B/0x606C
-存在时须为不可本地/RPDO 写入的只读 I32 输出；缺失则报告未绑定。v1 帧仍为
-56/36 字节和 counts 单位；未配置 device_adapter 的旧配置行为不变。
+存在时须为不可本地/RPDO 写入的只读 I32 输出；缺失则报告未绑定。私有 v1 类型/反馈
+编码仍保持 counts 单位和原布局，但不再作为外部 OD 传输。internal 可不配置
+device_adapter；external 缺失适配配置时初始化明确失败。
 
 unit_profile 支持 `counts`（明确声明原始 counts 单位）、`identity`（全部按未确认
 同单位直通）、`kinco_fd`（已知手册公式＋未知规则直通）。默认 Kinco 清单：
@@ -487,14 +495,22 @@ external 后端通过 `xnet_canopen_get_motor_drive_endpoint` 获取 endpoint，
 `motor_drive_` 端口。模型端头文件 [motor_drive.h](include/motor_drive.h) 不暴露 XNET/OD；
 读请求填版本/大小与 READ_ASYNC，target_step/source_cutoff 为 0。完整反馈回显源 token，
 报告实际 PCL/model 步及固定步长；提交成功只表示暂存，必须读取 processed_* 确认。
-打开端口时禁止兼容心跳/反馈本地写，普通 ECU 命令写不受影响。
+端口是唯一反馈/心跳写入通道，普通 ECU 命令写不受影响。
 
 heartbeat 只转发模型实际执行进展；重复或只改 heartbeat 序号不刷新新鲜度。
 fault_class/detail 须有明确设备故障码映射；无映射拒绝并失败关闭。模型 limit_flags
-合成有效反馈的 Statusword bit11。停止握手期间模型须可交互，stop 后 close，再释放后端；
+合成有效反馈的 Statusword bit11。停止握手期间已有端口须可交互，通用 OD/batch 不再有
+停机豁免；stop 后先让独立模型线程退出/join，再 close，最后释放后端；
 PCL 不应阻塞等待自己下一步才能产生的反馈。
 
-本轮未实现共享总线、硬件时间映射或 VeriStand signal/FIFO 调度：
+`xnet_canopen_read_sync_event` 提供每端口的 SYNC 接收观察：保留最近 64 条局部
+epoch/序号、XNET 原始 100 ns 时间戳和可选 counter。首次使用 `(0, 0)`，之后使用
+返回的 epoch/序号；无后续记录返回 NOT_FOUND，历史覆盖返回 ACCESS_ERROR，代次失效
+返回 INVALID_STATE。RX 溢出、复位/重启、SYNC COB-ID 更改及 LSS 静默会使代次失效。
+这只是接收观察，不校验 counter 连续性，也不表示控制已逐边界处理；不同端口的
+序号不能直接比较，时间戳尚未验证或映射到 PCL。
+
+每节点使用独立 NI-XNET 端口；当前尚未实现硬件时间映射或 VeriStand signal/FIFO 调度：
 READ_SCHEDULED 明确返回 UNSUPPORTED，不将 worker 次数伪装成 SYNC。cycle/target_step
 为 0；publish_time 为进程 steady clock 的秒（域 1），不等同硬件/PCL 时间。
 既有 ABI 不变，新结构大小依次为 time 16、cycle 64、step 56、request 88、view 208、
@@ -520,6 +536,15 @@ feedback 184 字节；部署前核对 LabVIEW 布局，本轮未重新生成二�
   和通信复位时加上当前节点 ID，包括 PDO5..8。节点 255 贡献零。省略时，显式 ID 保持
   现有的绝对 ID 行为。解析后的 ID 必须是有效、不受限的 11 位 ID，且不得与其他本地
   服务冲突。
+
+PDO 与 SYNC 不要求一一配对。同步 RPDO 在下一个 SYNC 应用此前缓存的最新数据；没有
+新帧时保留 OD 原值。当前 CANopenNode 将 RPDO type 0..240 按同步接收处理，不验证主站
+的发送周期。TPDO type 0 由事件触发并等待 SYNC，type 1..240 按配置的 SYNC 计数周期
+发送，254/255 为异步。默认 worker 会按序处理同批多个 SYNC，但 XNET 背压、有界缓存
+和调度仍不保证物理发送时间或硬实时。可选的内部严格 RPDO 测试计划要求选中 RPDO
+每个 SYNC 前都到达，启用时会警告；这不是 CANopen 的通用要求，不适用于稀疏发送的主站。
+此处生成的 PDO 通信和映射对象对主站为只读：须在 JSON 中配置启动值并与主站匹配，
+不支持通过 SDO 在线重配置 PDO。
 
 禁用的 PDO 在其生成的通信 COB-ID 中设置 bit 31，既不发送也不应用接收到的数据。
 空映射是有效的非活动槽位，而不是映射错误。`request_tpdo()` 会拒绝非活动槽位。
@@ -995,7 +1020,7 @@ PDO 示例的 `0x43F` 是普通的 11 位 ID，并不说明需要扩展帧。
 权限的批次写入反馈。
 
 启用 `drive_402` 后，PDS、轮廓规划、状态字和模式显示由库负责；外部模型使用 counts
-兼容帧或 `motor_drive_` SI 接口，不直接使用下表的 OD 输入/输出。设备适配层负责原始
+`motor_drive_` SI 接口，不直接使用下表的 OD 输入/输出。设备适配层负责原始
 单位和故障转换。当前 PP 绑定使用 `0x6064`，不将其别名为 `0x6063`，也未实现下表的
 其他模式或遥测；目标设备的位置语义仍需单独核对。
 

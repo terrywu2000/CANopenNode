@@ -9,13 +9,15 @@ struct Event {
     xco::Clock::time_point when;
 };
 void reset();
-void inject(uint16_t id, std::initializer_list<uint8_t> bytes, uint8_t type = nxFrameType_CAN_Data, uint8_t flags = 0);
+void inject(uint16_t id, std::initializer_list<uint8_t> bytes, uint8_t type = nxFrameType_CAN_Data,
+            uint8_t flags = 0, uint64_t timestamp = 0);
 std::vector<nxFrameCAN_t> transmitted();
 std::vector<Event> events();
 void clear_transmitted();
 size_t sessions();
 void fail_next(const std::string& operation, nxStatus_t status);
 void output_full(bool value);
+void write_hook(void (*hook)(uint32_t identifier, void* context), void* context);
 void bus_state(u32 value, nxStatus_t fault = 0);
 }
 #endif

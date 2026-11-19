@@ -61,8 +61,10 @@ public:
 class ExternalModel final : public MotorModel {
 public:
     explicit ExternalModel(uint32_t timeout_us) : timeout_us_(timeout_us) {}
-    /** Store feedback and reset its age. */
-    void post(const Feedback& feedback);
+    /** Record a newly accepted safety sample and reset its age. */
+    void refresh();
+    /** Set the independently selected sample used for normal motion. */
+    void select(const Feedback& feedback) { last_ = feedback; }
     Feedback sample(int32_t demand_position, int32_t demand_velocity, uint32_t dt_us) override;
     void set_age(uint64_t age_us) { age_us_ = age_us; }
     void advance_age(uint32_t dt_us);
@@ -131,6 +133,12 @@ public:
     bool external_model() const { return use_external_; }
     /** Post host feedback; false when the external model is not selected. */
     bool post_feedback(const Feedback& feedback);
+    /** Accept safety information without changing the normal-motion sample. */
+    bool post_safety_feedback(const Feedback& feedback);
+    /** Select a previously accepted sample without refreshing safety age. */
+    bool select_feedback(const Feedback& feedback);
+    /** Revoke the normal-motion sample; the caller must separately report a timing fault. */
+    void invalidate_selected_feedback();
     /** Set an external transport/startup fault that cannot be inferred from feedback alone. */
     void set_external_fault(bool fault);
     /** Set PP readiness and reset permission from the latest accepted model frame. */
@@ -138,6 +146,12 @@ public:
 
     /** Run one cycle: state transitions, profile update, then the model sample. */
     void step(const Inputs& in, uint32_t dt_us);
+
+    /**
+     * Process safety without accepting a normal setpoint. The caller must not
+     * advance stopping motion over the same elapsed interval again in step().
+     */
+    void process_safety(const Inputs& in, uint32_t dt_us);
 
     /** Snapshot for statusword, mode display, and host status. */
     Status status() const;
@@ -149,7 +163,7 @@ public:
 
 private:
     MotorModel& model();
-    void transition(const Inputs& in);
+    void transition(const Inputs& in, bool safety_only = false);
     void request_transition(uint8_t action, Pds target);
     void begin_fault_reaction(const Inputs& in);
     void fail_fault_reaction();
@@ -192,6 +206,8 @@ private:
     bool model_faulted() const;
     bool fault_reset_prev_ = false;
     Feedback feedback_{};
+    Feedback safety_feedback_{};
+    bool selected_feedback_valid_ = false;
 };
 
 } // namespace xco::d402
