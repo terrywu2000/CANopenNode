@@ -69,6 +69,9 @@ if(XNET_CANOPEN_BUILD_TESTS)
     target_compile_definitions(xnet_canopen_tests PRIVATE
         XNET_CO_EXAMPLE_MODEL="${CMAKE_CURRENT_SOURCE_DIR}/examples/device.json")
     add_test(NAME xnet_canopen_tests COMMAND xnet_canopen_tests)
+    add_test(NAME xnet_canopen_ds402_p0_regressions COMMAND xnet_canopen_tests --ds402-p0-regressions)
+    set_tests_properties(xnet_canopen_tests xnet_canopen_ds402_p0_regressions
+        PROPERTIES RESOURCE_LOCK xnet_canopen_app_log)
     add_executable(xnet_canopen_logging_tests tests/test_logging.cpp src/logging.cpp)
     target_compile_features(xnet_canopen_logging_tests PRIVATE cxx_std_17)
     target_include_directories(xnet_canopen_logging_tests PRIVATE

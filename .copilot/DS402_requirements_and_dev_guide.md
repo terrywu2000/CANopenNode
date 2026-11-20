@@ -78,11 +78,78 @@
 
 CANopen NMT 是底层通信层状态机，DS402 PDS 是上层电机控制状态机。NMT 状态本身不直接改变 PDS；DS402 可以读取 NMT 状态作为自己的输入，并由 DS402 决定电机控制动作、PDS 转换及相应 OD 发布（见 §6.4）。
 
-### 3.2 PDS 状态（CiA 402 标准）
+### 3.2 DS 402 (CiA 402) PDS 状态机
 
-`NOT_READY_TO_SWITCH_ON`、`SWITCH_ON_DISABLED`、`READY_TO_SWITCH_ON`、`SWITCHED_ON`、`OPERATION_ENABLED`、`QUICK_STOP_ACTIVE`、`FAULT_REACTION_ACTIVE`、`FAULT`。
+#### 3.2.1 状态转换示意图
 
-参考：`reference/canopennode-rtt/profile/cia402/common/CO_402_state.h`；EtherCAT 对应常量 `cia402appl.h:90-97`。
+图中编号为 CiA 402 转换编号；命令来自 `0x6040`（Controlword），状态由核心通过 `0x6041`（Statusword）发布。图展示协议路径，外部模型的握手和完成条件见 §3.2.3；不能把一次 Controlword 写入视为状态已经转换。
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    state "Not Ready to Switch On" as NR
+    state "Switch On Disabled" as SD
+    state "Ready to Switch On" as RS
+    state "Switched On" as SO
+    state "Operation Enabled" as OE
+    state "Quick Stop Active" as QS
+    state "Fault Reaction Active" as FR
+    state "Fault" as F
+    state "任一非故障 PDS 状态（示意入口）" as ANY
+
+    [*] --> NR: 0 上电或复位
+    NR --> SD: 1 内部初始化完成
+    SD --> RS: 2 Shutdown
+    RS --> SO: 3 Switch On
+    SO --> OE: 4 Enable Operation
+    OE --> SO: 5 Disable Operation
+    SO --> RS: 6 Shutdown
+    RS --> SD: 7 Disable Voltage / Quick Stop
+    OE --> RS: 8 Shutdown
+    OE --> SD: 9 Disable Voltage
+    SO --> SD: 10 Disable Voltage / Quick Stop
+    OE --> QS: 11 Quick Stop
+    QS --> SD: 12 Disable Voltage 或按选项完成快停
+    ANY --> FR: 13 检测到需锁存的故障
+    FR --> F: 14 故障反应完成或失败关闭
+    F --> SD: 15 Fault Reset 成功
+    QS --> OE: 16 选项允许且重新使能成功
+```
+
+- 常用命令示例（其余位为 0）：`0x0006` Shutdown、`0x0007` Switch On / Disable Operation（取决于当前状态）、`0x000F` Enable Operation、`0x0002` Quick Stop、`0x0000` Disable Voltage。由 `READY_TO_SWITCH_ON` 写 `0x000F` 可请求连续使能，但仍须先完成 Switch On，再执行 Enable Operation，不能跳过 `SWITCHED_ON`。
+- 快停路径由 `0x605A` 决定：选项 `0` 在快停动作完成后进入 `SWITCH_ON_DISABLED`；选项 `1/2` 减速完成后退出至 `SWITCH_ON_DISABLED`；选项 `5/6` 停止后保持 `QUICK_STOP_ACTIVE`。设计要求重新使能同时满足有效反馈确认快停完成、选项允许和有效 Enable Operation 命令，不能只看 bit2 恢复（FR-PDS-07）。
+- 外部模型快停必须有匹配的动作完成响应和有效的零速反馈；`0x605A` 支持 `0/1/2/5/6`，`0x605E` 支持 `0/1/2`。未配置时分别使用 `2`、`0`。
+
+#### 3.2.2 八种状态与 Statusword
+
+下表为本项目发布的状态位参考值（`0x6041 & 0x006F`），不是完整 Statusword。PP 相关位和其他状态位另按 §6.2 更新。
+
+| PDS 状态 | 状态位 | 含义 |
+|---|---|---|
+| `NOT_READY_TO_SWITCH_ON` | `0x0000` | PDS 正在初始化或自检，不接受普通使能命令。 |
+| `SWITCH_ON_DISABLED` | `0x0040` | PDS 已完成内部初始化，但尚未进入上电序列；不允许普通运动。等待 Shutdown。 |
+| `READY_TO_SWITCH_ON` | `0x0021` | Shutdown 已完成，可接受 Switch On；尚未使能运行。 |
+| `SWITCHED_ON` | `0x0023` | Switch On 已完成，但普通运动仍未获许可；等待 Enable Operation 及模型就绪确认。 |
+| `OPERATION_ENABLED` | `0x0027` | Enable Operation 已完成。仅在普通输出许可有效时执行 PP demand；不代表电机正在移动或目标已到达。 |
+| `QUICK_STOP_ACTIVE` | `0x0007` | 普通运动许可已撤销，按快停选项减速或保持停止；该状态本身不证明电机已经停稳。 |
+| `FAULT_REACTION_ACTIVE` | `0x000F` | 故障已锁存，普通运动许可已撤销；正在请求和等待故障反应。 |
+| `FAULT` | `0x0008` | 故障反应结束，或无法确认而已失败关闭；故障保持锁存，等待符合条件的主站复位。 |
+
+#### 3.2.3 外部电机驱动模型与 PDS 的对应关系
+
+模型状态是 PDS 的输入，不是独立的 CANopen 状态，也不能直接写 `0x6041`。PDS 核心结合主站命令、NMT 许可、模型反馈和动作结果决定对外状态。
+
+| 外部模型或握手情况 | PDS 状态与处理 |
+|---|---|
+| 模型未启动、初始化中，或尚无本 epoch 的有效心跳和完整反馈；未超过 `startup_timeout_us` | PDS 自身自检期间为 `NOT_READY_TO_SWITCH_ON`；PDS 自检完成后可进入 `SWITCH_ON_DISABLED`，不必等待模型初始化才发布该状态。未获得匹配的动作确认不得推进对应转换，模型未就绪不得进入 `OPERATION_ENABLED`。当前核心 `reset()` 直接置 `SWITCH_ON_DISABLED`，不能要求主站必然观测到 `0x0000`。 |
+| 模型初始化异常 | 收到有效的模型故障报告，或等待有效心跳和完整反馈超时，即进入 `FAULT_REACTION_ACTIVE`，随后进入 `FAULT`。只是暂未就绪且未超时，不等同于故障；无反馈时不自动切换到 InternalModel。 |
+| 模型初始化成功，心跳和完整反馈有效，处于待机 | 不自动使能。未收到主站命令时保持 `SWITCH_ON_DISABLED`；按 Shutdown、Switch On 及其匹配的 `DONE` 确认依次进入 `READY_TO_SWITCH_ON`、`SWITCHED_ON`。 |
+| 主站请求使能，模型正在切换到控制运行 | 满足 NMT 和模型 PP 就绪条件才发出 Enable Operation。等待期间（含 `BUSY`）保持 `SWITCHED_ON`；只有收到同 epoch、同 `action_seq` 的有效 `DONE` 才发布 `OPERATION_ENABLED`。模型开始计算、仅有心跳或上报 `BUSY` 均不能替代确认。 |
+| 模型正在控制，主站请求快停或撤销使能 | 先撤销普通输出许可，再按相应动作及完成条件发布目标 PDS 状态。外部模型异步执行期间，转换尚未提交时 `0x6041` 仍可能显示原状态；不能把该状态解读为仍允许普通运动。 |
+| 控制中检测到模型故障、心跳或反馈超时、动作 `ERROR` 或超时 | 立即撤销普通输出许可，抢占未完成的普通动作并进入 `FAULT_REACTION_ACTIVE`。匹配的 Fault Reaction `DONE` 后进入 `FAULT`；若故障反应本身 `ERROR` 或超时，也进入 `FAULT`，但明确诊断停止未确认，不伪造 `DONE` 或用陈旧反馈证明停稳。 |
+| 已进入 `FAULT` 后，模型恢复健康或重新开始报告有效数据 | PDS 保持 `FAULT`。当前故障条件清除、心跳及完整反馈有效且模型允许复位后，仍须主站在 `FAULT` 中发送新的 `0x6040` bit7 上升沿，并等待匹配的 Fault Reset `DONE`，才回到 `SWITCH_ON_DISABLED`。再次运行须重新走主站使能序列。 |
+
+启动与运行监控见 §7.5.6，异步动作与失败关闭见 §7.5.4，故障复位见 §6.3 和 §7.8。源码参考：[PDS 核心](../402/drive402.cpp)、[设备侧看门狗与反馈处理](../xnet_intergration/src/device.cpp)。
 
 ---
 
@@ -212,6 +279,8 @@ Statusword 的状态位由 PDS 当前状态决定，PP 相关位由核心根据�
 - NMT 状态机只管理底层 CANopen 通信状态；NMT 状态变化不直接调用或改写 PDS 状态，也不直接触发电机控制动作。
 - DS402 周期逻辑可以读取 NMT 状态，并据此决定自身是否接受普通控制命令、撤销输出许可、执行 disableVoltage/quickStop 等动作，以及如何更新 PDS 和 0x6041。所有电机控制行为变化必须经 DS402 状态机完成并由其发布相应 OD。
 - NMT 状态到 DS402 行为的具体策略属于 DS402 产品策略，须在 DS402 内定义并测试；NMT 重新进入 Operational 不得自动恢复 `OPERATION_ENABLED`，需要重新满足 DS402 条件并由主站发送使能命令序列。
+- worker 逐帧交付离开 Operational 的事件，不等待下一次 SYNC；即使 Stop 和 Start 同批到达，PDS 也会撤销原输出许可。返回 Operational 后必须重新写入 `0x6040`，不能沿用退出前的使能命令。
+- 外部模型停机未确认时，Stop 清理完成后返回错误；Reset Node / Reset Communication 不重建栈，也不递增完成计数。等待期间现有模型端口仍可回传停止动作结果。
 
 ---
 
@@ -924,6 +993,8 @@ ECU                 节点核心/适配           异步 CD             PCL 模�
 ### 10.4 验证命令
 
 本文档为需求文档，本身无需构建验证。后续实现时使用仓库现有构建与测试入口（以 `xnet_intergration/README.md` 与 `tests/` 为准），**不得新增构建工具**，除非任务明确要求。
+
+P0 回归已纳入默认 CTest；按 README 构建无硬件测试后，可用 `ctest --test-dir build-tests -R ds402_p0_regressions --output-on-failure` 单独运行同批 NMT Stop → Start、无模型心跳时的 Enable DONE，以及停止未确认时的 Stop、Reset Communication、Reset Node。
 
 ---
 

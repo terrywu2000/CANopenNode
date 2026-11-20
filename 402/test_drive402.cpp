@@ -477,8 +477,11 @@ static void test_safety_does_not_defer_fault_reset_edge() {
     in.controlword = 0;
     d.process_safety(in, 0);
     in.controlword = 0x80;
-    d.step(in, 0);
+    d.process_safety(in, 0);
     CHECK(d.status().action == CO_402_ACTION_FAULT_RESET);
+    const auto reset = d.status().action_seq;
+    d.step(in, 0);
+    CHECK(d.status().action == CO_402_ACTION_FAULT_RESET && d.status().action_seq == reset);
 }
 
 static void test_safety_preempts_pending_enable() {
@@ -499,8 +502,34 @@ static void test_safety_preempts_pending_enable() {
     in.action_response_seq = enabling;
     in.action_result = CO_402_ACTION_RESULT_DONE;
     d.process_safety(in, 0);
-    CHECK(d.status().action == CO_402_ACTION_QUICK_STOP
+    CHECK(d.status().action == CO_402_ACTION_DISABLE_VOLTAGE
         && d.status().action_seq != enabling && !d.status().output_allowed);
+}
+
+static void test_quick_stop_requires_valid_standstill() {
+    Drive d;
+    d.use_external_model(true);
+    CHECK(d.post_feedback(Feedback{}));
+    auto in = base_inputs();
+    enable(d, in);
+    CHECK(d.status().output_allowed);
+    in.quick_stop_option = 6;
+    in.controlword = 0x0b;
+    d.step(in, 0);
+    in.action_response_seq = d.status().action_seq;
+    in.action_result = CO_402_ACTION_RESULT_DONE;
+    CHECK(d.post_feedback(Feedback{0, 10, false}));
+    d.step(in, 0);
+    CHECK(d.status().action_pending && !d.status().output_allowed);
+    CHECK(d.post_feedback(Feedback{0, 0, false, false, false}));
+    d.step(in, 0);
+    CHECK(d.status().action_pending);
+    CHECK(d.post_feedback(Feedback{0, 0, false}));
+    d.step(in, 0);
+    CHECK(d.status().pds == Pds::quick_stop_active && !d.status().action_pending);
+    in.controlword = cw_enable;
+    d.step(in, 0);
+    CHECK(d.status().action == CO_402_ACTION_ENABLE_OPERATION);
 }
 
 static void test_selected_feedback_is_independent_of_safety() {
@@ -573,6 +602,7 @@ int main() {
     test_safety_ages_feedback_without_motion_boundary();
     test_safety_does_not_defer_fault_reset_edge();
     test_safety_preempts_pending_enable();
+    test_quick_stop_requires_valid_standstill();
     test_selected_feedback_is_independent_of_safety();
     if (failures) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);

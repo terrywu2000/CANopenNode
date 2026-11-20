@@ -583,7 +583,7 @@ void xnet_canopen_device::receive(SyncBoundaryHandler boundary, void* context) {
                 }
             }
             // Drain general-protocol mailboxes without advancing timers again.
-            auto reset = CO_process(co, false, 0, nullptr);
+            auto reset = process_network(0);
             if (reset != CO_RESET_NOT) { reset_stack(reset == CO_RESET_APP); return; }
             if (sync_execution && CO_NMT_getInternalState(co->NMT) != CO_NMT_OPERATIONAL) {
                 sync_execution->test_rpdo_seen = 0;

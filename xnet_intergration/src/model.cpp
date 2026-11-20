@@ -483,6 +483,13 @@ void Model::load(const Json& root) {
         if (drive_has_error_code) required(0x603f, "UNSIGNED16", 2, false, false, false);
         required(0x6040, "UNSIGNED16", 2, true, true, false);
         required(0x6041, "UNSIGNED16", 2, false, false, true);
+        for (uint16_t index : {0x605a, 0x605e}) {
+            if (!has_object(index)) continue;
+            auto& v = required(index, "INTEGER16", 2, (value(index, 0).attr & ODA_SDO_W) != 0, true, true);
+            int16_t option = 0;
+            std::memcpy(&option, v.data(), sizeof(option));
+            require(d402::option_supported(index, option), XNET_CO_MODEL_ERROR, "unsupported DS402 stop option");
+        }
         auto& mode = required(0x6060, "INTEGER8", 1, true, false, false);
         required(0x6061, "INTEGER8", 1, false, false, false);
         required(0x6064, "INTEGER32", 4, false, false, true);

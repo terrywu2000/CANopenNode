@@ -241,7 +241,7 @@ void faults(unsigned scenario) {
         wait_for([&] { return (device.read(0x6041, 2) & 0x6f) == 0x40; });
         CHECK(device.read(0x603f, 2) == 0);
     }
-    CHECK(simulator.stop());
+    CHECK(simulator.stop() == (scenario != 1));
 }
 
 void missing_feedback_during_teardown(bool reset) {
@@ -265,13 +265,14 @@ void missing_feedback_during_teardown(bool reset) {
         wait_for([&] {
             xnet_canopen_status_t status{};
             CHECK(xnet_canopen_get_status(device.handle, &status) == XNET_CO_OK);
-            return status.reset_communication_count == 1;
+            CHECK(status.reset_communication_count == 0);
+            return status.runtime_state == XNET_CO_RUNTIME_FAILED;
         });
     }
-    CHECK(simulator.stop());
+    CHECK(!simulator.stop());
     xnet_canopen_status_t status{};
     CHECK(xnet_canopen_get_status(device.handle, &status) == XNET_CO_OK);
-    CHECK(status.runtime_state == XNET_CO_RUNTIME_STOPPED);
+    CHECK(status.runtime_state == (reset ? XNET_CO_RUNTIME_FAILED : XNET_CO_RUNTIME_STOPPED));
     int32_t code = 0;
     uint32_t required = 0;
     char diagnostic[2048]{};
