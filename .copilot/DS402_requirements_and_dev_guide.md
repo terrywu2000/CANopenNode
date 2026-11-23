@@ -141,7 +141,7 @@ stateDiagram-v2
 
 | 外部模型或握手情况 | PDS 状态与处理 |
 |---|---|
-| 模型未启动、初始化中，或尚无本 epoch 的有效心跳和完整反馈；未超过 `startup_timeout_us` | PDS 自身自检期间为 `NOT_READY_TO_SWITCH_ON`；PDS 自检完成后可进入 `SWITCH_ON_DISABLED`，不必等待模型初始化才发布该状态。未获得匹配的动作确认不得推进对应转换，模型未就绪不得进入 `OPERATION_ENABLED`。当前核心 `reset()` 直接置 `SWITCH_ON_DISABLED`，不能要求主站必然观测到 `0x0000`。 |
+| 模型未启动、初始化中，或尚无本 epoch 的有效心跳和完整反馈；未超过 `startup_timeout_us` | PDS 本地初始化期间为 `NOT_READY_TO_SWITCH_ON`；本地初始化完成后自动进入 `SWITCH_ON_DISABLED`，不等待模型就绪。未获得匹配的动作确认不得推进对应转换，模型未就绪不得进入 `OPERATION_ENABLED`。 |
 | 模型初始化异常 | 收到有效的模型故障报告，或等待有效心跳和完整反馈超时，即进入 `FAULT_REACTION_ACTIVE`，随后进入 `FAULT`。只是暂未就绪且未超时，不等同于故障；无反馈时不自动切换到 InternalModel。 |
 | 模型初始化成功，心跳和完整反馈有效，处于待机 | 不自动使能。未收到主站命令时保持 `SWITCH_ON_DISABLED`；按 Shutdown、Switch On 及其匹配的 `DONE` 确认依次进入 `READY_TO_SWITCH_ON`、`SWITCHED_ON`。 |
 | 主站请求使能，模型正在切换到控制运行 | 满足 NMT 和模型 PP 就绪条件才发出 Enable Operation。等待期间（含 `BUSY`）保持 `SWITCHED_ON`；只有收到同 epoch、同 `action_seq` 的有效 `DONE` 才发布 `OPERATION_ENABLED`。模型开始计算、仅有心跳或上报 `BUSY` 均不能替代确认。 |
@@ -177,7 +177,7 @@ JSON 是 OD 与 PDO 配置的唯一运行时来源，初始化阶段不根据 `d
 |---|---|---|
 | FR-PDS-01 | 按 CiA 402 状态转换表实现 PDS，普通转换由 Controlword 发起，内部就绪、故障及驱动完成条件由核心处理 | 单元测试覆盖全部合法转换（至少 1–15 号转换）、异步完成及非法转换忽略 |
 | FR-PDS-02 | Statusword 由 PDS 状态派生，bit0-3、5、6 与状态一一对应 | 每个状态下 Statusword 的状态掩码 `0x006F` 与参考值一致（见 `cia402appl.h:90-97`） |
-| FR-PDS-03 | 上电后必须处于 `NOT_READY_TO_SWITCH_ON`，经内部自检后自动进入 `SWITCH_ON_DISABLED` | 上电后 Statusword 状态位为 0x0040 |
+| FR-PDS-03 | 冷启动、Stop → Start 和成功的 NMT Reset 均从 `NOT_READY_TO_SWITCH_ON` 开始，OD 绑定后发布初始 `0x6041/0x6061`。本地初始化完成后由监督周期自动转换到 `SWITCH_ON_DISABLED`，不依赖 Controlword、NMT Operational、SYNC 或外部模型就绪。 | 在受控周期验证 `0x6041 & 0x006F` 依次为 `0x0000`、`0x0040`，且转换 1 不同时执行 Shutdown。Boot-up 帧不是 Statusword；主站第一次 SDO 可已读到 `0x0040`，不要求用 TPDO 捕获瞬态。 |
 | FR-PDS-04 | Controlword 0x000F 视为 Switch On + Enable Operation 的单条命令，但仍按状态逐步处理，不得跳过 `SWITCHED_ON` 的驱动回调 | 由 `READY_TO_SWITCH_ON` 直接写 0x000F，回调顺序为 switchOn → enableOperation |
 | FR-PDS-05 | 驱动动作必须非阻塞，返回 BUSY / DONE / ERROR，核心据此推进 | 回调 BUSY 时状态保持，DONE 后提交新状态 |
 | FR-PDS-06 | Shutdown、Disable Voltage、Quick Stop 必须按 CiA 402 规定的优先级生效 | Quick Stop 可抢占 BUSY 的 enableOperation；Disable Voltage 可抢占任何 BUSY |

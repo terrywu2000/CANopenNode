@@ -549,6 +549,7 @@ struct xnet_canopen_device {
     void initialized() const;
     void load_persistent();
     void setup_stack();
+    void publish_drive_status(const xco::d402::Status& status);
     void reset_stack(bool reset_all_objects);
     void start_test_rpdo_plan();
     void start_test_timing_provider();

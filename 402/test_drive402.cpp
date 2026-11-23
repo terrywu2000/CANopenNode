@@ -51,6 +51,8 @@ void run(Drive& d, Inputs in, int cycles, uint32_t dt_us = 1000) {
 
 /** Drive from switch-on disabled to operation enabled with the given mode. */
 void enable(Drive& d, Inputs& in) {
+    d.complete_local_initialization();
+    d.process_safety(in, 0);
     in.controlword = cw_shutdown;
     run(d, in, 1);
     in.controlword = cw_switch_on;
@@ -64,6 +66,14 @@ void enable(Drive& d, Inputs& in) {
 static void test_pds_path() {
     Drive d;
     Inputs in = base_inputs();
+    in.controlword = cw_shutdown;
+    in.nmt_operational = false;
+    d.step(in, 0);
+    CHECK((d.status().statusword & 0x006f) == 0x0000);
+    CHECK(d.status().mode_display == 0 && !d.status().output_allowed);
+    d.complete_local_initialization();
+    in.nmt_operational = true;
+    d.process_safety(in, 0);
     CHECK(d.status().pds == Pds::switch_on_disabled);
     CHECK(d.status().statusword == 0x0240);
     enable(d, in);
@@ -73,6 +83,13 @@ static void test_pds_path() {
     in.controlword = 0x00; // disable voltage
     run(d, in, 1);
     CHECK(d.status().pds == Pds::switch_on_disabled);
+    d.reset();
+    d.process_safety(in, 0);
+    CHECK((d.status().statusword & 0x006f) == 0x0000);
+    d.complete_local_initialization();
+    in.nmt_operational = false;
+    d.process_safety(in, 0);
+    CHECK((d.status().statusword & 0x006f) == 0x0040);
 }
 
 static void test_pp_profile_reaches_target() {
@@ -185,6 +202,8 @@ static void test_external_action_acknowledgement_is_matched() {
     d.set_external_permissions(true, true);
     CHECK(d.post_feedback(Feedback{0, 0, false}));
     Inputs in = base_inputs();
+    d.complete_local_initialization();
+    d.process_safety(in, 0);
     in.controlword = cw_shutdown;
     d.step(in, 1000);
     auto status = d.status();
@@ -339,6 +358,8 @@ static void test_action_timeout_takes_priority_over_done() {
     d.use_external_model(true);
     CHECK(d.post_feedback(Feedback{0, 0, false}));
     Inputs in = base_inputs();
+    d.complete_local_initialization();
+    d.process_safety(in, 0);
     in.controlword = cw_shutdown;
     d.step(in, 0);
     const auto seq = d.status().action_seq;
@@ -378,6 +399,7 @@ static void test_safety_without_motion_boundary() {
     d.set_external_permissions(true, true);
     CHECK(d.post_feedback(Feedback{0, 0, false}));
     Inputs in = base_inputs();
+    d.complete_local_initialization();
     in.controlword = cw_shutdown;
     d.process_safety(in, 1000);
     CHECK(!d.status().action_pending && d.status().pds == Pds::switch_on_disabled);
@@ -490,6 +512,8 @@ static void test_safety_preempts_pending_enable() {
     d.set_external_permissions(true, true);
     CHECK(d.post_feedback(Feedback{0, 0, false}));
     Inputs in = base_inputs();
+    d.complete_local_initialization();
+    d.process_safety(in, 0);
     in.controlword = cw_shutdown;
     run(d, in, 1, 0);
     in.controlword = cw_switch_on;

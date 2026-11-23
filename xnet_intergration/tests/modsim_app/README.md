@@ -35,6 +35,14 @@ to that JSON. Persistence is never deleted; saved LSS settings can override node
 ID and bitrate. Omitting `--motor` uses the defaults in [motor.json](motor.json).
 SIGINT/SIGTERM or the optional positive duration request orderly shutdown.
 
+When adapting an EDS-derived model for external PP simulation, set the initial
+`0x6060` to `1` and use positive PP profile rates (`0x6081`, `0x6083`, `0x6084`).
+Keep drive-owned outputs (`0x603F`, `0x6041`, `0x6061`, `0x6064`, `0x606C`,
+`0x606B`, `0x60FC`, when present) SDO-readable, with `local_write` omitted or
+`false` and no RPDO mappings. An EDS conversion may set `local_write: true`
+even for SDO-read-only objects; remove it from these outputs in the simulator
+model, not from the generic EDS converter.
+
 ## Model exchange and scheduling
 
 The example [device.json](device.json) explicitly selects external, single-axis PP.

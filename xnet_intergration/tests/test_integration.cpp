@@ -609,7 +609,9 @@ void motor_drive_si_exchange() {
     const auto old_token = view.token;
     {
         std::lock_guard<std::recursive_mutex> lock(fixture.device->mutex);
-        fixture.device->drive_402->reset(); fixture.device->start_drive_epoch();
+        fixture.device->drive_402->reset();
+        fixture.device->start_drive_epoch();
+        fixture.device->drive_402->complete_local_initialization();
     }
     tick();
     CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK && view.token.epoch > old_token.epoch);
@@ -1102,6 +1104,78 @@ void drive_402_watchdog_deadlines() {
         submit(command(), CO_402_ACTION_RESULT_DONE);
         CHECK(scalar(0x603f) == 0);
     }
+}
+
+void drive_402_startup_status_publication() {
+    Fixture f;
+    auto config = drive_402_model();
+    config["objects"][2]["value"] = 0x0027;
+    config["objects"][4]["value"] = 1;
+    f.model(config);
+    CHECK(f.initialize() == XNET_CO_OK);
+    const auto read_od = [&](uint16_t index, auto expected) {
+        decltype(expected) value{};
+        uint32_t size = 0;
+        const auto rc = xnet_canopen_read_od(f.device, index, 0,
+            reinterpret_cast<uint8_t*>(&value), sizeof(value), &size);
+        CHECK(rc == XNET_CO_OK && size == sizeof(value) && value == expected);
+    };
+    const auto check_startup = [&] {
+        auto status = f.device->drive_402->status();
+        CHECK(status.pds == xco::d402::Pds::not_ready_to_switch_on && !status.output_allowed);
+        read_od(0x6041, status.statusword);
+        read_od(0x6061, int8_t{0});
+        f.device->process_drive_402(0, false, true);
+        status = f.device->drive_402->status();
+        CHECK((status.statusword & 0x006f) == 0x0040 && !status.output_allowed);
+        read_od(0x6041, status.statusword);
+    };
+    {
+        // Hold the worker at its entry lock; step explicitly rather than racing the startup snapshot.
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        check_startup();
+        CHECK(xnet_canopen_start(f.device) == XNET_CO_OK);
+        check_startup();
+        f.device->process_drive_402(0);
+        read_od(0x6061, int8_t{1});
+    }
+    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        CHECK(xnet_canopen_start(f.device) == XNET_CO_OK);
+        check_startup();
+        for (bool reset_node : {false, true}) {
+            f.device->process_drive_402(0);
+            read_od(0x6061, int8_t{1});
+            const int32_t target = 123;
+            std::memcpy(f.device->model->value(0x607a, 0).data(), &target, sizeof(target));
+            const auto before = f.status();
+
+            std::unique_lock<std::recursive_mutex> worker_lock(f.device->mutex);
+            f.device->worker_lock = &worker_lock;
+            try {
+                fake::inject(0, {static_cast<uint8_t>(reset_node ? 0x81 : 0x82), 10});
+                f.device->receive();
+            } catch (...) {
+                f.device->worker_lock = nullptr;
+                throw;
+            }
+            f.device->worker_lock = nullptr;
+            const auto after = f.status();
+            CHECK(after.reset_node_count == before.reset_node_count + (reset_node ? 1U : 0U));
+            CHECK(after.reset_communication_count == before.reset_communication_count + (reset_node ? 0U : 1U));
+            read_od(0x607a, reset_node ? int32_t{0} : target);
+            check_startup();
+        }
+        fake::clear_transmitted();
+    }
+    wait_for([&] { return f.status().nmt_state == CO_NMT_PRE_OPERATIONAL; });
+    wait_for([] {
+        for (const auto& frame : fake::transmitted())
+            if (frame.Identifier == 0x70a && frame.PayloadLength == 1 && frame.Payload[0] == 0) return true;
+        return false;
+    });
+    CHECK((sdo_upload(0x6041) & 0x006f) == 0x0040);
 }
 
 void drive_402_missing_model_startup() {
@@ -5479,6 +5553,7 @@ int main(int argc, char** argv) {
         {"DS402 PP integration", drive_402_integration},
         {"DS402 external exchange", drive_402_external_exchange},
         {"DS402 watchdog deadlines", drive_402_watchdog_deadlines}, {"NODE_ID offsets", node_id_offsets},
+        {"DS402 startup status publication", drive_402_startup_status_publication},
         {"DS402 missing model startup", drive_402_missing_model_startup},
         {"adapter session configuration", adapter_session_configuration},
         {"CAN termination configuration", can_termination_configuration},

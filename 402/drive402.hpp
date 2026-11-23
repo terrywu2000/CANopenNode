@@ -162,8 +162,10 @@ public:
     /** Snapshot for statusword, mode display, and host status. */
     Status status() const;
 
-    /** Return to switch-on-disabled and zero the profile. */
+    /** Re-enter initialization and clear the previous profile and permissions. */
     void reset();
+    /** Allow the next supervisor cycle to complete local initialization. */
+    void complete_local_initialization() { local_initialization_complete_ = true; }
 
     static bool mode_supported(int8_t mode);
 
@@ -182,7 +184,8 @@ private:
     ExternalModel external_;
     bool use_external_ = false;
 
-    Pds pds_ = Pds::switch_on_disabled;
+    Pds pds_ = Pds::not_ready_to_switch_on;
+    bool local_initialization_complete_ = false;
     int8_t mode_display_ = 0;
     int8_t previous_mode_ = 0;
 
