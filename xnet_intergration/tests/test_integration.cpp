@@ -1,4 +1,5 @@
 #include "fake_xnet.hpp"
+#include "co_device.h"
 #include "can_state.hpp"
 #include "logging_config.h"
 #include "timed_history.hpp"
@@ -425,6 +426,332 @@ xco::Json adapted_drive_model(const char* profile = "kinco_fd") {
     return model;
 }
 
+void system_queries() {
+    Fixture f;
+    xnet_canopen_system_status_v1 status{};
+    xnet_canopen_capabilities_v1 caps{};
+    xnet_canopen_diagnostic_v1 diag{};
+    CHECK(xnet_canopen_get_system_status_v1(f.device, &status, sizeof(status)) == XNET_CO_OK);
+    CHECK(status.abi_version == 1 && status.struct_size == sizeof(status));
+    CHECK(status.communication.runtime_state == XNET_CO_RUNTIME_UNINITIALIZED && !status.drive_valid);
+    caps.drive_model = 123;
+    CHECK(xnet_canopen_get_capabilities_v1(f.device, &caps, sizeof(caps)) == XNET_CO_INVALID_STATE);
+    CHECK(caps.drive_model == 123);
+    CHECK(xnet_canopen_get_diagnostic_v1(f.device, &diag, sizeof(diag)) == XNET_CO_OK);
+    CHECK(diag.source_domain == XNET_CO_DIAG_XNET && diag.source_code == XNET_CO_INVALID_STATE);
+    const auto previous = diag;
+    CHECK(xnet_canopen_get_diagnostic_v1(f.device, &diag, sizeof(diag) - 1) == XNET_CO_BUFFER_TOO_SMALL);
+    CHECK(std::memcmp(&previous, &diag, sizeof(diag)) == 0);
+    CHECK(xnet_canopen_clear_error(f.device) == XNET_CO_OK);
+    CHECK(xnet_canopen_get_diagnostic_v1(f.device, &diag, sizeof(diag)) == XNET_CO_OK);
+    CHECK(diag.source_domain == XNET_CO_DIAG_NONE && diag.source_code == 0 && diag.message_required == 1);
+
+    CHECK(f.initialize() == XNET_CO_OK);
+    CHECK(xnet_canopen_get_capabilities_v1(f.device, &caps, sizeof(caps)) == XNET_CO_OK);
+    CHECK(caps.abi_version == 1 && caps.struct_size == sizeof(caps));
+    CHECK(caps.drive_model == XNET_CO_DRIVE_NONE && caps.implemented_modes == 0);
+    CHECK((caps.capabilities & XNET_CO_CAP_OD_BATCH) && !(caps.capabilities & XNET_CO_CAP_MOTOR_ASYNC));
+    const auto saved_caps = caps;
+    CHECK(xnet_canopen_get_capabilities_v1(f.device, &caps, sizeof(caps) - 1) == XNET_CO_BUFFER_TOO_SMALL);
+    CHECK(std::memcmp(&saved_caps, &caps, sizeof(caps)) == 0);
+    status.drive_valid = 123;
+    CHECK(xnet_canopen_get_system_status_v1(f.device, &status, sizeof(status) - 1) == XNET_CO_BUFFER_TOO_SMALL);
+    CHECK(status.drive_valid == 123);
+    CHECK(xnet_canopen_get_system_status_v1(f.device, &status, sizeof(status)) == XNET_CO_OK);
+    const auto legacy = f.status();
+    CHECK(std::memcmp(&status.communication, &legacy, sizeof(legacy)) == 0 && !status.drive_valid);
+    CHECK(xnet_canopen_uninitialize(f.device) == XNET_CO_OK);
+
+    auto internal = drive_402_model();
+    internal["objects"][11]["value"] = 3; // The source device advertises more than PP.
+    f.model(internal);
+    CHECK(f.initialize() == XNET_CO_OK);
+    CHECK(xnet_canopen_get_capabilities_v1(f.device, &caps, sizeof(caps)) == XNET_CO_OK);
+    CHECK(caps.drive_model == XNET_CO_DRIVE_INTERNAL && caps.implemented_modes == XNET_CO_MODE_PROFILE_POSITION);
+    CHECK(!(caps.capabilities & (XNET_CO_CAP_MOTOR_ASYNC | XNET_CO_CAP_MOTOR_SCHEDULED)));
+    CHECK(xnet_canopen_get_system_status_v1(f.device, &status, sizeof(status)) == XNET_CO_OK);
+    CHECK(status.drive_valid && !(status.drive_flags & XNET_CO_DRIVE_STATUS_PORT_OPEN));
+    CHECK(status.pds_state == XNET_CO_PDS_NOT_READY);
+    CHECK(xnet_canopen_uninitialize(f.device) == XNET_CO_OK);
+
+    f.model(adapted_drive_model());
+    CHECK(f.initialize() == XNET_CO_OK);
+    CHECK(xnet_canopen_get_capabilities_v1(f.device, &caps, sizeof(caps)) == XNET_CO_OK);
+    CHECK(caps.drive_model == XNET_CO_DRIVE_EXTERNAL && caps.implemented_modes == XNET_CO_MODE_PROFILE_POSITION);
+    CHECK((caps.capabilities & (XNET_CO_CAP_MOTOR_ASYNC | XNET_CO_CAP_MOTOR_BOOTSTRAP | XNET_CO_CAP_MOTOR_SAFETY))
+        == (XNET_CO_CAP_MOTOR_ASYNC | XNET_CO_CAP_MOTOR_BOOTSTRAP | XNET_CO_CAP_MOTOR_SAFETY));
+    CHECK(!(caps.capabilities & XNET_CO_CAP_MOTOR_SCHEDULED));
+    motor_drive_endpoint_handle endpoint = nullptr;
+    motor_drive_port_handle port = nullptr, duplicate = nullptr;
+    CHECK(xnet_canopen_get_motor_drive_endpoint(f.device, &endpoint) == XNET_CO_OK);
+    CHECK(motor_drive_open_v1(endpoint, &port) == MOTOR_DRIVE_OK);
+    CHECK(xnet_canopen_get_system_status_v1(f.device, &status, sizeof(status)) == XNET_CO_OK);
+    CHECK(status.drive_valid && (status.drive_flags & XNET_CO_DRIVE_STATUS_PORT_OPEN));
+    CHECK(motor_drive_open_v1(endpoint, &duplicate) == MOTOR_DRIVE_BUSY);
+    CHECK(xnet_canopen_get_diagnostic_v1(f.device, &diag, sizeof(diag)) == XNET_CO_OK);
+    CHECK(diag.source_domain == XNET_CO_DIAG_MOTOR && diag.source_code == MOTOR_DRIVE_BUSY);
+    CHECK(diag.backend_code == XNET_CO_ACCESS_ERROR && std::strstr(diag.message, "already has a writer"));
+    int32_t legacy_code = 0; uint32_t required = 0; char message[2048]{};
+    CHECK(xnet_canopen_get_last_error(f.device, &legacy_code, message, sizeof(message), &required) == XNET_CO_OK);
+    CHECK(legacy_code == diag.backend_code && required == diag.message_required && std::strcmp(message, diag.message) == 0);
+    motor_drive_view_v1 view{};
+    CHECK(motor_drive_read_v1(port, nullptr, &view, sizeof(view)) == MOTOR_DRIVE_INVALID_ARGUMENT);
+    CHECK(xnet_canopen_get_diagnostic_v1(f.device, &diag, sizeof(diag)) == XNET_CO_OK);
+    CHECK(diag.source_domain == XNET_CO_DIAG_MOTOR && diag.source_code == MOTOR_DRIVE_INVALID_ARGUMENT
+        && diag.backend_code == XNET_CO_INVALID_ARGUMENT);
+    motor_drive_read_request_v1 request{};
+    request.abi_version = MOTOR_DRIVE_ABI_VERSION;
+    request.struct_size = sizeof(request);
+    request.flags = MOTOR_DRIVE_READ_SCHEDULED;
+    CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_UNSUPPORTED);
+    CHECK(xnet_canopen_get_diagnostic_v1(f.device, &diag, sizeof(diag)) == XNET_CO_OK);
+    CHECK(diag.source_domain == XNET_CO_DIAG_MOTOR && diag.source_code == MOTOR_DRIVE_UNSUPPORTED
+        && diag.backend_code == XNET_CO_ACCESS_ERROR);
+    CHECK(motor_drive_close_v1(port) == MOTOR_DRIVE_OK);
+    CHECK(xnet_canopen_get_system_status_v1(f.device, &status, sizeof(status)) == XNET_CO_OK);
+    CHECK(!(status.drive_flags & XNET_CO_DRIVE_STATUS_PORT_OPEN));
+    CHECK(xnet_canopen_uninitialize(f.device) == XNET_CO_OK);
+    CHECK(xnet_canopen_get_system_status_v1(f.device, &status, sizeof(status)) == XNET_CO_OK && !status.drive_valid);
+}
+
+void facade_operations() {
+    Fixture f;
+    co_device_handle raw = nullptr;
+    CHECK(co_device_create(&raw) == XNET_CO_OK);
+    std::unique_ptr<co_device, decltype(&co_device_destroy)> device(raw, co_device_destroy);
+    CHECK(co_device_open_motor_port(device.get(), nullptr) == XNET_CO_INVALID_ARGUMENT);
+    motor_drive_port_handle port = nullptr;
+    CHECK(co_device_open_motor_port(device.get(), &port) == XNET_CO_INVALID_STATE && !port);
+    CHECK(co_device_initialize(device.get(), "CAN1", f.model_path.string().c_str(), f.saved_path.string().c_str())
+        == XNET_CO_OK);
+    xnet_canopen_capabilities_v1 caps{};
+    CHECK(co_device_get_capabilities_v1(device.get(), &caps, sizeof(caps)) == XNET_CO_OK);
+    CHECK(caps.drive_model == XNET_CO_DRIVE_NONE);
+    xnet_canopen_sync_event_t sync_event{};
+    xnet_canopen_timing_event_v1 timing_event{};
+    CHECK(co_device_read_sync_event(device.get(), 0, 0, &sync_event) == XNET_CO_NOT_FOUND);
+    CHECK(co_device_read_timing_event_v1(device.get(), 0, &timing_event, sizeof(timing_event)) == XNET_CO_NOT_FOUND);
+    CHECK(co_device_open_motor_port(device.get(), &port) == XNET_CO_INVALID_STATE && !port);
+    xnet_canopen_diagnostic_v1 diag{};
+    CHECK(co_device_get_diagnostic_v1(device.get(), &diag, sizeof(diag)) == XNET_CO_OK);
+    CHECK(diag.source_domain == XNET_CO_DIAG_MOTOR && diag.source_code == MOTOR_DRIVE_INVALID_STATE);
+    CHECK(co_device_clear_diagnostic(device.get()) == XNET_CO_OK);
+    CHECK(co_device_get_diagnostic_v1(device.get(), &diag, sizeof(diag)) == XNET_CO_OK && diag.source_domain == XNET_CO_DIAG_NONE);
+
+    uint16_t index = 0x2000;
+    uint8_t subindex = 0;
+    uint32_t type = 0, size = 0, total = 0, batch = 0;
+    CHECK(co_device_bind_batch(device.get(), &index, &subindex, 1, &type, &size, &total, &batch) == XNET_CO_OK);
+    CHECK(type == XNET_CO_TYPE_UNSIGNED16 && size == 2 && total == 2);
+    uint8_t value[] = {0x34, 0x12}, output[2]{};
+    int32_t entry = 0;
+    CHECK(co_device_write_batch(device.get(), batch, value, sizeof(value), &entry, 1) == XNET_CO_OK && entry == XNET_CO_OK);
+    CHECK(co_device_read_batch(device.get(), batch, output, sizeof(output), &entry, 1) == XNET_CO_OK && entry == XNET_CO_OK);
+    CHECK(std::memcmp(value, output, sizeof(value)) == 0);
+    uint32_t value_size = 0;
+    CHECK(co_device_read_od(device.get(), index, 0, output, sizeof(output), &value_size) == XNET_CO_OK && value_size == 2);
+    value[0] = 0x56;
+    CHECK(co_device_write_od(device.get(), index, 0, value, sizeof(value)) == XNET_CO_OK);
+    CHECK(co_device_request_tpdo(device.get(), 1) == XNET_CO_INVALID_STATE);
+    CHECK(co_device_set_fault(device.get(), 0x40, 0x1000, 0, 1) == XNET_CO_INVALID_STATE);
+    CHECK(co_device_start(device.get()) == XNET_CO_OK);
+    xnet_canopen_system_status_v1 status{};
+    CHECK(co_device_get_status_v1(device.get(), &status, sizeof(status)) == XNET_CO_OK);
+    CHECK(status.communication.runtime_state == XNET_CO_RUNTIME_RUNNING);
+    CHECK(co_device_stop(device.get()) == XNET_CO_OK);
+    fake::fail_next("clear", nxErrInternalError);
+    CHECK(co_device_destroy(device.get()) == XNET_CO_XNET_ERROR);
+    CHECK(co_device_get_diagnostic_v1(device.get(), &diag, sizeof(diag)) == XNET_CO_OK);
+    CHECK(diag.backend_code == XNET_CO_XNET_ERROR);
+    CHECK(co_device_uninitialize(device.get()) == XNET_CO_OK);
+
+    f.model(adapted_drive_model());
+    CHECK(co_device_initialize(device.get(), "CAN1", f.model_path.string().c_str(), f.saved_path.string().c_str())
+        == XNET_CO_OK);
+    CHECK(co_device_get_capabilities_v1(device.get(), &caps, sizeof(caps)) == XNET_CO_OK
+        && caps.drive_model == XNET_CO_DRIVE_EXTERNAL);
+    CHECK(co_device_open_motor_port(device.get(), &port) == XNET_CO_OK);
+    std::unique_ptr<motor_drive_port, decltype(&motor_drive_close_v1)> owned(port, motor_drive_close_v1);
+    motor_drive_port_handle duplicate = port;
+    CHECK(co_device_open_motor_port(device.get(), &duplicate) == CO_DEVICE_BUSY && !duplicate);
+    CHECK(co_device_get_diagnostic_v1(device.get(), &diag, sizeof(diag)) == XNET_CO_OK);
+    CHECK(diag.source_domain == XNET_CO_DIAG_MOTOR && diag.source_code == MOTOR_DRIVE_BUSY);
+    uint32_t report_size = 0;
+    CHECK(co_device_get_drive_unit_report(device.get(), nullptr, 0, &report_size) == XNET_CO_BUFFER_TOO_SMALL);
+    CHECK(report_size > 1);
+    owned.reset();
+    std::atomic<bool> go{false};
+    motor_drive_port_handle racing_port = nullptr;
+    int32_t open_result = 0, uninitialize_result = 0;
+    std::thread opener([&] {
+        while (!go.load()) std::this_thread::yield();
+        open_result = co_device_open_motor_port(device.get(), &racing_port);
+    });
+    std::thread releaser([&] {
+        while (!go.load()) std::this_thread::yield();
+        uninitialize_result = co_device_uninitialize(device.get());
+    });
+    go = true;
+    opener.join();
+    releaser.join();
+    CHECK(uninitialize_result == XNET_CO_OK);
+    CHECK(open_result == XNET_CO_OK || open_result == XNET_CO_INVALID_STATE);
+    if (racing_port) {
+        motor_drive_read_request_v1 request{};
+        motor_drive_view_v1 view{};
+        CHECK(open_result == XNET_CO_OK);
+        CHECK(motor_drive_read_v1(racing_port, &request, &view, sizeof(view)) == MOTOR_DRIVE_INVALID_STATE);
+        CHECK(motor_drive_close_v1(racing_port) == MOTOR_DRIVE_OK);
+    } else {
+        CHECK(open_result == XNET_CO_INVALID_STATE);
+    }
+    CHECK(co_device_destroy(device.release()) == XNET_CO_OK);
+}
+
+void legacy_motor_port_bridge() {
+    Fixture f;
+    motor_drive_port_handle port = nullptr;
+    CHECK(co_device_open_motor_port_from_xnet(f.device, nullptr) == XNET_CO_INVALID_ARGUMENT);
+    CHECK(co_device_open_motor_port_from_xnet(f.device, &port) == XNET_CO_INVALID_STATE && !port);
+    CHECK(f.initialize() == XNET_CO_OK);
+    CHECK(co_device_open_motor_port_from_xnet(f.device, &port) == XNET_CO_INVALID_STATE && !port);
+    CHECK(xnet_canopen_uninitialize(f.device) == XNET_CO_OK);
+    f.model(adapted_drive_model());
+    CHECK(f.initialize() == XNET_CO_OK);
+    CHECK(co_device_open_motor_port_from_xnet(f.device, &port) == XNET_CO_OK);
+    motor_drive_port_handle duplicate = port;
+    CHECK(co_device_open_motor_port_from_xnet(f.device, &duplicate) == CO_DEVICE_BUSY && !duplicate);
+    CHECK(motor_drive_close_v1(port) == MOTOR_DRIVE_OK);
+
+    std::atomic<bool> go{false};
+    motor_drive_port_handle racing_port = nullptr;
+    int32_t open_result = 0, uninitialize_result = 0;
+    std::thread opener([&] {
+        while (!go.load()) std::this_thread::yield();
+        open_result = co_device_open_motor_port_from_xnet(f.device, &racing_port);
+    });
+    std::thread releaser([&] {
+        while (!go.load()) std::this_thread::yield();
+        uninitialize_result = xnet_canopen_uninitialize(f.device);
+    });
+    go = true;
+    opener.join();
+    releaser.join();
+    CHECK(uninitialize_result == XNET_CO_OK);
+    CHECK(open_result == XNET_CO_OK || open_result == XNET_CO_INVALID_STATE);
+    if (racing_port) {
+        motor_drive_read_request_v1 request{};
+        motor_drive_view_v1 view{};
+        CHECK(open_result == XNET_CO_OK);
+        CHECK(motor_drive_read_v1(racing_port, &request, &view, sizeof(view)) == MOTOR_DRIVE_INVALID_STATE);
+        CHECK(motor_drive_close_v1(racing_port) == MOTOR_DRIVE_OK);
+    } else {
+        CHECK(open_result == XNET_CO_INVALID_STATE);
+    }
+}
+
+void facade_worker_failure() {
+    Fixture f;
+    co_device_handle raw = nullptr;
+    CHECK(co_device_create(&raw) == XNET_CO_OK);
+    std::unique_ptr<co_device, decltype(&co_device_destroy)> device(raw, co_device_destroy);
+    CHECK(co_device_initialize(device.get(), "CAN1", f.model_path.string().c_str(), f.saved_path.string().c_str())
+        == XNET_CO_OK);
+    CHECK(co_device_start(device.get()) == XNET_CO_OK);
+    fake::fail_next("read", nxErrInternalError);
+    xnet_canopen_system_status_v1 status{};
+    wait_for([&] {
+        CHECK(co_device_get_status_v1(device.get(), &status, sizeof(status)) == XNET_CO_OK);
+        return status.communication.runtime_state == XNET_CO_RUNTIME_FAILED;
+    });
+    CHECK(co_device_stop(device.get()) == XNET_CO_XNET_ERROR);
+    xnet_canopen_diagnostic_v1 diag{};
+    CHECK(co_device_get_diagnostic_v1(device.get(), &diag, sizeof(diag)) == XNET_CO_OK);
+    CHECK(diag.backend_code == XNET_CO_XNET_ERROR);
+}
+
+void facade_external_stop(bool legacy) {
+    Fixture f;
+    f.model(adapted_drive_model());
+    co_device_handle raw = nullptr;
+    if (!legacy) CHECK(co_device_create(&raw) == XNET_CO_OK);
+    std::unique_ptr<co_device, decltype(&co_device_destroy)> device(raw, co_device_destroy);
+    if (legacy) CHECK(f.initialize() == XNET_CO_OK);
+    else CHECK(co_device_initialize(device.get(), "CAN1", f.model_path.string().c_str(), f.saved_path.string().c_str())
+        == XNET_CO_OK);
+    motor_drive_port_handle port = nullptr;
+    CHECK((legacy ? co_device_open_motor_port_from_xnet(f.device, &port)
+                  : co_device_open_motor_port(device.get(), &port)) == XNET_CO_OK);
+    std::unique_ptr<motor_drive_port, decltype(&motor_drive_close_v1)> owned(port, motor_drive_close_v1);
+    CHECK((legacy ? xnet_canopen_start(f.device) : co_device_start(device.get())) == XNET_CO_OK);
+    std::atomic<bool> running{true};
+    std::atomic<int32_t> failure{0};
+    std::thread model([&] {
+        motor_drive_read_request_v1 request{};
+        request.abi_version = MOTOR_DRIVE_ABI_VERSION;
+        request.struct_size = sizeof(request);
+        request.flags = MOTOR_DRIVE_READ_ASYNC;
+        uint64_t epoch = 0, step = 0;
+        uint32_t seq = 0, waiting = 0;
+        while (running) {
+            motor_drive_view_v1 view{};
+            const auto read = motor_drive_read_v1(port, &request, &view, sizeof(view));
+            if (read == MOTOR_DRIVE_NO_DATA) { std::this_thread::sleep_for(1ms); continue; }
+            if (read != MOTOR_DRIVE_OK) { failure = read; break; }
+            if (epoch != view.token.epoch) { epoch = view.token.epoch; seq = 0; waiting = 0; }
+            ++step;
+            motor_drive_model_step_v1 progress{9, step, step, step * 0.002, 0.002, {}};
+            const auto heartbeat = motor_drive_heartbeat_v1(port, &view.token, &progress, static_cast<uint32_t>(step));
+            if (heartbeat != MOTOR_DRIVE_OK && heartbeat != MOTOR_DRIVE_STALE) { failure = heartbeat; break; }
+            if (waiting && view.processed_feedback_seq == waiting) waiting = 0;
+            if (!waiting) {
+                motor_drive_feedback_v1 feedback{};
+                feedback.abi_version = MOTOR_DRIVE_ABI_VERSION; feedback.struct_size = sizeof(feedback);
+                feedback.source = view.token; feedback.executed_step = progress; feedback.feedback_seq = ++seq;
+                feedback.flags = 0x17;
+                feedback.action_result = view.action == MOTOR_DRIVE_ACTION_NONE ? MOTOR_DRIVE_RESULT_NONE : MOTOR_DRIVE_RESULT_DONE;
+                const auto submit = motor_drive_submit_v1(port, &feedback, sizeof(feedback));
+                if (submit == MOTOR_DRIVE_OK) waiting = seq;
+                else if (submit != MOTOR_DRIVE_STALE) { failure = submit; break; }
+            }
+            std::this_thread::sleep_for(2ms);
+        }
+    });
+    try {
+        xnet_canopen_system_status_v1 status{};
+        const auto snapshot = [&] {
+            CHECK((legacy ? xnet_canopen_get_system_status_v1(f.device, &status, sizeof(status))
+                          : co_device_get_status_v1(device.get(), &status, sizeof(status))) == XNET_CO_OK);
+            return status;
+        };
+        wait_for([&] { return snapshot().drive_flags & XNET_CO_DRIVE_STATUS_MODEL_READY; });
+        fake::inject(0, {1, 10});
+        wait_for([&] { return snapshot().communication.nmt_state == CO_NMT_OPERATIONAL; });
+        CHECK(sdo_download(0x6040, 0, 0x06, 2).Payload[0] == 0x60);
+        wait_for([&] { return snapshot().pds_state == XNET_CO_PDS_READY_TO_SWITCH_ON; });
+        CHECK(sdo_download(0x6040, 0, 0x07, 2).Payload[0] == 0x60);
+        wait_for([&] { return snapshot().pds_state == XNET_CO_PDS_SWITCHED_ON; });
+        CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
+        wait_for([&] { return snapshot().drive_flags & XNET_CO_DRIVE_STATUS_OUTPUT_ALLOWED; });
+        CHECK((legacy ? xnet_canopen_stop(f.device) : co_device_stop(device.get())) == XNET_CO_OK);
+        CHECK(snapshot().communication.runtime_state == XNET_CO_RUNTIME_STOPPED);
+        CHECK(!(status.drive_flags & (XNET_CO_DRIVE_STATUS_OUTPUT_ALLOWED | XNET_CO_DRIVE_STATUS_REACTION_UNCONFIRMED)));
+    } catch (...) {
+        running = false;
+        model.join();
+        throw;
+    }
+    running = false;
+    model.join();
+    CHECK(failure == 0);
+    owned.reset();
+    if (legacy) CHECK(xnet_canopen_uninitialize(f.device) == XNET_CO_OK);
+    else {
+        CHECK(co_device_uninitialize(device.get()) == XNET_CO_OK);
+        CHECK(co_device_destroy(device.release()) == XNET_CO_OK);
+    }
+}
+
 void drive_unit_adapter() {
     auto json = adapted_drive_model();
     xco::Model model; model.load(json);
@@ -698,6 +1025,12 @@ void motor_drive_worker_stop() {
         wait_for([&] { return drive_status().pds == xco::d402::Pds::switched_on; });
         CHECK(sdo_download(0x6040, 0, 15, 2).Payload[0] == 0x60);
         wait_for([&] { return drive_status().output_allowed; });
+        xnet_canopen_system_status_v1 snapshot{};
+        CHECK(xnet_canopen_get_system_status_v1(fixture.device, &snapshot, sizeof(snapshot)) == XNET_CO_OK);
+        CHECK(snapshot.communication.nmt_state == CO_NMT_OPERATIONAL);
+        CHECK(snapshot.drive_valid && snapshot.pds_state == XNET_CO_PDS_OPERATION_ENABLED);
+        CHECK((snapshot.drive_flags & (XNET_CO_DRIVE_STATUS_OUTPUT_ALLOWED | XNET_CO_DRIVE_STATUS_PORT_OPEN))
+            == (XNET_CO_DRIVE_STATUS_OUTPUT_ALLOWED | XNET_CO_DRIVE_STATUS_PORT_OPEN));
         CHECK(sdo_download(0x607a, 0, 1000, 4).Payload[0] == 0x60);
         CHECK(sdo_download(0x6040, 0, 31, 2).Payload[0] == 0x60);
         wait_for([&] { return drive_status().actual_position == 1000; });
@@ -1858,6 +2191,34 @@ void eighth_synchronous_pdo() {
             if (frame.Identifier == 0x43f && frame.Payload[0] == 107) return true;
         return false;
     });
+}
+
+void legacy_batched_sync() {
+    Fixture f;
+    auto j = eight_pdo_model();
+    j["sync"] = {{"period_us", 0}, {"window_us", 0}};
+    j["tpdos"][7]["transmission_type"] = 1;
+    j["tpdos"][7]["cob_id"] = 0x43f;
+    f.model(j);
+    CHECK(f.initialize() == XNET_CO_OK);
+    f.start();
+    operational(f);
+    fake::clear_transmitted();
+    uint64_t before;
+    {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        before = f.device->sync_observation_sequence;
+        fake::inject(0x80, {});
+        fake::inject(0x80, {});
+        fake::inject(0x80, {});
+    }
+    wait_for([&] {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        return f.device->sync_observation_sequence == before + 3;
+    });
+    size_t count = 0;
+    for (const auto& frame : fake::transmitted()) if (frame.Identifier == 0x43f) ++count;
+    CHECK(count == 1);
 }
 
 void ordered_sync_boundaries() {
@@ -5009,6 +5370,10 @@ void errors_and_cleanup() {
     wait_for([&] { return f.status().runtime_state == XNET_CO_RUNTIME_FAILED; });
     CHECK(diagnostic(f.device).find("read CAN") != std::string::npos);
     CHECK(xnet_canopen_start(f.device) == XNET_CO_INVALID_STATE);
+    const auto last_error = diagnostic(f.device);
+    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    CHECK(f.status().runtime_state == XNET_CO_RUNTIME_FAILED);
+    CHECK(diagnostic(f.device) == last_error);
     CHECK(xnet_canopen_uninitialize(f.device) == 0 && fake::sessions() == 0);
     CHECK(f.initialize() == 0);
     fake::fail_next("clear", nxErrInternalError);
@@ -5547,7 +5912,13 @@ int main(int argc, char** argv) {
         {"DS402 NMT Reset Node with unconfirmed reaction", [] { drive_402_unconfirmed_shutdown(129); }},
     } : TestList{
         {"model validation", model_validation}, {"DS402 model validation", drive_402_model_validation},
-        {"drive unit adapter", drive_unit_adapter}, {"motor drive SI exchange", motor_drive_si_exchange},
+        {"system queries", system_queries}, {"device facade", facade_operations},
+        {"legacy motor port bridge", legacy_motor_port_bridge},
+        {"facade worker failure", facade_worker_failure},
+        {"facade external stop", [] { facade_external_stop(false); }},
+        {"legacy bridge external stop", [] { facade_external_stop(true); }},
+        {"drive unit adapter", drive_unit_adapter},
+        {"motor drive SI exchange", motor_drive_si_exchange},
         {"motor drive worker stop", motor_drive_worker_stop},
         {"DS402 SDO only", drive_402_sdo_only},
         {"DS402 PP integration", drive_402_integration},
@@ -5565,6 +5936,7 @@ int main(int argc, char** argv) {
         {"device name SDO", device_name_sdo},
         {"eight PDO validation", eight_pdo_validation}, {"eight PDO traffic and lifecycle", eight_pdo_traffic},
         {"inactive PDO slots", inactive_pdo_slots}, {"eighth synchronous PDO", eighth_synchronous_pdo},
+        {"legacy batched SYNC", legacy_batched_sync},
         {"ordered SYNC boundaries", ordered_sync_boundaries}, {"worker independent PDO cadence", worker_pdo_independent_cadence},
         {"timed history selection", timed_history_selection},
         {"timed history auto retirement", timed_history_auto_retirement},

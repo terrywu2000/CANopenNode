@@ -6,16 +6,22 @@
  * a JSON-enabled DS402 core and ordinary application OD values.
  */
 #include "internal.hpp"
+#include "co_device.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <set>
 #include <tuple>
 
 using xco::Error;
 using xco::require;
+
+struct co_device {
+    xnet_canopen_handle backend = nullptr;
+};
 
 namespace {
 constexpr uint8_t drive_fault_startup = 0x01;
@@ -23,13 +29,15 @@ constexpr uint8_t drive_fault_heartbeat = 0x02;
 constexpr uint8_t drive_fault_feedback = 0x04;
 constexpr uint8_t drive_fault_action = 0x08;
 constexpr uint8_t drive_transport_error_bit = CO_EM_MANUFACTURER_START;
+int32_t motor_result(int32_t result);
 /**
  * C ABI gateway: serialize the operation and translate typed/standard exceptions
  * to operation results plus a per-handle diagnostic. The lifecycle lock stays
  * owned even when an operation unlocks the runtime mutex to join the worker.
  * This cannot make a fabricated handle or concurrent destroy safe.
  */
-template<class Function> int32_t call(xnet_canopen_handle d, Function function, bool allow_shutdown = false) noexcept {
+template<class Function> int32_t call(xnet_canopen_handle d, Function function, bool allow_shutdown = false,
+                                      bool motor_domain = false) noexcept {
     if (!d) return XNET_CO_INVALID_ARGUMENT;
     try {
         // Keep lifecycle ownership even when a call releases the OD lock to join the worker.
@@ -40,15 +48,18 @@ template<class Function> int32_t call(xnet_canopen_handle d, Function function, 
         return function(*d, lock);
     } catch (const Error& e) {
         std::lock_guard<std::recursive_mutex> lock(d->mutex);
-        d->fail(e.code, e.what());
+        if (motor_domain) d->fail_motor(motor_result(e.code), e.code, e.what());
+        else d->fail(e.code, e.what());
         return e.code;
     } catch (const xco::Json::exception& e) {
         std::lock_guard<std::recursive_mutex> lock(d->mutex);
-        d->fail(XNET_CO_MODEL_ERROR, e.what());
+        if (motor_domain) d->fail_motor(MOTOR_DRIVE_BACKEND_ERROR, XNET_CO_MODEL_ERROR, e.what());
+        else d->fail(XNET_CO_MODEL_ERROR, e.what());
         return XNET_CO_MODEL_ERROR;
     } catch (const std::exception& e) {
         std::lock_guard<std::recursive_mutex> lock(d->mutex);
-        d->fail(XNET_CO_INTERNAL_ERROR, e.what());
+        if (motor_domain) d->fail_motor(MOTOR_DRIVE_BACKEND_ERROR, XNET_CO_INTERNAL_ERROR, e.what());
+        else d->fail(XNET_CO_INTERNAL_ERROR, e.what());
         return XNET_CO_INTERNAL_ERROR;
     }
 }
@@ -93,8 +104,26 @@ int32_t motor_result(int32_t result) {
     }
 }
 int32_t motor_reject(xnet_canopen_device& d, int32_t result, const char* message) {
-    d.fail(result == MOTOR_DRIVE_INVALID_ARGUMENT ? XNET_CO_INVALID_ARGUMENT : XNET_CO_ACCESS_ERROR, message);
+    d.fail_motor(result, result == MOTOR_DRIVE_INVALID_ARGUMENT ? XNET_CO_INVALID_ARGUMENT : XNET_CO_ACCESS_ERROR, message);
     return result;
+}
+int32_t open_motor_port(xnet_canopen_device& d, motor_drive_endpoint_handle endpoint,
+                        motor_drive_port_handle* port) {
+    d.initialized();
+    require(port != nullptr, XNET_CO_INVALID_ARGUMENT, "motor port output is required");
+    require(endpoint && d.state != XNET_CO_RUNTIME_FAILED && d.drive_endpoint.get() == endpoint
+        && d.model->drive_adapter && d.model->drive_402_external,
+        XNET_CO_INVALID_STATE, "motor endpoint is not active");
+    if (endpoint->writer_open)
+        return motor_reject(d, MOTOR_DRIVE_BUSY, "motor endpoint already has a writer");
+    require(!d.drive_feedback_pending && !d.drive_has_last_submitted, XNET_CO_INVALID_STATE,
+        "restart the model epoch before replacing a model writer");
+    auto opened = std::make_unique<motor_drive_port>();
+    opened->endpoint = endpoint->shared_from_this();
+    opened->epoch = d.drive_epoch;
+    endpoint->writer_open = true;
+    *port = opened.release();
+    return MOTOR_DRIVE_OK;
 }
 template<class Function> int32_t motor_call(motor_drive_port_handle port, Function function) {
     if (!port) return MOTOR_DRIVE_INVALID_ARGUMENT;
@@ -115,7 +144,7 @@ template<class Function> int32_t motor_call(motor_drive_port_handle port, Functi
         }
         result = function(d, *port);
         return XNET_CO_OK;
-    }, true);
+    }, true, true);
     return backend == XNET_CO_OK ? result : motor_result(backend);
 }
 bool empty_time(const motor_drive_time_v1& time) {
@@ -230,12 +259,19 @@ void xnet_canopen_device::fail(int32_t code, std::string_view message) noexcept 
     const bool changed = error_code != code || std::strlen(error_message.data()) != size
         || std::memcmp(error_message.data(), message.data(), size) != 0;
     error_code = code;
+    diagnostic_domain = code == 0 ? XNET_CO_DIAG_NONE : XNET_CO_DIAG_XNET;
+    diagnostic_source_code = code;
     std::memcpy(error_message.data(), message.data(), size);
     error_message[size] = 0;
     // Repeated identical queue/driver errors must not flood the file each cycle.
     if (changed) {
         log(xco::LogLevel::error, "error code={}: {}", code, error_message.data());
     }
+}
+void xnet_canopen_device::fail_motor(int32_t result, int32_t backend_code, std::string_view message) noexcept {
+    fail(backend_code, message);
+    diagnostic_domain = XNET_CO_DIAG_MOTOR;
+    diagnostic_source_code = result;
 }
 void xnet_canopen_device::initialized() const {
     require(model && co && state != XNET_CO_RUNTIME_UNINITIALIZED, XNET_CO_INVALID_STATE, "device is not initialized");
@@ -1615,7 +1651,8 @@ void xnet_canopen_device::run() {
                         CO_process_TPDO(d.co, true, 0, nullptr);
                         d.transmit();
                     };
-                    receive(boundary, &processed_sync);
+                    if (drive_402) receive(boundary, &processed_sync);
+                    else receive();
                     // Receive dispatch can request a reset, stop, or bitrate switch in a callback.
                     if (switching == Switch::none && !stop_requested) {
                         auto reset = process_network(dt);
@@ -1845,6 +1882,11 @@ int32_t xnet_canopen_stop(xnet_canopen_handle handle) {
         std::unique_lock<std::recursive_mutex> runtime(handle->mutex);
         require(!handle->shutdown_joining, XNET_CO_INVALID_STATE, "device shutdown is already in progress");
         handle->initialized();
+        if (!handle->drive_402) {
+            runtime.unlock();
+            handle->stop();
+            return XNET_CO_OK;
+        }
         if (!handle->worker.joinable()) {
             runtime.unlock();
             lifecycle.unlock();
@@ -2044,26 +2086,107 @@ int32_t xnet_canopen_set_fault(xnet_canopen_handle handle, uint8_t bit, uint16_t
         return XNET_CO_OK;
     });
 }
+static xnet_canopen_status_t communication_status(const xnet_canopen_device& d) {
+    xnet_canopen_status_t status{};
+    status.runtime_state = d.state;
+    status.reset_node_count = d.reset_node_count;
+    status.reset_communication_count = d.reset_communication_count;
+    status.can_state_raw = d.can_state.raw;
+    status.can_state_valid = d.can_state.valid ? 1U : 0U;
+    if (d.co) {
+        status.nmt_state = CO_NMT_getInternalState(d.co->NMT);
+        status.can_error_status = d.co->CANmodule->CANerrorStatus;
+        status.active_node_id = d.active_node; status.pending_node_id = d.pending_node;
+        status.active_bitrate_kbps = d.active_bitrate; status.pending_bitrate_kbps = d.pending_bitrate;
+        status.node_guarding_timeout = d.co->NGslave->lifeTimeTimeout ? 1U : 0U;
+    }
+    return status;
+}
+static uint32_t public_pds(xco::d402::Pds pds) {
+    switch (pds) {
+        case xco::d402::Pds::not_ready_to_switch_on: return XNET_CO_PDS_NOT_READY;
+        case xco::d402::Pds::switch_on_disabled: return XNET_CO_PDS_SWITCH_ON_DISABLED;
+        case xco::d402::Pds::ready_to_switch_on: return XNET_CO_PDS_READY_TO_SWITCH_ON;
+        case xco::d402::Pds::switched_on: return XNET_CO_PDS_SWITCHED_ON;
+        case xco::d402::Pds::operation_enabled: return XNET_CO_PDS_OPERATION_ENABLED;
+        case xco::d402::Pds::quick_stop_active: return XNET_CO_PDS_QUICK_STOP_ACTIVE;
+        case xco::d402::Pds::fault_reaction_active: return XNET_CO_PDS_FAULT_REACTION_ACTIVE;
+        case xco::d402::Pds::fault: return XNET_CO_PDS_FAULT;
+    }
+    throw Error(XNET_CO_INTERNAL_ERROR, "invalid drive PDS state");
+}
 int32_t xnet_canopen_get_status(xnet_canopen_handle handle, xnet_canopen_status_t* status) {
     return call(handle, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
         require(status != nullptr, XNET_CO_INVALID_ARGUMENT, "status output is required");
-        *status = {};
-        status->runtime_state = d.state;
-        // These survive stack teardown and remain readable after worker failure
-        // or uninitialize. call() holds the same mutex used to complete resets.
-        status->reset_node_count = d.reset_node_count;
-        status->reset_communication_count = d.reset_communication_count;
-        status->can_state_raw = d.can_state.raw;
-        status->can_state_valid = d.can_state.valid ? 1U : 0U;
-        if (d.co) {
-            status->nmt_state = CO_NMT_getInternalState(d.co->NMT);
-            status->can_error_status = d.co->CANmodule->CANerrorStatus;
-            status->active_node_id = d.active_node; status->pending_node_id = d.pending_node;
-            status->active_bitrate_kbps = d.active_bitrate; status->pending_bitrate_kbps = d.pending_bitrate;
-            status->node_guarding_timeout = d.co->NGslave->lifeTimeTimeout ? 1U : 0U;
-        }
+        *status = communication_status(d);
         return XNET_CO_OK;
     });
+}
+int32_t xnet_canopen_get_system_status_v1(xnet_canopen_handle handle, xnet_canopen_system_status_v1* status,
+                                           uint32_t capacity) {
+    return call(handle, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
+        require(status != nullptr, XNET_CO_INVALID_ARGUMENT, "system status output is required");
+        require(capacity >= sizeof(*status), XNET_CO_BUFFER_TOO_SMALL, "system status buffer too small");
+        xnet_canopen_system_status_v1 output{};
+        output.abi_version = XNET_CO_SYSTEM_ABI_VERSION;
+        output.struct_size = sizeof(output);
+        output.communication = communication_status(d);
+        if (d.drive_402) {
+            const auto drive = d.drive_402->status();
+            output.drive_valid = 1;
+            output.pds_state = public_pds(drive.pds);
+            output.statusword = drive.statusword;
+            output.mode_display = drive.mode_display;
+            if (drive.feedback_fresh) output.drive_flags |= XNET_CO_DRIVE_STATUS_FEEDBACK_FRESH;
+            if (drive.model_fault) output.drive_flags |= XNET_CO_DRIVE_STATUS_MODEL_FAULT;
+            if (drive.model_ready) output.drive_flags |= XNET_CO_DRIVE_STATUS_MODEL_READY;
+            if (drive.action_pending) output.drive_flags |= XNET_CO_DRIVE_STATUS_ACTION_PENDING;
+            if (drive.output_allowed) output.drive_flags |= XNET_CO_DRIVE_STATUS_OUTPUT_ALLOWED;
+            if (drive.reaction_unconfirmed) output.drive_flags |= XNET_CO_DRIVE_STATUS_REACTION_UNCONFIRMED;
+            if (d.drive_endpoint && d.drive_endpoint->writer_open) output.drive_flags |= XNET_CO_DRIVE_STATUS_PORT_OPEN;
+            output.action = drive.action;
+            output.action_seq = drive.action_seq;
+        }
+        *status = output;
+        return XNET_CO_OK;
+    });
+}
+int32_t xnet_canopen_get_capabilities_v1(xnet_canopen_handle handle, xnet_canopen_capabilities_v1* capabilities,
+                                         uint32_t capacity) {
+    return call(handle, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
+        require(capabilities != nullptr, XNET_CO_INVALID_ARGUMENT, "capabilities output is required");
+        require(capacity >= sizeof(*capabilities), XNET_CO_BUFFER_TOO_SMALL, "capabilities buffer too small");
+        d.initialized();
+        xnet_canopen_capabilities_v1 output{};
+        output.abi_version = XNET_CO_SYSTEM_ABI_VERSION;
+        output.struct_size = sizeof(output);
+        output.capabilities = XNET_CO_CAP_OD_BATCH | XNET_CO_CAP_TPDO_REQUEST
+            | XNET_CO_CAP_MANUFACTURER_FAULT | XNET_CO_CAP_SYNC_OBSERVATION;
+        if (d.model->drive_402_enabled) {
+            output.implemented_modes = XNET_CO_MODE_PROFILE_POSITION;
+            output.drive_model = d.model->drive_402_external ? XNET_CO_DRIVE_EXTERNAL : XNET_CO_DRIVE_INTERNAL;
+            if (d.model->drive_402_external)
+                output.capabilities |= XNET_CO_CAP_MOTOR_ASYNC | XNET_CO_CAP_MOTOR_BOOTSTRAP | XNET_CO_CAP_MOTOR_SAFETY;
+        }
+        *capabilities = output;
+        return XNET_CO_OK;
+    });
+}
+int32_t xnet_canopen_get_diagnostic_v1(xnet_canopen_handle handle, xnet_canopen_diagnostic_v1* diagnostic,
+                                       uint32_t capacity) {
+    if (!handle || !diagnostic) return XNET_CO_INVALID_ARGUMENT;
+    if (capacity < sizeof(*diagnostic)) return XNET_CO_BUFFER_TOO_SMALL;
+    std::lock_guard<std::recursive_mutex> lock(handle->mutex);
+    xnet_canopen_diagnostic_v1 output{};
+    output.abi_version = XNET_CO_SYSTEM_ABI_VERSION;
+    output.struct_size = sizeof(output);
+    output.source_domain = handle->diagnostic_domain;
+    output.source_code = handle->diagnostic_source_code;
+    output.backend_code = handle->error_code;
+    output.message_required = static_cast<uint32_t>(std::strlen(handle->error_message.data()) + 1);
+    std::memcpy(output.message, handle->error_message.data(), output.message_required);
+    *diagnostic = output;
+    return XNET_CO_OK;
 }
 int32_t xnet_canopen_get_last_error(xnet_canopen_handle handle, int32_t* code, char* message, uint32_t capacity, uint32_t* required) {
     // Diagnostic queries must not replace the error they are trying to retrieve.
@@ -2150,24 +2273,9 @@ int32_t motor_drive_open_v1(motor_drive_endpoint_handle endpoint, motor_drive_po
     if (!device) return MOTOR_DRIVE_INVALID_STATE;
     int32_t result = MOTOR_DRIVE_BACKEND_ERROR;
     const auto backend = call(device, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
-        d.initialized();
-        require(port != nullptr, XNET_CO_INVALID_ARGUMENT, "motor port output is required");
-        require(d.state != XNET_CO_RUNTIME_FAILED && d.drive_endpoint.get() == endpoint,
-            XNET_CO_INVALID_STATE, "motor endpoint is not active");
-        if (endpoint->writer_open) {
-            result = motor_reject(d, MOTOR_DRIVE_BUSY, "motor endpoint already has a writer");
-            return XNET_CO_OK;
-        }
-        require(!d.drive_feedback_pending && !d.drive_has_last_submitted, XNET_CO_INVALID_STATE,
-            "restart the model epoch before replacing a model writer");
-        auto opened = std::make_unique<motor_drive_port>();
-        opened->endpoint = endpoint->shared_from_this();
-        opened->epoch = d.drive_epoch;
-        endpoint->writer_open = true;
-        *port = opened.release();
-        result = MOTOR_DRIVE_OK;
+        result = open_motor_port(d, endpoint, port);
         return XNET_CO_OK;
-    });
+    }, false, true);
     return backend == XNET_CO_OK ? result : motor_result(backend);
 }
 int32_t motor_drive_read_v1(motor_drive_port_handle port, const motor_drive_read_request_v1* request,
@@ -2539,9 +2647,107 @@ int32_t motor_drive_close_v1(motor_drive_port_handle port) {
         result = call(device, [&](xnet_canopen_device&, std::unique_lock<std::recursive_mutex>&) {
             port->endpoint->writer_open = false;
             return XNET_CO_OK;
-        }, true);
+        }, true, true);
     }
     if (result == XNET_CO_OK) delete port;
     return motor_result(result);
+}
+
+int32_t co_device_create(co_device_handle* device) {
+    if (!device) return XNET_CO_INVALID_ARGUMENT;
+    *device = nullptr;
+    auto facade = std::unique_ptr<co_device>(new (std::nothrow) co_device);
+    if (!facade) return XNET_CO_INTERNAL_ERROR;
+    const auto result = xnet_canopen_create(&facade->backend);
+    if (result == XNET_CO_OK) *device = facade.release();
+    return result;
+}
+int32_t co_device_destroy(co_device_handle device) {
+    if (!device) return XNET_CO_INVALID_ARGUMENT;
+    const auto result = xnet_canopen_destroy(device->backend);
+    if (result == XNET_CO_OK) delete device;
+    return result;
+}
+int32_t co_device_initialize(co_device_handle device, const char* interface_name,
+                             const char* model_path, const char* persistence_path) {
+    return xnet_canopen_initialize(device ? device->backend : nullptr, interface_name, model_path, persistence_path);
+}
+int32_t co_device_start(co_device_handle device) {
+    return xnet_canopen_start(device ? device->backend : nullptr);
+}
+int32_t co_device_stop(co_device_handle device) {
+    if (!device) return XNET_CO_INVALID_ARGUMENT;
+    const auto result = xnet_canopen_stop(device->backend);
+    if (result != XNET_CO_OK) return result;
+    std::lock_guard<std::recursive_mutex> lock(device->backend->mutex);
+    return device->backend->worker_result;
+}
+int32_t co_device_uninitialize(co_device_handle device) {
+    return xnet_canopen_uninitialize(device ? device->backend : nullptr);
+}
+int32_t co_device_get_status_v1(co_device_handle device, xnet_canopen_system_status_v1* status, uint32_t capacity) {
+    return xnet_canopen_get_system_status_v1(device ? device->backend : nullptr, status, capacity);
+}
+int32_t co_device_get_capabilities_v1(co_device_handle device, xnet_canopen_capabilities_v1* caps, uint32_t capacity) {
+    return xnet_canopen_get_capabilities_v1(device ? device->backend : nullptr, caps, capacity);
+}
+int32_t co_device_get_diagnostic_v1(co_device_handle device, xnet_canopen_diagnostic_v1* diagnostic, uint32_t capacity) {
+    return xnet_canopen_get_diagnostic_v1(device ? device->backend : nullptr, diagnostic, capacity);
+}
+int32_t co_device_clear_diagnostic(co_device_handle device) {
+    return xnet_canopen_clear_error(device ? device->backend : nullptr);
+}
+int32_t co_device_open_motor_port(co_device_handle device, motor_drive_port_handle* port) {
+    return co_device_open_motor_port_from_xnet(device ? device->backend : nullptr, port);
+}
+int32_t co_device_open_motor_port_from_xnet(xnet_canopen_handle device, motor_drive_port_handle* port) {
+    if (port) *port = nullptr;
+    return call(device, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) -> int32_t {
+        require(port != nullptr, XNET_CO_INVALID_ARGUMENT, "motor port output is required");
+        const auto result = open_motor_port(d, d.drive_endpoint.get(), port);
+        require(result == MOTOR_DRIVE_OK || result == MOTOR_DRIVE_BUSY, XNET_CO_INTERNAL_ERROR,
+            "unexpected motor port open result");
+        if (result == MOTOR_DRIVE_BUSY) return CO_DEVICE_BUSY;
+        return XNET_CO_OK;
+    }, false, true);
+}
+int32_t co_device_bind_batch(co_device_handle device, const uint16_t* indices, const uint8_t* subindices,
+                             uint32_t count, uint32_t* types, uint32_t* sizes, uint32_t* buffer_size, uint32_t* batch_id) {
+    return xnet_canopen_bind_batch(device ? device->backend : nullptr, indices, subindices, count,
+        types, sizes, buffer_size, batch_id);
+}
+int32_t co_device_read_batch(co_device_handle device, uint32_t batch_id, uint8_t* buffer,
+                             uint32_t buffer_size, int32_t* entry_status, uint32_t entry_count) {
+    return xnet_canopen_read_batch(device ? device->backend : nullptr, batch_id, buffer, buffer_size, entry_status, entry_count);
+}
+int32_t co_device_write_batch(co_device_handle device, uint32_t batch_id, const uint8_t* buffer,
+                              uint32_t buffer_size, int32_t* entry_status, uint32_t entry_count) {
+    return xnet_canopen_write_batch(device ? device->backend : nullptr, batch_id, buffer, buffer_size, entry_status, entry_count);
+}
+int32_t co_device_read_od(co_device_handle device, uint16_t index, uint8_t subindex,
+                          uint8_t* buffer, uint32_t buffer_size, uint32_t* value_size) {
+    return xnet_canopen_read_od(device ? device->backend : nullptr, index, subindex, buffer, buffer_size, value_size);
+}
+int32_t co_device_write_od(co_device_handle device, uint16_t index, uint8_t subindex,
+                           const uint8_t* buffer, uint32_t buffer_size) {
+    return xnet_canopen_write_od(device ? device->backend : nullptr, index, subindex, buffer, buffer_size);
+}
+int32_t co_device_request_tpdo(co_device_handle device, uint16_t tpdo_number) {
+    return xnet_canopen_request_tpdo(device ? device->backend : nullptr, tpdo_number);
+}
+int32_t co_device_set_fault(co_device_handle device, uint8_t error_bit, uint16_t error_code,
+                            uint32_t info_code, uint8_t active) {
+    return xnet_canopen_set_fault(device ? device->backend : nullptr, error_bit, error_code, info_code, active);
+}
+int32_t co_device_get_drive_unit_report(co_device_handle device, char* buffer, uint32_t capacity, uint32_t* required_size) {
+    return xnet_canopen_get_drive_unit_report(device ? device->backend : nullptr, buffer, capacity, required_size);
+}
+int32_t co_device_read_sync_event(co_device_handle device, uint64_t epoch, uint64_t sequence,
+                                  xnet_canopen_sync_event_t* event) {
+    return xnet_canopen_read_sync_event(device ? device->backend : nullptr, epoch, sequence, event);
+}
+int32_t co_device_read_timing_event_v1(co_device_handle device, uint64_t sequence,
+                                       xnet_canopen_timing_event_v1* event, uint32_t capacity) {
+    return xnet_canopen_read_timing_event_v1(device ? device->backend : nullptr, sequence, event, capacity);
 }
 } // extern "C"

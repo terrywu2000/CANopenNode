@@ -316,9 +316,27 @@ Statusword 的状态位由 PDS 当前状态决定，PP 相关位由核心根据�
 
 1. **OD 来源与校验**：启动时加载 JSON；该 JSON 由设备 EDS 转换工具生成并决定 OD 与 PDO，不由 402 核心补建对象。未声明 `drive_402` 时按普通设备初始化；声明启用时，校验 PP 必需对象、存在的可选对象及配置中的 PDO 映射；不强制指定 PDO 映射，必需对象缺失或配置不匹配时拒绝启动。
 2. **绑定（当前实现）**：`Model::load()` 完成 PP 必需 OD 与已配置 PDO 校验；显式启用时由 `device.cpp` 在 `setup_stack()` 安装 0x6060 SDO 写扩展，拒绝非 PP 模式。当前是 C++ `Drive` 直接读写已校验 OD，尚无通用 `CO_402_device_bindOD()` API。
-3. **周期调用**：默认 worker 对同批接收的每个 SYNC 依次应用同步 RPDO、处理 402 状态并生成符合 transmission type 的 TPDO；402 实际经过时间和协议定时仍按 worker 时间推进，异步 PDO 不等待 SYNC。定时测试路径才按映射后的边界间隔推进正常 profile。每节点核心只能有一个执行者；模型只由 VeriStand PCL 调度，不在 worker/CD 内计算。
+3. **周期调用**：402 默认 worker 对同批接收的每个 SYNC 依次应用同步 RPDO、处理 402 状态并生成符合 transmission type 的 TPDO；普通 301 设备保持原来的批次接收后统一处理 PDO。402 实际经过时间和协议定时仍按 worker 时间推进，异步 PDO 不等待 SYNC。定时测试路径才按映射后的边界间隔推进正常 profile。每节点核心只能有一个执行者；模型只由 VeriStand PCL 调度，不在 worker/CD 内计算。
 4. **Reset**：Reset Node/Communication 与 worker stop 在重建或退出前请求 DS402 安全动作；external 路径等待匹配动作反馈，并通过新 epoch 使旧帧失效。NMT 层不直接修改 PDS。
-5. **状态快照**：保持已发布 `xnet_canopen_status_t` ABI；402 设备诊断通过配置已有的只读 OD 对象暴露，新增时间/模型步与处理确认通过 motor_drive_ 快照及 CD 诊断 signal 提供，不自动新增设备 OD。复位代次随模型命令快照发布。
+5. **状态快照**：保持已发布 `xnet_canopen_status_t` ABI；402 设备状态可通过版本化系统快照及配置已有的只读 OD 对象观察，时间/模型步与处理确认通过 motor_drive_ 快照及 CD 诊断 signal 提供，不自动新增设备 OD。复位代次随模型命令快照发布。
+
+**系统查询补充**：`xnet_canopen_get_system_status_v1` 在同一运行时锁中返回原通信状态和
+可用时的 PDS、状态字、动作及模型状态标志；`drive_valid` 标识驱动字段是否存在，停止或
+失败后的数据可能是历史快照。`xnet_canopen_get_capabilities_v1` 报告已初始化配置及
+实际实现能力（目前仅 PP、外部模型异步/启动/安全读取），不把 EDS 的模式声明或测试定时
+路径视作生产能力。`xnet_canopen_get_diagnostic_v1` 提供同一设备最新诊断的来源域、
+来源码、旧 XNET 码与消息；模型错误保留 `MOTOR_DRIVE_*` 结果，但诊断不与单次调用
+关联，未关联有效设备的错误无法记录。查询均使用固定 v1 布局和容量参数；旧 301 API、
+模型邮箱和停止握手语义不变。详见 [接口说明](../xnet_intergration/README.zh-CN.md#版本化系统查询)。
+
+**系统设备 facade**：`co_device.h` 为单个仿真从站提供独立的设备句柄、生命周期、
+系统查询及高级 OD/batch 操作。旧句柄可通过 `co_device_open_motor_port_from_xnet`
+在同一设备上打开端口，无需创建第二个后端；版本化查询等扩展声明位于
+`xnet_canopen_extensions.h`。`co_device_open_motor_port` 在同一个后端锁域内打开
+唯一模型端口，无需宿主管理借用的 endpoint；已占用时返回 `CO_DEVICE_BUSY`，详情可从
+统一诊断获取。模型仍使用 `motor_drive_` 交换，端口由调用方关闭。`co_device_stop`
+仍是阻塞式握手，停止期间模型交换必须保持；它不是非阻塞停止接口，也不改变部署时序
+能力。详见 [facade 说明](../xnet_intergration/README.zh-CN.md#系统设备-facade)。
 
 ### 7.4 DriveIF 对 Kinco FD124 的适配 **[待确认]**
 

@@ -1,8 +1,12 @@
 #include "motor_drive.h"
 #include "xnet_canopen.h"
+#include "co_device.h"
 #include <stddef.h>
 
 typedef char status_size_must_be_48[(sizeof(xnet_canopen_status_t) == 48) ? 1 : -1];
+typedef char system_status_size[(sizeof(xnet_canopen_system_status_v1) == 84) ? 1 : -1];
+typedef char capabilities_size[(sizeof(xnet_canopen_capabilities_v1) == 20) ? 1 : -1];
+typedef char diagnostic_size[(sizeof(xnet_canopen_diagnostic_v1) == 2072) ? 1 : -1];
 typedef char sync_event_size_must_be_40[(sizeof(xnet_canopen_sync_event_t) == 40) ? 1 : -1];
 typedef char timing_event_size_must_be_464[(sizeof(xnet_canopen_timing_event_v1) == 464) ? 1 : -1];
 typedef char timing_event_sequence_offset[(offsetof(xnet_canopen_timing_event_v1, sequence) == 16) ? 1 : -1];
@@ -37,8 +41,18 @@ int xnet_canopen_c_header_test(void) {
         && xnet_canopen_read_od(NULL, 0x2000, 0, buffer, sizeof(buffer), &value_size) == XNET_CO_INVALID_ARGUMENT
         && xnet_canopen_write_od(NULL, 0x2000, 0, buffer, sizeof(buffer)) == XNET_CO_INVALID_ARGUMENT
         && xnet_canopen_stop(NULL) == XNET_CO_INVALID_ARGUMENT
+        && xnet_canopen_get_system_status_v1(NULL, NULL, 0) == XNET_CO_INVALID_ARGUMENT
+        && xnet_canopen_get_capabilities_v1(NULL, NULL, 0) == XNET_CO_INVALID_ARGUMENT
+        && xnet_canopen_get_diagnostic_v1(NULL, NULL, 0) == XNET_CO_INVALID_ARGUMENT
         && xnet_canopen_read_sync_event(NULL, 0, 0, NULL) == XNET_CO_INVALID_ARGUMENT
         && xnet_canopen_read_timing_event_v1(NULL, 0, NULL, 0) == XNET_CO_INVALID_ARGUMENT
+        && co_device_create(NULL) == XNET_CO_INVALID_ARGUMENT
+        && co_device_destroy(NULL) == XNET_CO_INVALID_ARGUMENT
+        && co_device_initialize(NULL, NULL, NULL, NULL) == XNET_CO_INVALID_ARGUMENT
+        && co_device_open_motor_port(NULL, NULL) == XNET_CO_INVALID_ARGUMENT
+        && co_device_open_motor_port_from_xnet(NULL, NULL) == XNET_CO_INVALID_ARGUMENT
+        && co_device_get_status_v1(NULL, NULL, 0) == XNET_CO_INVALID_ARGUMENT
+        && co_device_read_od(NULL, 0, 0, NULL, 0, NULL) == XNET_CO_INVALID_ARGUMENT
         && motor_drive_open_v1(NULL, NULL) == MOTOR_DRIVE_INVALID_ARGUMENT
         && motor_drive_read_v1(NULL, NULL, NULL, 0) == MOTOR_DRIVE_INVALID_ARGUMENT
         && motor_drive_submit_v1(NULL, NULL, 0) == MOTOR_DRIVE_INVALID_ARGUMENT

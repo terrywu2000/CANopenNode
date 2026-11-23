@@ -5,7 +5,7 @@
  * @copyright 2026 CANopenNode contributors
  */
 #include "motor.hpp"
-#include "xnet_canopen.h"
+#include "xnet_canopen_extensions.h"
 #include <array>
 #include <atomic>
 #include <chrono>
