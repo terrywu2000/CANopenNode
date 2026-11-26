@@ -359,7 +359,16 @@ void xnet_canopen_device::setup_stack() {
                 XNET_CO_STACK_ERROR, "cannot install DS402 mode OD handler");
         }
     }
+    if (drive_402) {
+        publish_drive_status(drive_402->status());
+        drive_402->complete_local_initialization();
+    }
     log(xco::LogLevel::info, "CANopen services initialized");
+}
+
+void xnet_canopen_device::publish_drive_status(const xco::d402::Status& status) {
+    write_drive_value(*model, 0x6041, status.statusword);
+    write_drive_value(*model, 0x6061, status.mode_display);
 }
 
 void xnet_canopen_device::start_sync_observation_epoch() {
@@ -945,8 +954,7 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
     }
     if (model->drive_adapter) model->drive_adapter->publish(status, !safety_only);
     else if (!safety_only) write_drive_value(*model, 0x6064, status.actual_position);
-    write_drive_value(*model, 0x6041, status.statusword);
-    write_drive_value(*model, 0x6061, status.mode_display);
+    publish_drive_status(status);
     if (unsupported_mode) {
         log(xco::LogLevel::warning, "unsupported 0x6060 value {} received through PDO; requesting quick stop and restoring PP",
             int(requested_mode));

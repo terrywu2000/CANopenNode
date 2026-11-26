@@ -111,7 +111,8 @@ void Drive::reset() {
     external_.reset();
     safety_feedback_ = {};
     selected_feedback_valid_ = false;
-    pds_ = Pds::switch_on_disabled;
+    pds_ = Pds::not_ready_to_switch_on;
+    local_initialization_complete_ = false;
     demand_pos_ = feedback_.position;
     demand_vel_ = 0.0;
     pending_valid_ = false;
@@ -131,6 +132,7 @@ void Drive::reset() {
     external_transport_fault_ = false;
     external_model_ready_ = false;
     external_reset_permitted_ = false;
+    fault_reset_prev_ = false;
 }
 
 void Drive::step(const Inputs& in, uint32_t dt_us) {
@@ -139,7 +141,8 @@ void Drive::step(const Inputs& in, uint32_t dt_us) {
         else external_.advance_age(dt_us);
     }
     const double dt_s = dt_us / 1e6;
-    const int8_t display = mode_supported(in.mode_requested) ? in.mode_requested : int8_t{0};
+    const int8_t display = pds_ != Pds::not_ready_to_switch_on && mode_supported(in.mode_requested)
+        ? in.mode_requested : int8_t{0};
     if (display != previous_mode_) {
         // Mode change restarts the profile from the actual state.
         demand_pos_ = feedback_.position;
@@ -293,8 +296,8 @@ void Drive::transition(const Inputs& in, bool safety_only) {
     Pds target = pds_;
     switch (pds_) {
     case Pds::not_ready_to_switch_on:
-        if (!safety_only) target = Pds::switch_on_disabled;
-        break;
+        if (local_initialization_complete_) pds_ = Pds::switch_on_disabled;
+        return;
     case Pds::switch_on_disabled:
         if (!safety_only && shutdown_request(cw)) { action = CO_402_ACTION_SHUTDOWN; target = Pds::ready_to_switch_on; }
         break;
