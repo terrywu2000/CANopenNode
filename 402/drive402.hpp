@@ -27,6 +27,10 @@ enum class Pds : uint8_t {
 };
 
 constexpr int8_t mode_profile_position = 1;
+constexpr bool option_supported(uint16_t index, int16_t option) {
+    return index == 0x605a ? (option >= 0 && option <= 2) || option == 5 || option == 6
+                           : option >= 0 && option <= 2;
+}
 
 /** Actual axis state reported by a motor model for one cycle. */
 struct Feedback {
@@ -34,6 +38,7 @@ struct Feedback {
     int32_t velocity = 0; /**< Actual velocity in counts/s. */
     bool fault = false; /**< Model-reported fault; forces the drive into fault reaction. */
     bool limited = false; /**< Model limit condition used for Statusword bit 11. */
+    bool velocity_valid = true;
 };
 
 /** Motor model boundary. Implementations are driven under the device runtime mutex. */
@@ -84,6 +89,7 @@ struct Inputs {
     uint16_t controlword = 0;
     int8_t mode_requested = 0; /**< 0x6060. */
     bool nmt_operational = true; /**< NMT state is owned by the lower CANopen layer. */
+    bool force_shutdown = false; /**< Worker stop or stack reset must exit a latched quick stop. */
     int32_t target_position = 0; /**< 0x607A. */
     uint32_t profile_velocity = 0; /**< 0x6081 PP profile velocity. */
     uint32_t max_profile_velocity = 0; /**< 0x607F. */
@@ -204,6 +210,7 @@ private:
     int16_t quick_stop_option_ = 2;
     /** Model fault, or external feedback that is stale (a timeout is a fault). */
     bool model_faulted() const;
+    bool model_stopped() const;
     bool fault_reset_prev_ = false;
     Feedback feedback_{};
     Feedback safety_feedback_{};

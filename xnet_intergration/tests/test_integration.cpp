@@ -711,6 +711,153 @@ void motor_drive_worker_stop() {
     CHECK(failure == 0);
 }
 
+void drive_402_same_batch_nmt_stop_start() {
+    Fixture f;
+    f.model(drive_402_model());
+    CHECK(f.initialize() == XNET_CO_OK);
+    f.start();
+    operational(f);
+    for (uint16_t cw : {0x06, 0x07, 0x0f}) {
+        CHECK(sdo_download(0x6040, 0, cw, 2).Payload[0] == 0x60);
+    }
+    wait_for([&] {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        return f.device->drive_402->status().output_allowed;
+    });
+
+    {
+        // Queue both NMT commands before the worker can make its next XNET read.
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        fake::clear_transmitted();
+        fake::inject(0, {2, 10});
+        fake::inject(0, {1, 10});
+        fake::inject(0x60a, {0x40, 0x41, 0x60, 0, 0, 0, 0, 0});
+    }
+    wait_for([] {
+        for (const auto& frame : fake::transmitted())
+            if (frame.Identifier == 0x58a && frame.Payload[0] == 0x4b) return true;
+        return false;
+    });
+    CHECK(f.status().nmt_state == CO_NMT_OPERATIONAL);
+    {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        CHECK(!f.device->drive_402->status().output_allowed);
+        CHECK(f.device->drive_402->status().pds != xco::d402::Pds::operation_enabled);
+    }
+    wait_for([&] { return (sdo_upload(0x6041) & 0x006f) == 0x0040; });
+    CHECK(sdo_download(0x6040, 0, 0x06, 2).Payload[0] == 0x60);
+    CHECK(sdo_download(0x6040, 0, 0x0f, 2).Payload[0] == 0x60);
+    wait_for([&] { return (sdo_upload(0x6041) & 0x006f) == 0x0027; });
+}
+
+class RegressionMotor {
+    std::unique_ptr<motor_drive_port, decltype(&motor_drive_close_v1)> port_{nullptr, motor_drive_close_v1};
+    uint32_t step_ = 0;
+public:
+    explicit RegressionMotor(Fixture& f) {
+        motor_drive_endpoint_handle endpoint = nullptr;
+        motor_drive_port_handle port = nullptr;
+        CHECK(xnet_canopen_get_motor_drive_endpoint(f.device, &endpoint) == XNET_CO_OK);
+        CHECK(motor_drive_open_v1(endpoint, &port) == MOTOR_DRIVE_OK);
+        port_.reset(port);
+    }
+    motor_drive_view_v1 read() const {
+        const motor_drive_read_request_v1 request{
+            MOTOR_DRIVE_ABI_VERSION, sizeof(motor_drive_read_request_v1), MOTOR_DRIVE_READ_ASYNC, 0, {}, {}};
+        motor_drive_view_v1 view{};
+        CHECK(motor_drive_read_v1(port_.get(), &request, &view, sizeof(view)) == MOTOR_DRIVE_OK);
+        return view;
+    }
+    void reply_done(const motor_drive_view_v1& view, bool heartbeat) {
+        ++step_;
+        motor_drive_feedback_v1 feedback{};
+        feedback.abi_version = MOTOR_DRIVE_ABI_VERSION;
+        feedback.struct_size = sizeof(feedback);
+        feedback.source = view.token;
+        feedback.executed_step = {1, step_, step_, step_ * 0.002, 0.002, {}};
+        feedback.feedback_seq = step_;
+        feedback.flags = MOTOR_DRIVE_POSITION_VALID | MOTOR_DRIVE_VELOCITY_VALID
+            | MOTOR_DRIVE_FEEDBACK_PP_READY | MOTOR_DRIVE_RESET_PERMITTED;
+        feedback.action_result = view.action == MOTOR_DRIVE_ACTION_NONE
+            ? MOTOR_DRIVE_RESULT_NONE : MOTOR_DRIVE_RESULT_DONE;
+        if (heartbeat)
+            CHECK(motor_drive_heartbeat_v1(port_.get(), &view.token, &feedback.executed_step, step_) == MOTOR_DRIVE_OK);
+        CHECK(motor_drive_submit_v1(port_.get(), &feedback, sizeof(feedback)) == MOTOR_DRIVE_OK);
+    }
+};
+
+void drive_402_enable_without_model_heartbeat() {
+    Fixture f;
+    f.model(external_drive_402_model());
+    CHECK(f.initialize() == XNET_CO_OK);
+    RegressionMotor motor(f);
+    std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+    CO_NMT_sendInternalCommand(f.device->co->NMT, CO_NMT_ENTER_OPERATIONAL);
+    CHECK(CO_NMT_process(f.device->co->NMT, nullptr, 0, nullptr) == CO_RESET_NOT);
+    CHECK(CO_NMT_getInternalState(f.device->co->NMT) == CO_NMT_OPERATIONAL);
+    f.device->process_drive_402(0);
+    motor.reply_done(motor.read(), false);
+    f.device->process_drive_402(0);
+    CHECK(f.device->drive_402->status().feedback_fresh);
+
+    for (uint16_t cw : {0x06, 0x07, 0x0f}) {
+        std::memcpy(f.device->model->value(0x6040, 0).data(), &cw, sizeof(cw));
+        f.device->process_drive_402(0);
+        // A buggy backend requests Enable; the model returns matching DONE without a heartbeat.
+        motor.reply_done(motor.read(), false);
+        f.device->process_drive_402(0);
+    }
+    CHECK(!f.device->drive_has_heartbeat);
+    CHECK(!(motor.read().flags & MOTOR_DRIVE_OUTPUT_ALLOWED));
+    CHECK(f.device->drive_402->status().pds != xco::d402::Pds::operation_enabled);
+}
+
+void drive_402_unconfirmed_shutdown(uint8_t nmt_reset) {
+    Fixture f;
+    auto config = external_drive_402_model();
+    config["drive_402"]["action_timeout_us"] = 100000;
+    f.model(config);
+    CHECK(f.initialize() == XNET_CO_OK);
+    RegressionMotor motor(f);
+    f.start();
+    operational(f);
+    const auto drive_status = [&] {
+        std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+        return f.device->drive_402->status();
+    };
+    const auto complete = [&](uint16_t cw, uint32_t action, xco::d402::Pds target) {
+        CHECK(sdo_download(0x6040, 0, cw, 2).Payload[0] == 0x60);
+        wait_for([&] { return drive_status().action == action; });
+        motor.reply_done(motor.read(), true);
+        wait_for([&] { return drive_status().pds == target; });
+    };
+    motor.reply_done(motor.read(), true);
+    wait_for([&] { return drive_status().feedback_fresh; });
+    complete(0x06, MOTOR_DRIVE_ACTION_SHUTDOWN, xco::d402::Pds::ready_to_switch_on);
+    complete(0x07, MOTOR_DRIVE_ACTION_SWITCH_ON, xco::d402::Pds::switched_on);
+    complete(0x0f, MOTOR_DRIVE_ACTION_ENABLE_OPERATION, xco::d402::Pds::operation_enabled);
+    CHECK(drive_status().output_allowed);
+
+    // Keep the port open, but do not acknowledge Quick Stop or Fault Reaction.
+    if (!nmt_reset) {
+        const auto result = xnet_canopen_stop(f.device);
+        CHECK(!drive_status().output_allowed && drive_status().reaction_unconfirmed);
+        CHECK(result != XNET_CO_OK);
+        return;
+    }
+    const auto before = f.status();
+    fake::inject(0, {nmt_reset, 10});
+    wait_for([&] {
+        const auto status = f.status();
+        return status.reset_communication_count != before.reset_communication_count
+            || status.reset_node_count != before.reset_node_count || status.runtime_state == XNET_CO_RUNTIME_FAILED;
+    });
+    const auto after = f.status();
+    CHECK(after.reset_communication_count == before.reset_communication_count);
+    CHECK(after.reset_node_count == before.reset_node_count);
+    CHECK(!drive_status().output_allowed && drive_status().reaction_unconfirmed);
+}
+
 void drive_402_external_exchange() {
     Fixture f;
     auto external = external_drive_402_model();
@@ -773,6 +920,7 @@ void drive_402_external_exchange() {
         CHECK(motor_drive_read_v1(port, &request, &view, sizeof(view)) == MOTOR_DRIVE_OK);
         CHECK(view.processed_feedback_seq == seq && view.processed_result == MOTOR_DRIVE_PROCESSED_ACCEPTED);
     }
+
     CHECK(f.device->drive_feedback_history_overwrites == 1);
     CHECK(f.device->drive_command_history_overwrites > 0);
     CHECK(f.device->drive_feedback_history[1].feedback.feedback_seq == 65);
@@ -786,6 +934,15 @@ void drive_402_external_exchange() {
     }
     f.start();
     CHECK(sdo_upload(0x2f03) == 43); // These indices belong to the device again, not the model transport.
+}
+
+// These timing fixtures stop without a model servicing the teardown action.
+void stop_without_model_ack(Fixture& f) {
+    const auto rc = xnet_canopen_stop(f.device);
+    std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
+    const auto drive = f.device->drive_402->status();
+    CHECK(!drive.output_allowed);
+    CHECK(rc == (drive.reaction_unconfirmed ? XNET_CO_STACK_ERROR : XNET_CO_OK));
 }
 
 void drive_402_watchdog_deadlines() {
@@ -1935,7 +2092,7 @@ void worker_sampling_deadline_crossed_at_boundary() {
         CHECK(std::string(execution.invalid_reason.data()).find("acceptance deadline missed") != std::string::npos);
         CHECK(!f.device->drive_402->status().output_allowed);
     }
-    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    stop_without_model_ack(f);
 }
 
 void worker_required_rpdo_boundaries() {
@@ -2067,7 +2224,7 @@ void worker_required_rpdo_boundaries() {
                 CHECK(std::string(execution.invalid_reason.data()).find("required RPDO missing") != std::string::npos);
             }
         }
-        CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+        stop_without_model_ack(f);
     }
 }
 
@@ -2570,7 +2727,7 @@ void worker_external_timed_history() {
         CHECK(!f.device->drive_402->status().feedback_fresh);
         CHECK(!f.device->drive_402->status().output_allowed);
     }
-    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    stop_without_model_ack(f);
 }
 
 void worker_external_scheduled_auto_retirement() {
@@ -2654,7 +2811,7 @@ void worker_external_scheduled_auto_retirement() {
         CHECK(!f.device->drive_402->status().output_allowed);
     }
     CHECK(timing_events(f.device).back().reason == XNET_CO_TIMING_REASON_HISTORY_GAP);
-    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    stop_without_model_ack(f);
 }
 
 void worker_external_ordered_command_watermark() {
@@ -2774,7 +2931,7 @@ void worker_external_ordered_command_watermark() {
                 CHECK(f.device->drive_402->status().model_fault);
             }
         }
-        CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+        stop_without_model_ack(f);
     }
     Fixture f;
     f.model(external_drive_402_model());
@@ -2978,7 +3135,7 @@ void worker_external_scheduled_read() {
         CHECK(!f.device->drive_402->status().output_allowed);
     }
     CHECK(timing_events(f.device).back().reason == XNET_CO_TIMING_REASON_DEADLINE);
-    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    stop_without_model_ack(f);
 }
 
 void worker_external_scheduled_assignment_overflow() {
@@ -3030,7 +3187,7 @@ void worker_external_scheduled_assignment_overflow() {
         CHECK(!f.device->drive_402->status().output_allowed);
     }
     CHECK(timing_events(f.device).back().reason == XNET_CO_TIMING_REASON_HISTORY_OVERFLOW);
-    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    stop_without_model_ack(f);
 }
 
 void worker_external_scheduled_safety_preemption() {
@@ -3094,7 +3251,7 @@ void worker_external_scheduled_safety_preemption() {
         CHECK(!f.device->sync_execution->invalid);
         CHECK(!f.device->drive_402->status().output_allowed);
     }
-    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    stop_without_model_ack(f);
 }
 
 void worker_external_scheduled_feedback_ages_before_acceptance() {
@@ -3176,7 +3333,7 @@ void worker_external_scheduled_feedback_ages_before_acceptance() {
         }
         CHECK(rejected && !accepted);
     }
-    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    stop_without_model_ack(f);
 }
 
 void worker_external_selected_feedback_source_validity() {
@@ -3290,7 +3447,7 @@ void worker_external_selected_feedback_source_validity() {
                 CHECK(events.back().boundary.sequence == 3);
             }
         }
-        CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+        stop_without_model_ack(f);
     }
 }
 
@@ -3349,7 +3506,7 @@ void worker_external_scheduled_mapping_change() {
             CHECK(std::string(f.device->sync_execution->invalid_reason.data()).find("clock mapping changed") != std::string::npos);
             CHECK(!f.device->drive_402->status().output_allowed);
         }
-        CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+        stop_without_model_ack(f);
     }
 }
 
@@ -3472,7 +3629,7 @@ void worker_external_scheduled_command_hold() {
                     != std::string::npos);
                 CHECK(!f.device->drive_402->status().output_allowed);
             }
-            CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+            stop_without_model_ack(f);
             continue;
         }
         if (scenario == 4) {
@@ -3505,7 +3662,7 @@ void worker_external_scheduled_command_hold() {
                 CHECK(execution.feedback.select(f.device->drive_epoch, 5000, 0, 5000, 6000, 5000, selected)
                     == xco::TimedHistoryResult::not_closed);
             }
-            CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+            stop_without_model_ack(f);
             continue;
         }
         feedback.executed_step = {1, 14, 3, 0.003, 0.001, {42, MOTOR_DRIVE_TIME_VALID, 0.005}};
@@ -3630,11 +3787,11 @@ void worker_external_scheduled_command_hold() {
                 } else CHECK(!execution.invalid);
             }
             if (scenario >= 6) {
-                CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+                stop_without_model_ack(f);
                 continue;
             }
             const auto old_epoch = f.device->drive_epoch;
-            CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+            stop_without_model_ack(f);
             owned.reset();
             {
                 std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
@@ -3665,7 +3822,7 @@ void worker_external_scheduled_command_hold() {
             CHECK(f.device->drive_processed_result == MOTOR_DRIVE_PROCESSED_INVALID);
             CHECK(f.device->drive_402->status().model_fault);
         }
-        CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+        stop_without_model_ack(f);
     }
 }
 
@@ -3823,7 +3980,7 @@ void worker_external_fixed_feedback_schedule() {
                 CHECK(f.device->drive_402->status().model_fault);
             }
         }
-        CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+        stop_without_model_ack(f);
     }
 }
 
@@ -3961,7 +4118,7 @@ void worker_external_history_budget() {
             std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
             CHECK(std::string(execution.invalid_reason.data()).find("history overflow") != std::string::npos);
         }
-        CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+        stop_without_model_ack(f);
         f.start();
         operational(f);
         {
@@ -4099,7 +4256,7 @@ void worker_external_timing_provider_contract() {
             std::lock_guard<std::recursive_mutex> lock(f.device->mutex);
             CHECK(!f.device->drive_402->status().output_allowed);
         }
-        CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+        stop_without_model_ack(f);
         if (scenario == 0) {
             owned.reset();
             provider->command_closed = false;
@@ -4188,7 +4345,7 @@ void worker_external_timed_safety_without_sync() {
         CHECK(f.device->drive_402->status().model_fault);
         CHECK(!f.device->drive_402->status().output_allowed);
     }
-    CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+    stop_without_model_ack(f);
 }
 
 void worker_external_timed_history_overflow() {
@@ -4330,7 +4487,7 @@ void worker_external_timed_feedback_faults() {
             CHECK(f.device->drive_adapter_fault);
             CHECK(!f.device->drive_402->status().output_allowed);
         }
-        CHECK(xnet_canopen_stop(f.device) == XNET_CO_OK);
+        stop_without_model_ack(f);
     }
 }
 
@@ -5306,7 +5463,15 @@ int main(int argc, char** argv) {
         }
     }
     if (!xnet_canopen_c_header_test()) return 1;
-    const std::vector<std::pair<const char*, std::function<void()>>> tests = {
+    using TestList = std::vector<std::pair<const char*, std::function<void()>>>;
+    const bool p0_regressions = argc == 2 && std::string(argv[1]) == "--ds402-p0-regressions";
+    const TestList tests = p0_regressions ? TestList{
+        {"DS402 same-batch NMT Stop and Start", drive_402_same_batch_nmt_stop_start},
+        {"DS402 Enable DONE without model heartbeat", drive_402_enable_without_model_heartbeat},
+        {"DS402 Stop with unconfirmed reaction", [] { drive_402_unconfirmed_shutdown(0); }},
+        {"DS402 NMT Reset Communication with unconfirmed reaction", [] { drive_402_unconfirmed_shutdown(130); }},
+        {"DS402 NMT Reset Node with unconfirmed reaction", [] { drive_402_unconfirmed_shutdown(129); }},
+    } : TestList{
         {"model validation", model_validation}, {"DS402 model validation", drive_402_model_validation},
         {"drive unit adapter", drive_unit_adapter}, {"motor drive SI exchange", motor_drive_si_exchange},
         {"motor drive worker stop", motor_drive_worker_stop},

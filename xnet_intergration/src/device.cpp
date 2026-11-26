@@ -103,7 +103,11 @@ template<class Function> int32_t motor_call(motor_drive_port_handle port, Functi
     int32_t result = MOTOR_DRIVE_BACKEND_ERROR;
     const auto backend = call(device, [&](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>&) {
         d.initialized();
-        require(d.state != XNET_CO_RUNTIME_FAILED && d.drive_endpoint.get() == port->endpoint.get()
+        if (d.state == XNET_CO_RUNTIME_FAILED) {
+            result = MOTOR_DRIVE_INVALID_STATE;
+            return XNET_CO_OK; // Preserve the worker's failure diagnostic during model teardown.
+        }
+        require(d.drive_endpoint.get() == port->endpoint.get()
             && port->endpoint->writer_open && d.model->drive_adapter, XNET_CO_INVALID_STATE, "motor port is not active");
         if (port->epoch != d.drive_epoch) {
             port->epoch = d.drive_epoch; port->pcl_epoch = 0; port->heartbeat_seq = 0;
@@ -303,6 +307,22 @@ void xnet_canopen_device::setup_stack() {
     auto init_result = CO_CANopenInit(co, nullptr, nullptr, &model->od, nullptr,
         CO_NMT_ERR_ON_BUSOFF_HB, 500, 1000, 1000, false, active_node, &info);
     stack_ok(init_result, info, "CANopen initialization");
+    if (!co->nodeIdUnconfigured && model->drive_402_enabled) {
+        drive_controlword_od = {};
+        drive_controlword_od.object = this;
+        drive_controlword_od.read = OD_readOriginal;
+        drive_controlword_od.write = write_drive_controlword;
+        require(OD_extension_init(OD_find(&model->od, 0x6040), &drive_controlword_od) == ODR_OK,
+            XNET_CO_STACK_ERROR, "cannot install DS402 Controlword OD handler");
+        drive_option_od = {};
+        drive_option_od.read = OD_readOriginal;
+        drive_option_od.write = write_drive_option;
+        for (uint16_t index : {0x605a, 0x605e}) {
+            if (auto* entry = OD_find(&model->od, index))
+                require(OD_extension_init(entry, &drive_option_od) == ODR_OK,
+                    XNET_CO_STACK_ERROR, "cannot install DS402 stop option OD handler");
+        }
+    }
     info = 0;
     auto result = CO_CANopenInitPDO(co, co->em, &model->od, active_node, &info);
     stack_ok(result, info, "PDO initialization");
@@ -431,6 +451,24 @@ ODR_t xnet_canopen_device::write_drive_mode(
     const auto result = binding.original.write(&original, buffer, count, transferred);
     stream->dataOffset = original.dataOffset;
     return result;
+}
+
+ODR_t xnet_canopen_device::write_drive_controlword(
+    OD_stream_t* stream, const void* buffer, OD_size_t count, OD_size_t* transferred) {
+    auto& d = *static_cast<xnet_canopen_device*>(stream->object);
+    const auto result = OD_writeOriginal(stream, buffer, count, transferred);
+    if (result == ODR_OK && CO_NMT_getInternalState(d.co->NMT) == CO_NMT_OPERATIONAL)
+        d.drive_controlword_rearm = false;
+    return result;
+}
+
+ODR_t xnet_canopen_device::write_drive_option(
+    OD_stream_t* stream, const void* buffer, OD_size_t count, OD_size_t* transferred) {
+    int16_t option = 0;
+    if (!buffer || count != sizeof(option)) return ODR_TYPE_MISMATCH;
+    std::memcpy(&option, buffer, sizeof(option));
+    if (!xco::d402::option_supported(stream->index, option)) return ODR_INVALID_VALUE;
+    return OD_writeOriginal(stream, buffer, count, transferred);
 }
 
 ODR_t xnet_canopen_device::read_drive_mode(
@@ -567,7 +605,7 @@ void xnet_canopen_device::start_drive_epoch() {
     drive_transport_faults = drive_reported_transport_faults = 0;
     drive_latched_fault = 0;
     drive_current_fault = 0;
-    drive_emcy_active = false;
+    drive_reported_model_fault = 0;
     drive_previous_pds = xco::d402::Pds::switch_on_disabled;
     drive_has_previous_pds = false;
     drive_pp_ready = false;
@@ -582,11 +620,13 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
 
     xco::d402::Inputs input;
     input.controlword = read_drive_value<uint16_t>(*model, 0x6040);
+    if (drive_controlword_rearm) input.controlword = 0x0002U;
     if (unsupported_mode)
         input.controlword = static_cast<uint16_t>((input.controlword | 0x0002U) & ~0x0004U);
     input.mode_requested = requested_mode;
     input.nmt_operational = !force_non_operational && !stop_requested
         && CO_NMT_getInternalState(co->NMT) == CO_NMT_OPERATIONAL;
+    input.force_shutdown = force_non_operational || stop_requested;
     const auto read_quantity = [&](xco::DriveQuantity quantity, uint16_t index, bool is_unsigned) -> int64_t {
         if (model->drive_adapter) return model->drive_adapter->read(quantity);
         return is_unsigned ? static_cast<int64_t>(read_drive_value<uint32_t>(*model, index))
@@ -599,6 +639,8 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
     input.quick_stop_deceleration = model->drive_has_quick_stop_deceleration
         ? static_cast<uint32_t>(read_quantity(xco::DriveQuantity::quick_stop_deceleration, 0x6085, true))
         : input.profile_deceleration;
+    if (OD_find(&model->od, 0x605a)) input.quick_stop_option = read_drive_value<int16_t>(*model, 0x605a);
+    if (OD_find(&model->od, 0x605e)) input.fault_reaction_option = read_drive_value<int16_t>(*model, 0x605e);
     input.position_tolerance = model->drive_position_tolerance;
     input.target_reached_time_us = model->drive_target_reached_time_us;
     uint16_t external_fault_code = 0;
@@ -672,7 +714,7 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
                 xco::d402::Feedback feedback{frame.actual_position,
                     velocity_valid ? frame.actual_velocity : drive_402->status().actual_velocity,
                     frame.fault_code != 0 || frame.action_result == CO_402_ACTION_RESULT_ERROR,
-                    (frame.flags & 0x08U) != 0};
+                    (frame.flags & 0x08U) != 0, velocity_valid};
                 require((safety_only || capture) ? drive_402->post_safety_feedback(feedback) : drive_402->post_feedback(feedback),
                     XNET_CO_INTERNAL_ERROR, "DS402 external feedback rejected by drive core");
                 drive_pp_ready = (frame.flags & 0x04U) != 0;
@@ -815,8 +857,9 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
         drive_402->set_external_fault(faults != 0 || drive_adapter_fault);
         external_fault_code = drive_current_fault ? drive_current_fault
             : drive_adapter_fault ? CO_EMC_GENERIC : faults ? 0x8130 : 0;
-        input.model_ready = drive_pp_ready && !capture;
-        input.reset_permitted = drive_reset_permitted;
+        input.model_ready = drive_startup_complete && drive_has_heartbeat && !heartbeat_expired
+            && drive_has_last_feedback && !feedback_expired && drive_pp_ready && external_fault_code == 0;
+        input.reset_permitted = healthy;
     }
     if (safety_only) drive_402->process_safety(input, dt_us);
     else drive_402->step(input, dt_us);
@@ -872,10 +915,6 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
             && status.pds == xco::d402::Pds::switch_on_disabled && !fault_active;
         if (fault_active) {
             if (drive_latched_fault == 0) drive_latched_fault = current_fault;
-            if ((drive_current_fault || drive_adapter_fault) && !drive_emcy_active && co && co->em) {
-                CO_errorReport(co->em, CO_EM_GENERIC_ERROR, current_fault, static_cast<uint32_t>(drive_epoch));
-                drive_emcy_active = true;
-            }
             for (uint8_t source = 0; source < 4; ++source) {
                 const uint8_t mask = static_cast<uint8_t>(1U << source);
                 if ((drive_transport_faults & mask) && !(drive_reported_transport_faults & mask) && co && co->em) {
@@ -885,15 +924,18 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
             }
         } else if (reset_completed) {
             drive_latched_fault = 0;
-            if (drive_emcy_active && co && co->em) {
-                CO_errorReset(co->em, CO_EM_GENERIC_ERROR, static_cast<uint32_t>(drive_epoch));
-                drive_emcy_active = false;
-            }
             for (uint8_t source = 0; source < 4; ++source) {
                 if ((drive_reported_transport_faults & (1U << source)) && co && co->em)
                     CO_errorReset(co->em, static_cast<uint8_t>(drive_transport_error_bit + source), 0);
             }
             drive_reported_transport_faults = 0;
+        }
+        const uint16_t model_fault = drive_current_fault ? drive_current_fault : drive_adapter_fault ? CO_EMC_GENERIC : 0;
+        if (model_fault != drive_reported_model_fault && co && co->em) {
+            const auto info = static_cast<uint32_t>(drive_epoch);
+            if (drive_reported_model_fault) CO_errorReset(co->em, CO_EM_GENERIC_ERROR, info);
+            if (model_fault) CO_errorReport(co->em, CO_EM_GENERIC_ERROR, model_fault, info);
+            drive_reported_model_fault = model_fault;
         }
         if (model->drive_has_error_code) write_drive_value(*model, 0x603f, drive_latched_fault);
         drive_previous_pds = status.pds;
@@ -913,8 +955,8 @@ void xnet_canopen_device::process_drive_402(uint32_t dt_us, bool force_non_opera
     }
 }
 
-void xnet_canopen_device::drain_drive_402() {
-    if (!drive_402) return;
+bool xnet_canopen_device::drain_drive_402() {
+    if (!drive_402) return true;
     const auto terminal = [&] {
         const auto status = drive_402->status();
         return !status.action_pending && status.pds != xco::d402::Pds::operation_enabled
@@ -930,12 +972,15 @@ void xnet_canopen_device::drain_drive_402() {
         previous = now;
         process_drive_402(static_cast<uint32_t>(std::min<int64_t>(dt, UINT32_MAX)), true);
         if (terminal()) break;
-        require(xco::Clock::now() < deadline, XNET_CO_STACK_ERROR,
-            "DS402 did not reach a terminal state before the shutdown/reset deadline");
+        if (xco::Clock::now() >= deadline) {
+            fail(XNET_CO_STACK_ERROR, "DS402 did not reach a terminal state before the shutdown/reset deadline");
+            return false;
+        }
         worker_lock->unlock();
         std::this_thread::sleep_for(std::chrono::microseconds(model->worker_period_us));
         worker_lock->lock();
     }
+    return !drive_402->status().reaction_unconfirmed;
 }
 
 void xnet_canopen_device::start_test_rpdo_plan() {
@@ -1056,7 +1101,8 @@ bool xnet_canopen_device::apply_test_timing_watermark(bool commands, uint64_t no
 
 void xnet_canopen_device::reset_stack(bool reset_all_objects) {
     log(xco::LogLevel::info, reset_all_objects ? "Reset Node requested" : "Reset Communication requested");
-    drain_drive_402();
+    require(drain_drive_402(), XNET_CO_STACK_ERROR, "DS402 reset aborted: physical stop unconfirmed");
+    drive_controlword_rearm = drive_402 != nullptr;
     adapter.stop_flush();
     // Reset Node reloads saved/startup LSS settings and restores all OD defaults.
     // Reset Communication preserves device data and the pending LSS settings.
@@ -1450,8 +1496,18 @@ void xnet_canopen_device::process_sync_boundary(xnet_canopen_device& d,
     CO_process_TPDO(d.co, true, 0, nullptr);
 }
 
+CO_NMT_reset_cmd_t xnet_canopen_device::process_network(uint32_t dt_us) {
+    const auto before = CO_NMT_getInternalState(co->NMT);
+    const auto reset = CO_process(co, false, dt_us, nullptr);
+    if (drive_402 && before == CO_NMT_OPERATIONAL && CO_NMT_getInternalState(co->NMT) != before) {
+        drive_controlword_rearm = true;
+        process_drive_402(0, false, true);
+    }
+    return reset;
+}
+
 void xnet_canopen_device::process_sync_iteration(uint32_t dt_us) {
-    auto reset = CO_process(co, false, dt_us, nullptr);
+    auto reset = process_network(dt_us);
     if (reset != CO_RESET_NOT) {
         reset_stack(reset == CO_RESET_APP);
         return;
@@ -1554,7 +1610,7 @@ void xnet_canopen_device::run() {
                     receive(boundary, &processed_sync);
                     // Receive dispatch can request a reset, stop, or bitrate switch in a callback.
                     if (switching == Switch::none && !stop_requested) {
-                        auto reset = CO_process(co, false, dt, nullptr);
+                        auto reset = process_network(dt);
                         if (switching == Switch::none && !stop_requested) {
                             if (reset != CO_RESET_NOT) reset_stack(reset == CO_RESET_APP);
                             else if (!co->nodeIdUnconfigured) {
@@ -1589,14 +1645,19 @@ void xnet_canopen_device::run() {
             // wait_for releases the OD lock, allowing channel calls between worker cycles.
             wake.wait_for(lock, std::chrono::microseconds(model->worker_period_us), [&] { return stop_requested.load(); });
         }
-        drain_drive_402();
+        if (!drain_drive_402()) worker_result = XNET_CO_STACK_ERROR;
     } catch (const Error& e) {
+        worker_result = e.code;
         fail(e.code, e.what()); state = XNET_CO_RUNTIME_FAILED; stop_requested = true;
     } catch (const std::exception& e) {
+        worker_result = XNET_CO_INTERNAL_ERROR;
         fail(XNET_CO_INTERNAL_ERROR, e.what()); state = XNET_CO_RUNTIME_FAILED; stop_requested = true;
     }
     try { adapter.stop_flush(); }
-    catch (const Error& e) { fail(e.code, e.what()); state = XNET_CO_RUNTIME_FAILED; }
+    catch (const Error& e) {
+        if (worker_result == XNET_CO_OK) worker_result = e.code;
+        fail(e.code, e.what()); state = XNET_CO_RUNTIME_FAILED;
+    }
     for (auto& pending : outgoing) pending.buffer->bufferFull = false;
     outgoing.clear();
     if (co) co->CANmodule->CANnormal = false;
@@ -1621,6 +1682,7 @@ void xnet_canopen_device::stop() {
     switching = Switch::none;
     co->CANmodule->CANnormal = false;
     if (state != XNET_CO_RUNTIME_FAILED) state = XNET_CO_RUNTIME_STOPPED;
+    if (had_worker && drive_402) drive_controlword_rearm = true;
     if (had_worker) log(xco::LogLevel::info, "device stopped");
 }
 
@@ -1759,6 +1821,7 @@ int32_t xnet_canopen_start(xnet_canopen_handle handle) {
             d.adapter.start();
             CO_CANsetNormalMode(d.co->CANmodule);
             d.stop_requested = false;
+            d.worker_result = XNET_CO_OK;
             d.state = XNET_CO_RUNTIME_RUNNING;
             d.worker = std::thread(&xnet_canopen_device::run, &d);
             d.log(xco::LogLevel::info, "device started");
@@ -1778,7 +1841,7 @@ int32_t xnet_canopen_stop(xnet_canopen_handle handle) {
             runtime.unlock();
             lifecycle.unlock();
             return call(handle, [](xnet_canopen_device& d, std::unique_lock<std::recursive_mutex>& lock) {
-                lock.unlock(); d.stop(); return XNET_CO_OK;
+                lock.unlock(); d.stop(); lock.lock(); return d.worker_result;
             });
         }
         handle->shutdown_joining = true;
@@ -1793,7 +1856,7 @@ int32_t xnet_canopen_stop(xnet_canopen_handle handle) {
         handle->shutdown_joining = false;
         owns_shutdown = false;
         handle->stop();
-        return XNET_CO_OK;
+        return handle->worker_result;
     } catch (const Error& e) {
         std::lock_guard<std::recursive_mutex> lock(handle->mutex);
         if (owns_shutdown) handle->shutdown_joining = false;

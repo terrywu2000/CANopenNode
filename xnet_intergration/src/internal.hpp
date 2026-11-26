@@ -442,6 +442,10 @@ struct xnet_canopen_device {
         OD_IO_t original{};
         OD_extension_t extension{};
     } drive_mode_od; /**< SDO mode-write guard; refreshed after each stack rebuild. */
+    OD_extension_t drive_controlword_od{};
+    OD_extension_t drive_option_od{};
+    bool drive_controlword_rearm = false;
+    int32_t worker_result = XNET_CO_OK;
     std::unique_ptr<xco::d402::Drive> drive_402; /**< Present only when enabled by JSON. */
     std::shared_ptr<motor_drive_endpoint> drive_endpoint;
     uint64_t sync_observation_epoch = 0;
@@ -498,7 +502,7 @@ struct xnet_canopen_device {
     uint8_t drive_transport_faults = 0, drive_reported_transport_faults = 0;
     uint16_t drive_latched_fault = 0;
     uint16_t drive_current_fault = 0;
-    bool drive_emcy_active = false;
+    uint16_t drive_reported_model_fault = 0;
     xco::d402::Pds drive_previous_pds = xco::d402::Pds::switch_on_disabled;
     bool drive_has_previous_pds = false;
     bool drive_pp_ready = false, drive_reset_permitted = false;
@@ -573,9 +577,12 @@ struct xnet_canopen_device {
     static ODR_t write_communication(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
     static ODR_t read_drive_mode(OD_stream_t*, void*, OD_size_t, OD_size_t*);
     static ODR_t write_drive_mode(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
+    static ODR_t write_drive_controlword(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
+    static ODR_t write_drive_option(OD_stream_t*, const void*, OD_size_t, OD_size_t*);
+    CO_NMT_reset_cmd_t process_network(uint32_t dt_us);
     ODR_t stage_drive_feedback(const CO_402_feedback_frame_t& frame, const uint8_t* bytes);
     void process_drive_402(uint32_t dt_us, bool force_non_operational = false, bool safety_only = false);
-    void drain_drive_402();
+    bool drain_drive_402();
     void start_drive_epoch();
     void start_sync_observation_epoch();
 };
