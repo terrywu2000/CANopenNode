@@ -49,7 +49,7 @@ if(XNET_CANOPEN_BUILD_LIBRARY)
     target_link_options(xnet_canopen PRIVATE "$<$<PLATFORM_ID:Linux>:-Wl,--no-undefined>")
     set_target_properties(xnet_canopen PROPERTIES VERSION 0.1.0 SOVERSION 0)
     install(TARGETS xnet_canopen LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
-    install(FILES include/xnet_canopen.h include/motor_drive.h DESTINATION include)
+    install(FILES include/xnet_canopen.h include/xnet_canopen_extensions.h include/motor_drive.h include/co_device.h DESTINATION include)
 endif()
 
 if(XNET_CANOPEN_BUILD_APP)

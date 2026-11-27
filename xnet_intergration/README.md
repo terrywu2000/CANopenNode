@@ -115,6 +115,8 @@ behavior or engineering-unit conversions.
 ## Files
 
 - [include/xnet_canopen.h](include/xnet_canopen.h): public C ABI.
+- [include/xnet_canopen_extensions.h](include/xnet_canopen_extensions.h): additive system, endpoint and timing APIs for existing handles.
+- [include/co_device.h](include/co_device.h): system-level C facade and model-port entry point.
 - [src/model.cpp](src/model.cpp): version-1 JSON validation and OD construction.
 - [src/driver.cpp](src/driver.cpp): XNET sessions and CANopen driver boundary.
 - [src/device.cpp](src/device.cpp): lifecycle, worker, LSS, channels, diagnostics.
@@ -815,6 +817,100 @@ validation as PDOs. Accepted SDO changes override that relative startup default
 across stop/start; a communication/node reset restores and re-evaluates it.
 EMCY's omitted `cob_id` still selects its existing `0x80 + node ID` default.
 
+## System device facade
+
+`co_device.h` provides a separate opaque `co_device_handle` owning one private
+XNET backend. It is an additive API; it neither changes nor exposes an existing
+`xnet_canopen_handle` as its own handle. A facade instance and a separately created legacy device
+are independent resources: callers still enforce exclusive interface and
+persistence-path use. The facade forwards lifecycle and v1 status, capability,
+diagnostic and advanced OD/batch/TPDO/fault/SYNC operations to the same backend;
+the contracts in `xnet_canopen.h` still apply.
+
+For an external model, call `co_device_create`, `co_device_initialize`,
+`co_device_open_motor_port` and `co_device_start`, checking each result before
+proceeding. The model/CD then exchanges read, submit and heartbeat through the
+port. If a step fails, inspect the diagnostic when a device exists and clean up
+the resources acquired so far; a failed cleanup remains retryable.
+
+`co_device_open_motor_port` acquires the exclusive writer in one backend-locked
+operation, so a concurrent uninitialize cannot invalidate a borrowed endpoint
+between lookup and open. It returns `CO_DEVICE_BUSY` if a writer already exists,
+otherwise `XNET_CO_*`; the device diagnostic preserves the `MOTOR_DRIVE_*`
+failure. Other facade operations return `XNET_CO_*`, while subsequent
+`motor_drive_*` calls retain their own result domain. The output port is NULL on
+open failure. The caller owns and closes it; closing it does not stop the drive.
+
+Existing LabVIEW or C applications can include `co_device.h` and call
+`co_device_open_motor_port_from_xnet(legacy_handle, &port)` on their existing
+initialized device instead of opening a second backend. It has the same atomic
+open, ownership, result and shutdown contracts as the facade operation. The
+legacy owner retains lifecycle control; close the port and stop all users
+before uninitialize/destroy. The versioned `xnet_canopen_*` queries and other
+additive APIs for the same handle are declared in `xnet_canopen_extensions.h`;
+the legacy `xnet_canopen.h` remains independently usable.
+
+`co_device_stop` is the existing **blocking** stop, not NMT Stop or a new
+asynchronous API. Keep the model/CD exchange active throughout the stop
+handshake, including on failure. After stop returns, stop/join port users, close
+the port, then uninitialize and destroy the device. Serialize lifecycle changes
+and stop attempts; a rejected concurrent stop is not completion of the active
+stop. Never block the PCL that
+must produce the response. A cleanup error is explicit and the facade remains
+valid for diagnostic access and retry; do not overlap destroy or port close
+with other calls. Uninitialize invalidates any still-open port, which remains
+closable, but does not close it. No operation proves physical standstill.
+For an ordinary 301 device, legacy `xnet_canopen_stop` retains its existing
+success result after joining a failed worker; inspect runtime state and
+diagnostic for that failure. `co_device_stop` reports the worker failure.
+For 402 devices, stop also reports failures of the safety handshake.
+
+## Versioned system queries
+
+Include `xnet_canopen_extensions.h` for these queries. The existing 301 C ABI
+is unchanged. Three additive v1 queries use caller-owned
+structures and a byte capacity; the library writes `abi_version` and
+`struct_size` on success and leaves the output unchanged on failure. The v1
+layouts are frozen: future incompatible layouts require new versioned symbols.
+
+```c
+xnet_canopen_system_status_v1 status;
+xnet_canopen_capabilities_v1 caps;
+xnet_canopen_diagnostic_v1 diagnostic;
+int32_t rc = xnet_canopen_get_capabilities_v1(handle, &caps, sizeof(caps));
+/* Check rc before using caps. The device must be initialized. */
+rc = xnet_canopen_get_system_status_v1(handle, &status, sizeof(status));
+/* Check rc before using status. */
+rc = xnet_canopen_get_diagnostic_v1(handle, &diagnostic, sizeof(diagnostic));
+/* Check rc before using diagnostic. */
+```
+
+`get_system_status_v1` copies the legacy communication snapshot and, when a
+drive core exists, its PDS state, Statusword, mode, action and drive flags under
+one runtime lock. `drive_valid` gates the drive fields; retained values may be
+historical after stop or failure. Runtime, NMT and PDS are distinct states.
+The snapshot is not a physical-safety or real-time guarantee, and ordinary
+status and batch operations still have no shutdown exception.
+
+`get_capabilities_v1` describes the initialized configuration and implemented
+mechanisms, not the EDS-advertised 0x6502, the existence of a configured PDO,
+or whether a particular operation is currently permitted. Ordinary devices
+have no drive mode; internal/external 402 configurations implement PP only.
+External models support asynchronous, bootstrap and safety reads. Scheduled
+reads and production SYNC/PCL time mapping remain unsupported.
+
+`get_diagnostic_v1` copies the latest device diagnostic with its source domain,
+source code, legacy `XNET_CO_*` code and message. Motor rejections retain their
+`MOTOR_DRIVE_*` result; the legacy code may be a mapped code rather than an
+underlying backend failure. Exceptions translated by the backend retain both
+the motor-facing result and the original backend code. The old
+`get_last_error` and `clear_error` APIs continue to operate on the same
+diagnostic; clear resets both views. The snapshot is not call-correlated:
+another thread or the worker can replace it before it is read. Errors before
+a live device is available cannot be recorded on that device. A failed runtime
+preserves the worker failure diagnostic during existing port exchange. The diagnostic
+query never replaces the diagnostic, including on insufficient capacity.
+
 ## Batch ABI
 
 Binding takes uint16 indices and uint8 subindices as inputs and returns uint32
@@ -908,7 +1004,7 @@ to its NMT/producer rules.
 
 ### Status snapshot and reset notification
 
-`get_status()` remains the single read-only runtime/protocol information API.
+`get_status()` remains the legacy read-only runtime/protocol snapshot API.
 It needs no batch binding, JSON configuration, or extra network-visible OD
 entries. All fields are copied under the same runtime lock.
 
@@ -1139,9 +1235,10 @@ OD store/restore objects `0x1010/0x1011` are not implemented by this LSS mechani
 
 ## External device-model integration
 
-The existing batch, status, TPDO-request and fault APIs are the boundary to an
-external CiA 402 or other device model. A dedicated drive-profile API is not
-needed for ordinary command/feedback exchange. Generate only the objects and
+For ordinary device models, the existing batch, status, TPDO-request and fault
+APIs provide the integration boundary. The integrated external CiA 402 model
+instead uses the dedicated `motor_drive_` private mailbox described above;
+generic OD/batch is not its feedback path. Generate only the objects and
 channels required by the agreed modes/tests, not every object found in an EDS.
 For each channel, record index/subindex, type, byte size, signedness, raw
 units/scaling, ownership, default and reset behavior.

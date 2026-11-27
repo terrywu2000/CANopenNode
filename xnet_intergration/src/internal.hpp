@@ -13,7 +13,7 @@
 #include "402/CO_402_protocol.h"
 #include "402/drive402.hpp"
 #include "timed_history.hpp"
-#include "xnet_canopen.h"
+#include "xnet_canopen_extensions.h"
 #include "nlohmann/json.hpp"
 #include "spdlog/common.h"
 #include "xnet/nixnet.h"
@@ -415,6 +415,8 @@ struct xnet_canopen_device {
     } can_state; /**< Runtime-lock-protected controller sample and counter-only log throttling. */
     int32_t error_code = 0; /**< Latest per-handle XNET_CO_* diagnostic code; 0 when cleared. */
     std::array<char, 2048> error_message{}; /**< NUL-terminated diagnostic text, truncated to fit. */
+    uint32_t diagnostic_domain = XNET_CO_DIAG_NONE;
+    int32_t diagnostic_source_code = 0;
     const uint64_t log_instance = xco::next_log_instance(); /**< Process-local handle identity, stable across LSS/reset. */
     std::array<uint32_t, 4> log_identity{}; /**< Validated CANopen identity retained for failure/cleanup logging. */
     std::shared_ptr<spdlog::logger> logger; /**< Shared private file logger; null before the first initialize attempt opens it. */
@@ -532,6 +534,7 @@ struct xnet_canopen_device {
     uint16_t switch_delay_ms = 0; /**< LSS-requested delay in milliseconds, applied before and after the change. */
 
     void fail(int32_t code, std::string_view message) noexcept;
+    void fail_motor(int32_t result, int32_t backend_code, std::string_view message) noexcept;
     /** Caller serializes device state; backend sink serializes writes across handles. */
     void log(xco::LogLevel level, std::string_view message) noexcept;
     template<class Arg, class... Args>

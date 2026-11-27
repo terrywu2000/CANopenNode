@@ -107,6 +107,7 @@ OD 值保持在本地，除非通过协议服务或主机 API 访问。
 ## 文件
 
 - [include/xnet_canopen.h](include/xnet_canopen.h)：公共 C ABI。
+- [include/xnet_canopen_extensions.h](include/xnet_canopen_extensions.h)：既有句柄的系统查询、endpoint 和时序扩展 API。
 - [src/model.cpp](src/model.cpp)：版本 1 JSON 校验和 OD 构建。
 - [src/driver.cpp](src/driver.cpp)：XNET 会话和 CANopen 驱动边界。
 - [src/device.cpp](src/device.cpp)：生命周期、工作线程、LSS、通道、诊断。
@@ -626,6 +627,77 @@ SYNC 和 EMCY 也接受与显式 `cob_id` 基值配合的 `cob_id_offset: "NODE_
 
 <a id="batch-abi"></a>
 
+## 系统设备 facade
+
+`co_device.h` 提供独立的不透明 `co_device_handle`，每个实例拥有一个私有 XNET 后端。
+这是增量 API，不把既有 `xnet_canopen_handle` 当作 facade 句柄。facade 与单独创建的旧设备是
+不同资源；调用方仍须保证接口和持久化路径独占。生命周期、v1 状态/能力/诊断及高级
+OD/batch/TPDO/故障/SYNC 操作均转发到同一后端，遵循 `xnet_canopen.h` 的相应契约。
+
+外部模型依次调用 `co_device_create`、`co_device_initialize`、
+`co_device_open_motor_port` 和 `co_device_start`，再通过 `motor_drive_read_v1`、
+`motor_drive_submit_v1` 和 `motor_drive_heartbeat_v1` 交换。每步都应检查返回值；
+失败时若设备已创建则查询诊断，并清理已获取的资源。清理失败后可重试。
+
+`co_device_open_motor_port` 在同一个后端锁域内取得唯一写入端口，避免查询 endpoint 与
+打开之间并发 uninitialize 引起的失效。已有写入者时返回 `CO_DEVICE_BUSY`，其他返回值
+为 `XNET_CO_*`；设备诊断保留原始 `MOTOR_DRIVE_*` 错误。其他 facade 操作返回
+`XNET_CO_*`，后续 `motor_drive_*` 操作仍使用各自的结果域。打开失败时输出端口为
+NULL；端口由调用方关闭，关闭端口不会停止驱动。
+
+既有 LabVIEW 或 C 程序可包含 `co_device.h`，对已经初始化的旧句柄调用
+`co_device_open_motor_port_from_xnet(legacy_handle, &port)`，无需再创建第二个后端。
+它与 facade 打开操作使用相同的原子打开、所有权、返回值和停止契约。旧句柄的所有者
+仍负责生命周期；uninitialize/destroy 前须关闭端口并停止所有调用。针对同一句柄的
+版本化 `xnet_canopen_*` 查询及其他新增接口声明在 `xnet_canopen_extensions.h` 中；
+旧 `xnet_canopen.h` 仍可单独使用。
+
+`co_device_stop` 是既有**阻塞式**停止，不是 NMT Stop，也不是新增异步接口。停止握手
+期间必须保持模型/CD 交换，直至停止返回（包括失败）；随后停止并 join 端口调用方、
+关闭端口，再 uninitialize 和 destroy。生命周期变更和停止请求应由调用方串行化；并发
+停止请求被拒绝不代表正在执行的停止已完成。不要阻塞必须提供响应的 PCL。清理失败会明确
+返回错误并保留 facade 以便诊断和重试；destroy 或端口 close 不得与其他调用并发。
+uninitialize 会使未关闭的端口失效，但端口仍可关闭，不会被自动关闭。这些操作不证明
+物理静止。
+普通 301 设备的旧 `xnet_canopen_stop` 在成功 join 已失败的 worker 后保留原来的成功
+返回值；应检查运行状态及诊断以发现 worker 错误。`co_device_stop` 会返回该错误。
+402 设备的 stop 也会报告安全握手失败。
+
+## 版本化系统查询
+
+这些查询需包含 `xnet_canopen_extensions.h`。既有 301 C ABI 保持不变。新增的三个 v1 查询使用调用方分配的结构和以字节为单位的
+容量；成功时写入 `abi_version` 和 `struct_size`，失败时不修改输出。v1 布局固定，
+未来不兼容的布局使用新的版本化符号。
+
+```c
+xnet_canopen_system_status_v1 status;
+xnet_canopen_capabilities_v1 caps;
+xnet_canopen_diagnostic_v1 diagnostic;
+int32_t rc = xnet_canopen_get_capabilities_v1(handle, &caps, sizeof(caps));
+/* 检查 rc 后使用 caps；设备必须已初始化。 */
+rc = xnet_canopen_get_system_status_v1(handle, &status, sizeof(status));
+/* 检查 rc 后使用 status。 */
+rc = xnet_canopen_get_diagnostic_v1(handle, &diagnostic, sizeof(diagnostic));
+/* 检查 rc 后使用 diagnostic。 */
+```
+
+`get_system_status_v1` 在同一个运行时锁内复制既有通信状态，以及存在时的 402 PDS、
+状态字、模式、动作和驱动状态标志。只有 `drive_valid` 为 1 时驱动字段有效；停止或
+失败后保留的驱动值可能是历史值。运行时、NMT 和 PDS 状态互相独立；快照不提供物理
+安全或实时保证。普通状态和批量接口在停止期间仍无特殊访问例外。
+
+`get_capabilities_v1` 报告已初始化配置及实现支持的机制，不是 EDS 的 0x6502 声明，
+也不保证已配置某个 PDO 或当前允许某个操作。普通设备没有驱动模式；内部和外部 402
+配置目前仅实现 PP。外部模型支持异步、启动和安全读取，不支持生产环境定时读取及
+SYNC/PCL 时钟映射。
+
+`get_diagnostic_v1` 返回最新设备诊断的来源域、来源码、原有 `XNET_CO_*` 码和消息。
+模型拒绝保留 `MOTOR_DRIVE_*` 结果，旧码可能只是映射结果；后端异常保留模型侧结果及
+原始后端码。旧 `get_last_error` 和 `clear_error` 与新接口共享诊断，清除操作同时清除
+两个视图。该快照不与某次调用绑定，可能被其他线程或 worker 替换；未关联有效设备的
+错误无法记录在设备上。运行时失败后既有端口的交换调用保留 worker 的失败诊断。诊断查询失败
+（包括容量不足）不会覆盖原诊断。
+
 ## 批量 ABI
 
 绑定输入为 uint16 索引和 uint8 子索引数组，输出为 uint32 类型和大小数组。类型为
@@ -705,7 +777,7 @@ Library Function Node。当前 API 既没有写使能参数，也没有 `XNET_CO
 
 ### 状态快照与复位通知
 
-`get_status()` 仍是唯一的只读运行时/协议信息 API。它不需要批量绑定、JSON 配置，
+`get_status()` 仍是原有的只读运行时/协议信息 API。它不需要批量绑定、JSON 配置，
 也不需要额外的网络可见 OD 条目。所有字段在同一个运行时锁下复制。
 
 | 字节偏移 | uint32 字段 | 含义 |
@@ -893,8 +965,8 @@ API 调用不会清除该诊断。
 
 ## 外部设备模型集成
 
-现有的批量、状态、TPDO 请求和故障 API 就是与外部 CiA 402 或其他设备模型之间的边界。
-普通的命令/反馈交换不需要专门的驱动器配置文件 API。只生成约定模式/测试所需的对象和
+普通设备模型使用现有批量、状态、TPDO 请求和故障 API；集成的外部 CiA 402 模型使用
+前述 `motor_drive_` 私有邮箱，不能将通用 OD/batch 作为其反馈路径。只生成约定模式/测试所需的对象和
 通道，而不是 EDS 中的每个对象。对于每个通道，记录索引/子索引、类型、字节大小、
 有无符号、原始单位/缩放、所有权、默认值和复位行为。
 
